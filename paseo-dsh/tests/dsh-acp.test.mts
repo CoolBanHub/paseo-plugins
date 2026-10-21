@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClientSideConnection } from "@agentclientprotocol/sdk";
 import { createDshConnector } from "../server/dsh-acp.ts";
+import { dshCatalogCacheKey } from "../server/dsh-catalog.ts";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const mockAgent = join(testsDir, "mock-dsh-agent.cjs");
@@ -133,4 +134,16 @@ test("permission preset setting reaches the dsh process", async () => {
   } finally {
     await preset.stream.writable.close();
   }
+});
+
+test("catalog cache key changes when the ACP profile changes", async (t) => {
+  const profile = mkdtempSync(join(tmpdir(), "dsh-profile-cache-test-"));
+  t.after(() => rmSync(profile, { recursive: true, force: true }));
+  writeFileSync(join(profile, "cordis.patch.yml"), "model: mimo-v2.6-pro\n");
+
+  const options = { scope: "workspace" as const, cwd: "/tmp" };
+  const before = dshCatalogCacheKey(options, profile);
+  writeFileSync(join(profile, "cordis.patch.yml"), "model: deepseek-v4.1-flash\n");
+
+  assert.notEqual(dshCatalogCacheKey(options, profile), before);
 });
