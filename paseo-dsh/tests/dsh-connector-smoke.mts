@@ -1,0 +1,67 @@
+import { ClientSideConnection } from "@agentclientprotocol/sdk";
+import { createDshConnector } from "../server/dsh-acp.ts";
+
+const log = (message: string, detail?: unknown) =>
+  console.log("[smoke]", message, detail === undefined ? "" : JSON.stringify(detail));
+
+const updates: unknown[] = [];
+const stream = await createDshConnector(log)();
+const client = {
+  requestPermission: async (request: unknown) => {
+    log("permission request", request);
+    return { outcome: { outcome: "cancelled" as const } };
+  },
+  sessionUpdate: (notification: unknown) => {
+    updates.push((notification as { update?: { sessionUpdate?: string } }).update?.sessionUpdate);
+  },
+};
+const connection = new ClientSideConnection(() => client as never, stream as never);
+
+const initialized = await connection.initialize({
+  protocolVersion: 1,
+  clientCapabilities: {},
+  clientInfo: { name: "paseo-smoke", version: "1" },
+});
+console.log("STEP1 initialize loadSession capability:", initialized.agentCapabilities?.loadSession);
+if (initialized.agentCapabilities?.loadSession !== true) throw new Error("loadSession capability was not injected");
+
+const session = await connection.newSession({ cwd: "/tmp", mcpServers: [] });
+console.log("STEP2 session/new:", session.sessionId);
+const model = (session.configOptions ?? []).find((o) => o.category === "model");
+console.log("STEP2 model option current:", model?.currentValue, "choices:", JSON.stringify(model?.options).slice(0, 400));
+const modelChoices = model?.options.flatMap((option) => "group" in option ? option.options : [option]) ?? [];
+const deepseekFlash = modelChoices.find((option) => {
+  try {
+    const [provider, modelId] = JSON.parse(option.value) as [string, string];
+    return provider === "bai" && modelId === "deepseek-v4.1-flash";
+  } catch {
+    return false;
+  }
+});
+if (!model || !deepseekFlash) throw new Error("bai/deepseek-v4.1-flash model option was not found");
+const selected = await connection.setSessionConfigOption({
+  sessionId: session.sessionId,
+  configId: model.id,
+  value: deepseekFlash.value,
+});
+const thinking = selected.configOptions.find((option) => option.category === "thought_level");
+console.log("STEP2 DeepSeek-V4.1-Flash thinking options:", JSON.stringify(thinking?.options));
+if (!thinking?.options.some((option) => "value" in option && option.value === "max")) {
+  throw new Error("bai/deepseek-v4.1-flash did not expose the max thinking option");
+}
+
+await connection.closeSession({ sessionId: session.sessionId });
+console.log("STEP3 session/close ok");
+
+// Paseo reopens persisted sessions with session/load; the connector must
+// translate this into dsh's session/resume.
+const resumed = await connection.loadSession({ sessionId: session.sessionId, cwd: "/tmp", mcpServers: [] });
+console.log("STEP4 session/load -> resume ok, configOptions:", (resumed.configOptions ?? []).length);
+
+const listed = await connection.listSessions({ cwd: "/tmp" });
+console.log("STEP5 session/list entries:", JSON.stringify(listed.sessions));
+
+await connection.closeSession({ sessionId: session.sessionId });
+await stream.writable.close();
+console.log("STEP6 closed; updates observed:", updates.length);
+process.exit(0);

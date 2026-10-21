@@ -1,0 +1,7 @@
+{
+  "id": "dsh",
+  "name": "dsh (DeepSeek)",
+  "requirements": {
+    "paseo": ">=0.11.4"
+  }
+}
