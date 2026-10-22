@@ -1,10 +1,23 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import { ndJsonStream } from "@agentclientprotocol/sdk";
 import type { AcpConnector, AcpStream, AcpStreamMessage } from "@getpaseo/plugin/server/acp";
+import type { DshSessionLaunchContext } from "./session-launch-context";
+import { writeWebModelOverlay } from "./dsh-catalog.ts";
 
 /**
  * Locate the dsh bin script (a Node JS file). The daemon's PATH may not
@@ -108,23 +121,250 @@ function versionTupleOf(nodePath: string): number[] | undefined {
 
 const nodeVersionCache = new Map<string, number[]>();
 
+const AGENT_PRESET_BRIDGE_SOURCE = `import { readFileSync, writeFileSync } from "node:fs";
+
+const PRESETS = new Set(["standard", "ptc", "minimal", "cordis"]);
+const permissionAgents = new Map();
+const appliedPermissions = new Map();
+const controlFile = process.env.DSH_PERMISSION_CONTROL_FILE;
+const catalogFile = process.env.DSH_PERMISSION_CATALOG_FILE;
+
+export const name = "paseo-dsh-agent-preset-bridge";
+export const inject = ["agentPresets", "sessionProjections", "permissionPresets"];
+
+function selectedPermissions() {
+  if (!controlFile) return {};
+  try {
+    return JSON.parse(readFileSync(controlFile, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function writeCatalog(ctx) {
+  if (!catalogFile) return;
+  try {
+    const catalog = await ctx.permissionPresets.catalog();
+    const sessionPermissions = Object.fromEntries([...permissionAgents].map(([id, agent]) => [
+      id,
+      ctx.permissionPresets.current(agent.session),
+    ]));
+    writeFileSync(catalogFile, JSON.stringify({
+      ...catalog,
+      options: catalog.options.filter((option) => option.value !== "custom"),
+      sessionPermissions,
+    }));
+  } catch (error) {
+    ctx.logger.warn("paseo-dsh: permission catalog unavailable", error);
+  }
+}
+
+async function applyPermission(ctx, agent, preset) {
+  if (typeof preset !== "string" || appliedPermissions.get(agent.session.id) === preset) return;
+  try {
+    await ctx.permissionPresets.set(agent.session, preset);
+    appliedPermissions.set(agent.session.id, preset);
+    await writeCatalog(ctx);
+  } catch (error) {
+    ctx.logger.warn("paseo-dsh: permission preset could not be applied", { preset, error });
+  }
+}
+
+export function apply(ctx) {
+  const requested = process.env.DSH_AGENT_PRESET;
+  const fallback = PRESETS.has(requested) ? requested : "standard";
+  writeCatalog(ctx);
+  ctx.on("agent/created", async ({ agent }) => {
+    const recorded = ctx.sessionProjections.stateOf(agent.session, "agentPreset");
+    const preset = typeof recorded === "string" ? recorded : fallback;
+    if (!PRESETS.has(preset)) throw new Error("Unsupported dsh agent preset: " + preset);
+    if (recorded === preset) await ctx.agentPresets.mount(agent.ctx, preset);
+    else await ctx.agentPresets.select(agent, preset);
+    permissionAgents.set(agent.session.id, agent);
+    await applyPermission(ctx, agent, selectedPermissions()[agent.session.id]);
+    await writeCatalog(ctx);
+  });
+
+  const poll = setInterval(() => {
+    const selections = selectedPermissions();
+    for (const [sessionId, agent] of permissionAgents) {
+      void applyPermission(ctx, agent, selections[sessionId]);
+    }
+  }, 100);
+  poll.unref?.();
+}`;
+
+const AGENT_PRESET_INTEGRATION_PATCH = `- insert:
+    - id: paseo-agent-preset-registry
+      name: "@deepseek-ai/dsh-agent-preset-registry"
+      config:
+        default: standard
+    - id: paseo-subagent-model-selection-settings
+      name: "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+    - id: paseo-cordis-host-runner
+      name: "@deepseek-ai/dsh-cordis-host-runner"
+    - id: paseo-cordis-inspect-providers
+      name: "@deepseek-ai/dsh-tool-cordis/host"
+    - id: paseo-agent-preset-selection
+      name: ./agent-preset-bridge.js
+      inject: [agentPresets, sessionProjections, permissionPresets]
+`;
+
 const DSH_MODES = [
-  {
-    id: "standard",
-    name: "标准模式",
-    description: "按常规方式处理请求。",
-  },
-  {
-    id: "plan",
-    name: "计划模式",
-    description: "先分析并给出计划，不要直接修改项目。",
-  },
+  { id: "standard", name: "标准模式", description: "日常编码任务的标准工具组合。" },
+  { id: "ptc", name: "PTC 模式", description: "使用 dsh 的 PTC 工具呈现处理批量工具任务。" },
+  { id: "minimal", name: "极简模式", description: "使用 dsh 的精简工具组合。" },
+  { id: "cordis", name: "创造模式", description: "使用 dsh 的创造者工具组合。" },
 ] as const;
 
-const PLAN_MODE_INSTRUCTION = [
-  "[Paseo plan mode] Do not create, edit, delete, or execute commands that modify project state.",
-  "Inspect the project using read-only operations, then return a concise implementation plan and wait for approval.",
-].join(" ");
+type DshModeId = (typeof DSH_MODES)[number]["id"];
+
+function normalizeModeId(mode: string | undefined): DshModeId {
+  if (mode === "ptc" || mode === "minimal" || mode === "cordis") return mode;
+  return "standard";
+}
+
+function modeById(modeId: string) {
+  return DSH_MODES.find((mode) => mode.id === modeId);
+}
+
+function presetPatchPaths(script: string, preset: DshModeId, dataDir: string): string[] {
+  const dshPackageRoot = dirname(dirname(script));
+  const webPresetRoot = process.env.DSH_WEB_PRESET_ROOT ?? join(dirname(dshPackageRoot), "dsh-web-app", "presets");
+  const localPresetRoot = join(dataDir, "agent-presets");
+  mkdirSync(localPresetRoot, { recursive: true });
+  writeFileSync(join(localPresetRoot, "agent-preset-bridge.js"), AGENT_PRESET_BRIDGE_SOURCE);
+  writeFileSync(join(localPresetRoot, "cordis.patch.yml"), AGENT_PRESET_INTEGRATION_PATCH);
+  const paths = [
+    join(localPresetRoot, "cordis.patch.yml"),
+    join(webPresetRoot, `${preset}.patch.yml`),
+  ];
+  for (const path of paths) {
+    if (!existsSync(path)) throw new Error(`dsh preset patch was not found: ${path}`);
+  }
+  return paths;
+}
+
+function dshProfileRoot(profile: string): string {
+  const override = profile === "web"
+    ? process.env.DSH_WEB_PROFILE_ROOT
+    : profile === "acp"
+      ? process.env.DSH_ACP_PROFILE_ROOT
+      : undefined;
+  if (override) return override;
+  return join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "profiles", profile);
+}
+
+function readPermissionCatalog(file: string): {
+  options: Array<{ value: string; name: string }>;
+  defaultPreset?: string;
+  sessionPermissions?: Record<string, string>;
+} {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
+      options?: unknown;
+      defaultPreset?: unknown;
+      sessionPermissions?: unknown;
+    };
+    const options = Array.isArray(parsed.options)
+      ? parsed.options.filter((option): option is { value: string; name: string } =>
+        !!option && typeof option === "object" &&
+        typeof (option as { value?: unknown }).value === "string" &&
+        typeof (option as { name?: unknown }).name === "string",
+      ).map((option) => ({ ...option, name: PERMISSION_LABELS[option.value] ?? option.name }))
+      : [];
+    if (options.length) {
+      return {
+        options,
+        defaultPreset: typeof parsed.defaultPreset === "string" ? parsed.defaultPreset : undefined,
+        sessionPermissions: parsed.sessionPermissions && typeof parsed.sessionPermissions === "object"
+          ? parsed.sessionPermissions as Record<string, string>
+          : undefined,
+      };
+    }
+  } catch {
+    // Use the built-in preset list when a dsh profile has no catalog bridge yet.
+  }
+  return { options: DEFAULT_PERMISSION_OPTIONS };
+}
+
+function permissionConfigOption(
+  options: Array<{ value: string; name: string }>,
+  currentValue: string,
+): ConfigOption {
+  const selected = options.some((option) => option.value === currentValue)
+    ? currentValue
+    : options[0]?.value ?? "workspace-write";
+  return {
+    id: PERMISSION_SETTING_ID,
+    name: "Permissions",
+    description: "Choose the dsh permission preset for this project session.",
+    category: "dsh_permission_preset",
+    type: "select",
+    currentValue: selected,
+    options: options.map((option) => ({ value: option.value, name: option.name })),
+  };
+}
+
+function decorateConfigOptions(
+  source: unknown,
+  permissionOptions: Array<{ value: string; name: string }>,
+  currentPermission: string,
+): ConfigOption[] {
+  const options = Array.isArray(source) ? source as ConfigOption[] : [];
+  const setting = permissionConfigOption(permissionOptions, currentPermission);
+  const existing = options.findIndex((option) => option.id === PERMISSION_SETTING_ID);
+  if (existing === -1) return [...options, setting];
+  const next = [...options];
+  next[existing] = setting;
+  return next;
+}
+
+function writePermissionSelections(file: string, selections: Map<string, string>): void {
+  const temporaryFile = `${file}.tmp`;
+  writeFileSync(temporaryFile, JSON.stringify(Object.fromEntries(selections)), { mode: 0o600 });
+  renameSync(temporaryFile, file);
+}
+
+class ProjectPermissionStore {
+  private values: Record<string, string> = {};
+  private readonly file: string;
+
+  constructor(file: string) {
+    this.file = file;
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        this.values = Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] =>
+          typeof entry[1] === "string",
+        ));
+      }
+    } catch {
+      // Start with defaults when no project preferences have been saved.
+    }
+  }
+
+  get(cwd: string | undefined): string | undefined {
+    return cwd ? this.values[projectKey(cwd)] : undefined;
+  }
+
+  set(cwd: string | undefined, preset: string): void {
+    if (!cwd) return;
+    this.values[projectKey(cwd)] = preset;
+    mkdirSync(dirname(this.file), { recursive: true });
+    const temporaryFile = `${this.file}.tmp`;
+    writeFileSync(temporaryFile, `${JSON.stringify(this.values, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporaryFile, this.file);
+  }
+}
+
+function projectKey(cwd: string): string {
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return resolve(cwd);
+  }
+}
 
 function compareVersions(left: number[], right: number[]): number {
   for (let i = 0; i < Math.max(left.length, right.length); i++) {
@@ -183,13 +423,36 @@ interface TrackedRequest {
   list?: boolean;
   /** A session/new or session/resume response whose modes need adapting. */
   session?: boolean;
+  /** A regular config-option response that must retain our synthetic setting. */
+  config?: boolean;
+  /** ACP session id for a request whose response needs synthetic settings. */
+  sessionId?: string;
+  /** Working directory associated with the native ACP session. */
+  cwd?: string;
 }
 
 type SelectOption = { value?: unknown; name?: unknown };
 type ConfigOption = {
+  id?: unknown;
   category?: unknown;
+  name?: unknown;
+  description?: unknown;
+  type?: unknown;
   currentValue?: unknown;
   options?: Array<SelectOption & Record<string, unknown>>;
+};
+
+const PERMISSION_SETTING_ID = "paseo_dsh_permission_preset";
+const DEFAULT_PERMISSION_OPTIONS = [
+  { value: "workspace-write", name: "Default permissions" },
+  { value: "read-only", name: "Read only" },
+  { value: "danger-full-access", name: "Full access" },
+];
+const PERMISSION_LABELS: Record<string, string> = {
+  "workspace-write": "Default permissions",
+  "read-only": "Read only",
+  "danger-full-access": "Full access",
+  auto: "Auto-review",
 };
 
 /**
@@ -243,7 +506,7 @@ function describeWireMessage(message: AcpStreamMessage): string {
  */
 export function createDshConnector(
   log: (message: string, detail?: unknown) => void,
-  getPermissionMode?: () => string | undefined,
+  getLaunchContext?: () => DshSessionLaunchContext | undefined,
 ): AcpConnector {
   const dataDir = join(
     process.env.PASEO_HOME ?? join(process.env.HOME ?? homedir(), ".paseo"),
@@ -251,6 +514,7 @@ export function createDshConnector(
     "dsh",
   );
   const probes = new ProbeRegistry(join(dataDir, "probe-sessions.json"));
+  const projectPermissions = new ProjectPermissionStore(join(dataDir, "project-permissions.json"));
 
   return async (): Promise<AcpStream> => {
     const script = resolveDshScript();
@@ -261,17 +525,31 @@ export function createDshConnector(
       );
     }
     const node = resolveNodePath();
-    // dsh's permission preset (read-only / workspace-write / danger-full-access)
-    // is fixed per process; because Paseo spawns a fresh dsh process per
-    // session, a plugin setting here applies to every NEW session.
-    const permissionMode = getPermissionMode?.();
+    const launchContext = getLaunchContext?.();
+    const initialMode = normalizeModeId(launchContext?.mode);
+    const presetPatches = presetPatchPaths(script, initialMode, dataDir);
+    const modelOverlayPath = join(dataDir, "web-models.patch.yml");
+    const modelIds = writeWebModelOverlay(dshProfileRoot("acp"), dshProfileRoot("web"), modelOverlayPath);
+    const permissionControlFile = join(dataDir, `permission-control-${randomUUID()}.json`);
+    const permissionCatalogFile = join(dataDir, `permission-catalog-${randomUUID()}.json`);
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(permissionControlFile, "{}", { mode: 0o600 });
     const env = { ...process.env };
-    if (permissionMode && permissionMode !== "default") env.DSH_PERMISSION_MODE = permissionMode;
-    log("starting dsh acp", { node, script, permissionMode: permissionMode ?? "inherited" });
-    const child = spawn(node, [script, "--profile", "acp"], {
+    env.DSH_AGENT_PRESET = initialMode;
+    env.DSH_PERMISSION_CONTROL_FILE = permissionControlFile;
+    env.DSH_PERMISSION_CATALOG_FILE = permissionCatalogFile;
+    log("starting dsh acp", {
+      node,
+      script,
+      cwd: launchContext?.cwd,
+      agentPreset: initialMode,
+      webModels: modelIds,
+    });
+    const patchArgs = [...presetPatches, modelOverlayPath].flatMap((path) => ["--patch", path]);
+    const child = spawn(node, [script, "--profile", "acp", ...patchArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
-      cwd: homedir(),
+      cwd: launchContext?.cwd ?? homedir(),
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
@@ -280,6 +558,8 @@ export function createDshConnector(
       }
     });
     child.once("exit", (code, signal) => {
+      rmSync(permissionControlFile, { force: true });
+      rmSync(permissionCatalogFile, { force: true });
       if (child.exitCode !== null || child.signalCode !== null) {
         log("dsh acp exited", { code, signal: signal ?? undefined });
       }
@@ -292,7 +572,16 @@ export function createDshConnector(
 
     const initializeIds = new Set<string | number>();
     const tracked = new Map<string | number, TrackedRequest>();
-    let currentMode = "standard";
+    const sessionConfigOptions = new Map<string, ConfigOption[]>();
+    const permissionSelections = new Map<string, string>();
+    const sessionCwds = new Map<string, string>();
+    const launchPermission = launchContext?.settings?.[PERMISSION_SETTING_ID];
+    const configuredPermission = typeof launchPermission === "string" ? launchPermission : undefined;
+    const currentPermissionFor = (sessionId: string, cwd?: string, catalog = readPermissionCatalog(permissionCatalogFile)) =>
+      permissionSelections.get(sessionId) ?? catalog.sessionPermissions?.[sessionId] ?? configuredPermission ??
+      projectPermissions.get(cwd) ?? catalog.defaultPreset ?? catalog.options[0]?.value ?? "workspace-write";
+    let currentMode = initialMode;
+    const processMode = initialMode;
     let fromAgentController: { enqueue(chunk: AcpStreamMessage): void } | undefined;
     // toolCallId -> latest tool_call snapshot, used to enrich dsh's minimal
     // session/request_permission requests (see enrichPermissionRequest).
@@ -317,20 +606,50 @@ export function createDshConnector(
           if (message.method === "initialize") {
             initializeIds.add(message.id);
           } else if (message.method === "session/new") {
+            const params = message.params as { cwd?: unknown } | undefined;
             tracked.set(message.id, {
               session: true,
               probe: isProbeNewSession(message.params),
+              cwd: typeof params?.cwd === "string" ? params.cwd : undefined,
             });
           } else if (message.method === "session/resume" || message.method === "session/load") {
-            tracked.set(message.id, { session: true });
+            const params = message.params as { sessionId?: unknown; cwd?: unknown } | undefined;
+            tracked.set(message.id, {
+              session: true,
+              sessionId: typeof params?.sessionId === "string" ? params.sessionId : undefined,
+              cwd: typeof params?.cwd === "string" ? params.cwd : undefined,
+            });
           } else if (message.method === "session/list") {
             tracked.set(message.id, { list: true });
+          } else if (message.method === "session/set_config_option") {
+            const params = message.params as {
+              sessionId?: unknown;
+              configId?: unknown;
+            } | undefined;
+            if (params?.configId !== PERMISSION_SETTING_ID) {
+              tracked.set(message.id, {
+                config: true,
+                sessionId: typeof params?.sessionId === "string" ? params.sessionId : undefined,
+              });
+            }
           }
 
           if (message.method === "session/set_mode") {
             const modeId = (message.params as { modeId?: unknown } | undefined)?.modeId;
-            if (modeId === "standard" || modeId === "plan") {
-              currentMode = modeId;
+            if (typeof modeId === "string" && modeById(modeId)) {
+              const requestedMode = normalizeModeId(modeId);
+              if (requestedMode !== processMode) {
+                fromAgentController?.enqueue({
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: {
+                    code: -32602,
+                    message: "dsh agent presets are composed when the session starts; create a new session to use another mode",
+                  },
+                });
+                return;
+              }
+              currentMode = requestedMode;
               if (!fromAgentController) throw new Error("dsh ACP stream is not ready for mode changes");
               fromAgentController.enqueue({ jsonrpc: "2.0", id: message.id, result: {} });
               log("changed dsh mode", { mode: currentMode });
@@ -338,12 +657,49 @@ export function createDshConnector(
             }
           }
 
-          if (message.method === "session/prompt" && currentMode === "plan") {
-            const params = message.params as { prompt?: unknown } | undefined;
-            if (params && Array.isArray(params.prompt)) {
-              params.prompt.unshift({ type: "text", text: PLAN_MODE_INSTRUCTION });
+          if (message.method === "session/set_config_option") {
+            const params = message.params as {
+              sessionId?: unknown;
+              configId?: unknown;
+              value?: unknown;
+            } | undefined;
+            if (params?.configId === PERMISSION_SETTING_ID) {
+              if (typeof params.sessionId !== "string" || typeof params.value !== "string") {
+                fromAgentController?.enqueue({
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32602, message: "Permission setting requires a session id and preset value" },
+                });
+                return;
+              }
+              const catalog = readPermissionCatalog(permissionCatalogFile);
+              if (!catalog.options.some((option) => option.value === params.value)) {
+                fromAgentController?.enqueue({
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32602, message: `Unsupported dsh permission preset: ${params.value}` },
+                });
+                return;
+              }
+              permissionSelections.set(params.sessionId, params.value);
+              projectPermissions.set(sessionCwds.get(params.sessionId) ?? launchContext?.cwd, params.value);
+              writePermissionSelections(permissionControlFile, permissionSelections);
+              const currentOptions = decorateConfigOptions(
+                sessionConfigOptions.get(params.sessionId),
+                catalog.options,
+                params.value,
+              );
+              sessionConfigOptions.set(params.sessionId, currentOptions);
+              fromAgentController?.enqueue({
+                jsonrpc: "2.0",
+                id: message.id,
+                result: { configOptions: currentOptions },
+              });
+              log("changed dsh permission preset", { sessionId: params.sessionId, preset: params.value });
+              return;
             }
           }
+
           if (message.method === "session/load") {
             log("translated session/load to session/resume");
             message = { ...message, method: "session/resume" };
@@ -414,7 +770,8 @@ export function createDshConnector(
           wireLog("agent->", message);
           if ("method" in message && !("result" in message)) {
             if (message.method === "session/update" && !("id" in message)) {
-              const update = (message.params as { update?: Record<string, unknown> } | undefined)?.update;
+              const params = message.params as { update?: Record<string, unknown> } | undefined;
+              const update = params?.update;
               if (update?.sessionUpdate === "tool_call" && typeof update.toolCallId === "string") {
                 toolSnapshots.set(update.toolCallId, {
                   title: update.title,
@@ -424,6 +781,15 @@ export function createDshConnector(
                 if (toolSnapshots.size > 500) {
                   const oldest = toolSnapshots.keys().next().value;
                   if (oldest !== undefined) toolSnapshots.delete(oldest);
+                }
+              } else if (update?.sessionUpdate === "config_option_update") {
+                const sessionId = (message.params as { sessionId?: unknown }).sessionId;
+                if (typeof sessionId === "string") {
+                  const catalog = readPermissionCatalog(permissionCatalogFile);
+                  const current = currentPermissionFor(sessionId, sessionCwds.get(sessionId), catalog);
+                  const decorated = decorateConfigOptions(update.configOptions, catalog.options, current);
+                  update.configOptions = decorated;
+                  sessionConfigOptions.set(sessionId, decorated);
                 }
               }
             } else {
@@ -437,6 +803,7 @@ export function createDshConnector(
                   sessions?: Array<{ sessionId?: unknown }>;
                   configOptions?: unknown;
                   modes?: { availableModes?: Array<Record<string, unknown>>; currentModeId?: string };
+                  agentCapabilities?: Record<string, unknown>;
                 }
               | undefined;
             if (result && typeof result === "object") {
@@ -454,19 +821,49 @@ export function createDshConnector(
               tracked.delete(message.id);
               if (request?.session) {
                 const modes = result.modes ?? {};
-                const availableModes = Array.isArray(modes.availableModes)
-                  ? [...modes.availableModes]
-                  : [];
-                for (const mode of DSH_MODES) {
-                  if (!availableModes.some((candidate) => candidate.id === mode.id)) {
-                    availableModes.push(mode as unknown as Record<string, unknown>);
-                  }
-                }
+                const availableModes = DSH_MODES.map(({ id, name, description }) => ({
+                  id,
+                  name,
+                  description,
+                }));
                 result.modes = {
                   ...modes,
                   availableModes,
-                  currentModeId: modes.currentModeId ?? currentMode,
+                  currentModeId: currentMode,
                 };
+                const sessionId = typeof result.sessionId === "string"
+                  ? result.sessionId
+                  : request.sessionId;
+                if (sessionId) {
+                  const cwd = request.cwd ?? launchContext?.cwd;
+                  if (cwd) sessionCwds.set(sessionId, cwd);
+                  const catalog = readPermissionCatalog(permissionCatalogFile);
+                  const currentPermission = currentPermissionFor(sessionId, cwd, catalog);
+                  permissionSelections.set(sessionId, currentPermission);
+                  const decorated = decorateConfigOptions(
+                    result.configOptions,
+                    catalog.options,
+                    currentPermission,
+                  );
+                  result.configOptions = decorated;
+                  sessionConfigOptions.set(sessionId, decorated);
+                  log("exposed dsh permission setting", { sessionId, currentPermission });
+                }
+              }
+              if (request?.config && request.sessionId) {
+                const catalog = readPermissionCatalog(permissionCatalogFile);
+                const currentPermission = currentPermissionFor(
+                  request.sessionId,
+                  sessionCwds.get(request.sessionId),
+                  catalog,
+                );
+                const decorated = decorateConfigOptions(
+                  result.configOptions,
+                  catalog.options,
+                  currentPermission,
+                );
+                result.configOptions = decorated;
+                sessionConfigOptions.set(request.sessionId, decorated);
               }
               if (request?.probe && typeof result.sessionId === "string") {
                 probes.add(result.sessionId);

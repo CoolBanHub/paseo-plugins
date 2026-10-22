@@ -5,7 +5,7 @@ Registers the local DeepSeek coding agent (`dsh`, from
 Paseo alongside Claude Code, Codex and ZCode: you can start sessions in
 any project directory, send prompts, watch the timeline (reasoning, tool
 calls, replies), answer permission prompts, and switch models, reasoning
-effort, and the standard/plan mode in Paseo.
+effort, dsh Agent presets, and dsh permission presets independently.
 
 ## How it works
 
@@ -60,52 +60,52 @@ dsh's launcher refuses Electron runtime fingerprints.
   globally, or `DSH_BIN` pointing at its bin script.
 - A working LLM route for the `acp` profile. The auto-initialized profile
   defaults to `deepseek-official` with an API key; if your web profile
-  uses a custom provider instead (for example a pi-ai route), mirror that
-  `llm-pi-ai` + `agent-default-model` + `acp` configuration into
+  uses a custom provider instead (for example a pi-ai route), configure the
+  matching provider endpoint and credentials in
   `~/.dsh/profiles/acp/cordis.patch.yml` so Paseo sessions authenticate
-  the same way. Credentials resolve from `~/.dsh/.credentials.yaml`.
+  the same way. The Web profile's current model definitions, including
+  reasoning-effort options, are overlaid automatically at discovery and
+  session startup. Credentials resolve from `~/.dsh/.credentials.yaml`.
 - Paseo >= 0.11.4.
 
-## Permission preset
+## Project modes
 
-Choose **dsh 权限** from the Paseo sidebar (also available under Settings)
-and select the permission mode (`default`, `workspace-write`, `read-only`,
-`danger-full-access`). It is injected as
-`DSH_PERMISSION_MODE` when Paseo starts a new dsh process, so changes apply
-to new sessions. `default` leaves the daemon environment unchanged; when
-unset, dsh uses `workspace-write`.
+Paseo's native Agent mode selector offers dsh's **标准模式**, **PTC 模式**,
+**极简模式**, and **创造模式**. Each selection mounts the matching dsh
+agent-preset composition, so PTC changes the tool presentation and Minimal
+and Creator load their dsh-defined tool and prompt sets. Paseo stores the
+selection in the project agent configuration and passes it to the ACP process
+when a session starts. Existing sessions retain their composition; create a
+new session to use another mode.
 
-## Modes
-
-Paseo shows **标准模式** and **计划模式** in its native session mode
-selector. dsh ACP does not expose native modes, so this plugin translates
-the selection: standard mode leaves prompts unchanged; plan mode prepends
-read-only planning instructions to each prompt. This is prompt-guided and
-is not a hard tool sandbox like dsh's native plan mode.
+The dsh permission preset is exposed as a separate **Permissions** session
+setting. It uses dsh's live permission-preset catalog and service, so changing
+it updates that dsh session's sandbox and approval policy without changing its
+Agent preset. Paseo remembers the selection by project path and applies it to
+new dsh sessions opened in that project.
 
 ## Capabilities and limits
 
-- Prompting, interrupting, model and reasoning-effort selection, standard
-  and prompt-guided plan modes, and permission prompts. Model choices come
+- Prompting, interrupting, model and reasoning-effort selection, dsh agent
+  presets, and permission prompts. Model choices come
   from dsh's live catalog (provider-grouped, flattened by Paseo).
-- Thinking options require the model to declare reasoning support in the
-  `acp` profile (`reasoningEfforts` per model in `cordis.patch.yml`); the web
-  profile's model settings do not automatically carry over. Models
-  without it show no thinking selector. dsh's "Provider default" effort
+- Paseo mirrors the `bai` model list and `reasoningEfforts` from the Web
+  profile's `llm-pi-ai` patch into a temporary ACP overlay. Removing a model
+  or changing its effort list in dsh Web invalidates Paseo's catalog cache;
+  refresh the provider catalog to see the update. The ACP profile still owns
+  the provider endpoint and credential configuration. dsh's "Provider default" effort
   (empty string) is stripped by the connector because Paseo's schema
   requires non-empty option ids.
-- Permissions: dsh runs sessions under the `workspace-write` preset by
+- Permissions: dsh runs sessions under the `workspace-write` permission preset by
   default — sandboxed in-workspace operations run without prompts, and
   escalations (outside-workspace writes, wider sandbox) surface as
   permission prompts in Paseo. dsh's permission requests carry only a
   tool call id, so the connector enriches them with the title and input
   from the observed tool-call updates (Paseo's adapter otherwise fails on
   the missing raw input and dsh reports "no approval channel available").
-  Set **Settings > dsh 权限 > Permission mode** (or
-  `DSH_PERMISSION_MODE=danger-full-access` / `read-only` in the daemon's
-  environment) to change the preset for Paseo-spawned sessions.
-- Plan mode is prompt-guided because dsh ACP does not expose its native
-  plan-mode command or a hard mode switch.
+  The separate Permissions setting maps to dsh's current permission preset
+  service, including optional presets such as Auto-review when the ACP profile
+  has them enabled.
 - Session import lists persisted dsh sessions for the project directory
   (dsh returns no titles, so entries appear by session id).
 - Paseo's catalog probe and every session open spawn a fresh

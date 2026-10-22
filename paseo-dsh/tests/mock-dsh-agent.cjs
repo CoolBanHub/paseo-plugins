@@ -21,8 +21,10 @@ rl.on("line", (line) => {
     case "initialize":
       respond({
         protocolVersion: 1,
-        // Echo the injected permission preset so tests can assert it.
-        agentInfo: { name: "mock-dsh", version: process.env.DSH_PERMISSION_MODE ?? "unset" },
+        agentInfo: {
+          name: "mock-dsh",
+          version: `${process.env.DSH_AGENT_PRESET ?? "unset"}|${process.argv.slice(2).join(" ")}`,
+        },
         agentCapabilities: { sessionCapabilities: { close: {}, list: {}, resume: {} } },
         authMethods: [],
       });
@@ -130,6 +132,28 @@ rl.on("line", (line) => {
     }
     case "session/set_mode":
       respond({});
+      break;
+    case "session/set_config_option":
+      respond({
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: message.params?.value ?? "m",
+            options: [{ value: "m", name: "M" }],
+          },
+          {
+            id: "reasoning_effort",
+            name: "Reasoning effort",
+            category: "thought_level",
+            type: "select",
+            currentValue: "off",
+            options: [{ value: "off", name: "Off" }],
+          },
+        ],
+      });
       break;
     case "session/list":
       respond({

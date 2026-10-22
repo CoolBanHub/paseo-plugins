@@ -1,11 +1,17 @@
 import { ClientSideConnection } from "@agentclientprotocol/sdk";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDshConnector } from "../server/dsh-acp.ts";
+
+const paseoHome = mkdtempSync(join(tmpdir(), "paseo-dsh-smoke-"));
+process.env.PASEO_HOME = paseoHome;
 
 const log = (message: string, detail?: unknown) =>
   console.log("[smoke]", message, detail === undefined ? "" : JSON.stringify(detail));
 
 const updates: unknown[] = [];
-const stream = await createDshConnector(log)();
+const stream = await createDshConnector(log, () => ({ cwd: "/tmp", mode: process.env.DSH_AGENT_PRESET }))();
 const client = {
   requestPermission: async (request: unknown) => {
     log("permission request", request);
@@ -50,6 +56,31 @@ if (!thinking?.options.some((option) => "value" in option && option.value === "m
   throw new Error("bai/deepseek-v4.1-flash did not expose the max thinking option");
 }
 
+const permissionSetting = selected.configOptions.find((option) => option.id === "paseo_dsh_permission_preset");
+if (!permissionSetting) throw new Error("dsh permission preset setting was not exposed");
+console.log("STEP2 dsh permission options:", JSON.stringify(permissionSetting.options));
+await connection.setSessionConfigOption({
+  sessionId: session.sessionId,
+  configId: permissionSetting.id,
+  value: "read-only",
+});
+await new Promise((resolve) => setTimeout(resolve, 300));
+const dataDir = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "plugin-data", "dsh");
+const permissionCatalogFiles = readdirSync(dataDir)
+  .filter((file) => file.startsWith("permission-catalog-") && file.endsWith(".json"));
+const savedPermission = permissionCatalogFiles.map((file) => {
+  try {
+    const catalog = JSON.parse(readFileSync(join(dataDir, file), "utf8")) as {
+      sessionPermissions?: Record<string, string>;
+    };
+    return catalog.sessionPermissions?.[session.sessionId];
+  } catch {
+    return undefined;
+  }
+}).find((value) => value !== undefined);
+if (savedPermission !== "read-only") throw new Error(`dsh did not apply read-only permission preset: ${savedPermission}`);
+console.log("STEP2 dsh applied permission preset:", savedPermission);
+
 await connection.closeSession({ sessionId: session.sessionId });
 console.log("STEP3 session/close ok");
 
@@ -63,5 +94,6 @@ console.log("STEP5 session/list entries:", JSON.stringify(listed.sessions));
 
 await connection.closeSession({ sessionId: session.sessionId });
 await stream.writable.close();
+rmSync(paseoHome, { recursive: true, force: true });
 console.log("STEP6 closed; updates observed:", updates.length);
 process.exit(0);
