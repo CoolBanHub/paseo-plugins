@@ -87,9 +87,16 @@ export function describeError(err: unknown): string {
   return message.split("\n").slice(0, 4).join("\n");
 }
 
+/**
+ * Global options carried by every invocation. git quotes non-ASCII paths as
+ * C-style octal escapes by default (`core.quotepath`), which turns Chinese
+ * filenames into mojibake; print them verbatim instead.
+ */
+const GIT_GLOBAL_ARGS: readonly string[] = ["-c", "core.quotepath=false"];
+
 async function runChecked(run: GitRun, args: readonly string[], cwd: string, timeoutMs?: number): Promise<string> {
   try {
-    return await run(args, cwd, timeoutMs);
+    return await run([...GIT_GLOBAL_ARGS, ...args], cwd, timeoutMs);
   } catch (err) {
     //execFile rejects on non-zero exits; surface git's own words.
     throw new Error(describeError(err));
@@ -878,11 +885,70 @@ export async function gitFetch(run: GitRun, cwd: string): Promise<ActionResult> 
   }
 }
 
+export interface DiffStat {
+  files: number;
+  additions: number;
+  deletions: number;
+}
+
+/** Parse the one-line summary printed by `git diff --shortstat` (LC_ALL=C). */
+export function parseShortStat(body: string): DiffStat {
+  const files = /(\d+) files? changed/.exec(body);
+  const insertions = /(\d+) insertions?\(\+\)/.exec(body);
+  const deletions = /(\d+) deletions?\(-\)/.exec(body);
+  return {
+    files: files ? Number.parseInt(files[1] ?? "0", 10) : 0,
+    additions: insertions ? Number.parseInt(insertions[1] ?? "0", 10) : 0,
+    deletions: deletions ? Number.parseInt(deletions[1] ?? "0", 10) : 0,
+  };
+}
+
+/** One toast-sized line instead of git's own multi-screen diffstat. */
+export function formatPullSummary(
+  before: string,
+  after: string,
+  commits: number,
+  stat: DiffStat,
+): string {
+  const range = `${before.slice(0, 8)} → ${after.slice(0, 8)}`;
+  const head = `快进 ${commits} 个提交（${range}）`;
+  if (stat.files === 0) return `已${head}`;
+  const delta =
+    stat.additions === 0 && stat.deletions === 0 ? "" : `（+${stat.additions} −${stat.deletions}）`;
+  return `已${head}，更新 ${stat.files} 个文件${delta}`;
+}
+
+async function headOrNull(run: GitRun, cwd: string): Promise<string | null> {
+  try {
+    const head = (await runChecked(run, ["rev-parse", "--verify", "--quiet", "HEAD"], cwd)).trim();
+    return head.length > 0 ? head : null;
+  } catch {
+    return null; // unborn branch: the repository has no commit yet
+  }
+}
+
+/**
+ * Pull fast-forwards only, so the panel can describe the result itself: git's
+ * stdout is a full per-file diffstat, far too noisy for a toast (and it used to
+ * leak octal-escaped paths).
+ */
 export async function gitPull(run: GitRun, cwd: string): Promise<ActionResult> {
   try {
     const root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
-    const stdout = await runChecked(run, ["pull", "--ff-only"], root, 120_000);
-    return { ok: true, error: null, message: stdout.trim() || "已是最新" };
+    const before = await headOrNull(run, root);
+    await runChecked(run, ["pull", "--ff-only"], root, 120_000);
+    const after = (await runChecked(run, ["rev-parse", "HEAD"], root)).trim();
+    if (before === null) {
+      // Empty repository: the pull seeded the first commits.
+      return { ok: true, error: null, message: `已拉取到 ${after.slice(0, 8)}` };
+    }
+    if (before === after) {
+      return { ok: true, error: null, message: "已是最新，没有可拉取的提交" };
+    }
+    const countText = await runChecked(run, ["rev-list", "--count", `${before}..${after}`], root);
+    const commits = Number.parseInt(countText.trim(), 10) || 0;
+    const statText = await runChecked(run, ["diff", "--no-ext-diff", "--shortstat", before, after], root);
+    return { ok: true, error: null, message: formatPullSummary(before, after, commits, parseShortStat(statText)) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err), message: null };
   }

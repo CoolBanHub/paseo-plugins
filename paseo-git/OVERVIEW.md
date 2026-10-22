@@ -34,7 +34,9 @@ pane below — like the JetBrains Git Log view.
   合并提交按 first-parent 展示其带来的变更。
 - **状态头** — 仓库名、当前分支、领先/落后上游、工作区改动计数；
   获取（`fetch --prune`）、拉取（`pull --ff-only`，发散时拒绝并报 git 原文）、
-  手动刷新；面板打开期间每 45 秒静默刷新。
+  手动刷新；面板打开期间每 45 秒静默刷新。拉取成功后只提示一行摘要
+  （快进的提交数与新旧哈希、改动文件数、增删行），不再把 git 的整屏
+  diffstat 倒进 toast。
 - **网络代理** — 设置页（Paseo 设置 > Git 代理）可填写代理地址
   （`http://127.0.0.1:7897` 或 `socks5://…`，留空直连），拉取 GitHub 等
   远端时由守护进程注入 `HTTP(S)_PROXY`/`ALL_PROXY`；可选让
@@ -49,8 +51,10 @@ pane below — like the JetBrains Git Log view.
   the daemon over typed zod RPC contracts (`shared/contracts.ts`).
 - Server: handlers run `git` through the SDK's `execCommand`
   (`server/git-runner.ts`) with `LC_ALL=C` and `GIT_OPTIONAL_LOCKS=0`;
-  parsing lives in `server/git-ops.ts` with runner injection so tests
-  exercise the real git binary. Host-scoped proxy settings
+  every git-ops invocation also carries `-c core.quotepath=false` so
+  non-ASCII (e.g. Chinese) paths print verbatim instead of C-style octal
+  escapes. Parsing lives in `server/git-ops.ts` with runner injection so
+  tests exercise the real git binary. Host-scoped proxy settings
   (`shared/settings.ts`, `server/proxy-env.ts`) are applied as extra
   environment variables on every git invocation — inert for local
   commands, steering only the network transports.

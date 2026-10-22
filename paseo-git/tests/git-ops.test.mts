@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { test } from "node:test";
 import {
+  formatPullSummary,
   gitBranchCreate,
   gitBranchDelete,
   gitBranches,
   gitCommit,
   gitLog,
   gitPaths,
+  gitPull,
   gitStatus,
   gitCheckout,
   gitTagCreate,
@@ -24,6 +26,7 @@ import {
   parseLogBody,
   parseNameStatusTokens,
   parseNumstatTokens,
+  parseShortStat,
   parseStatusBody,
   parseTagsBody,
   parseWorktreeList,
@@ -226,6 +229,21 @@ test("gitPaths 按层级列出跟踪的目录与文件", async () => {
 
     const bad = await gitPaths(testRun, repo.root, "../escape");
     assert.equal(bad.ok, false);
+  });
+});
+
+test("gitPaths 中文文件名按 UTF-8 原样返回（不转义成八进制）", async () => {
+  await withFixtureRepo(async (repo) => {
+    await mkdir(join(repo.root, "文档"), { recursive: true });
+    await writeFile(join(repo.root, "文档", "说明.md"), "# 说明\n", "utf8");
+    await git(repo.root, "add", "--", "文档/说明.md");
+    await git(repo.root, "commit", "-q", "-m", "添加中文文档");
+
+    const rootLevel = await gitPaths(testRun, repo.root, "");
+    assert.ok(rootLevel.dirs.includes("文档"), JSON.stringify(rootLevel.dirs));
+
+    const inner = await gitPaths(testRun, repo.root, "文档");
+    assert.deepEqual(inner.files, ["说明.md"]);
   });
 });
 
@@ -552,3 +570,87 @@ test("parseTagsBody 忽略残缺记录", () => {
   assert.equal(parseTagsBody("").length, 0);
   assert.equal(parseTagsBody("garbage\n\n").length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// fetch / pull
+// ---------------------------------------------------------------------------
+
+test("parseShortStat 解析文件数与增删行", () => {
+  assert.deepEqual(parseShortStat(""), { files: 0, additions: 0, deletions: 0 });
+  assert.deepEqual(parseShortStat(" 3 files changed, 12 insertions(+), 4 deletions(-)"), {
+    files: 3,
+    additions: 12,
+    deletions: 4,
+  });
+  assert.deepEqual(parseShortStat(" 1 file changed, 5 deletions(-)"), {
+    files: 1,
+    additions: 0,
+    deletions: 5,
+  });
+  assert.deepEqual(parseShortStat(" 2 files changed"), { files: 2, additions: 0, deletions: 0 });
+});
+
+test("formatPullSummary 输出单行摘要", () => {
+  const before = "9a4a53ed00000000000000000000000000000000";
+  const after = "ffc7185900000000000000000000000000000000";
+  assert.equal(
+    formatPullSummary(before, after, 2, { files: 2, additions: 2, deletions: 0 }),
+    "已快进 2 个提交（9a4a53ed → ffc71859），更新 2 个文件（+2 −0）",
+  );
+  // 只改二进制时 diff —shortstat 不报增删行
+  assert.equal(
+    formatPullSummary(before, after, 1, { files: 1, additions: 0, deletions: 0 }),
+    "已快进 1 个提交（9a4a53ed → ffc71859），更新 1 个文件",
+  );
+  assert.equal(
+    formatPullSummary(before, after, 3, { files: 0, additions: 0, deletions: 0 }),
+    "已快进 3 个提交（9a4a53ed → ffc71859）",
+  );
+});
+
+test("gitPull 快进后返回简短摘要而不是原始 diffstat", async () => {
+  const base = await mkdtemp(join(tmpdir(), "paseo-git-pull-"));
+  try {
+    const origin = join(base, "origin");
+    await initRepo(origin);
+    await writeFile(join(origin, "a.txt"), "one\n", "utf8");
+    const c1 = await commitAll(origin, "c1");
+
+    const clone = join(base, "clone");
+    await git(base, "clone", "-q", origin, clone);
+
+    await mkdir(join(origin, "文档"), { recursive: true });
+    await writeFile(join(origin, "文档", "说明.md"), "# 说明\n", "utf8");
+    await commitAll(origin, "添加中文文档");
+    await writeFile(join(origin, "a.txt"), "one\ntwo\n", "utf8");
+    const c3 = await commitAll(origin, "修改 a.txt");
+
+    const result = await gitPull(testRun, clone);
+    assert.equal(result.ok, true, result.error ?? "");
+    const message = result.message ?? "";
+    assert.ok(!message.includes("\n"), `摘要只有一行：${message}`);
+    assert.match(message, /快进 2 个提交/);
+    assert.match(message, /2 个文件（\+2 −0）/);
+    assert.ok(message.includes(c1.slice(0, 8)) && message.includes(c3.slice(0, 8)), message);
+
+    const again = await gitPull(testRun, clone);
+    assert.equal(again.ok, true, again.error ?? "");
+    assert.match(again.message ?? "", /已是最新/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+async function initRepo(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await git(dir, "init", "--initial-branch=main");
+  await git(dir, "config", "user.name", "李四");
+  await git(dir, "config", "user.email", "li@example.com");
+  await git(dir, "config", "commit.gpgsign", "false");
+}
+
+async function commitAll(dir: string, message: string): Promise<string> {
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-q", "-m", message);
+  return (await git(dir, "rev-parse", "HEAD")).trim();
+}
