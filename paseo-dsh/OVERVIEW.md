@@ -136,8 +136,12 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   JSONL sidecar; the connector tails it and surfaces every sub-call as its
   own detailed Paseo timeline row (Shell, Read, Edit, Search, Fetch — the
   same rows the ZCode provider shows), including per-call status, output
-  and todo list updates. Only live sessions' records are mirrored, and the
-  sidecar is removed when the process exits.
+  and todo list updates. The aggregate `run_code` tool-call updates are
+  dropped from the wire so no opaque "Run code" JSON rows remain; a program
+  that dispatched no tools still leaves one row labeled with its
+  description and carrying its printed output (or error). Only live
+  sessions' records are mirrored, and the sidecar is removed when the
+  process exits.
 
 ## Development
 

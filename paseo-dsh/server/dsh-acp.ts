@@ -562,6 +562,41 @@ function ptcResultText(content: unknown): string {
     .join("\n");
 }
 
+/**
+ * Extract the printed output of an aggregate run_code tool_call_update. dsh
+ * nests the text one level deeper than the dispatch records
+ * (`[{type:"content", content:{type:"text", text}}]`) and failed updates may
+ * carry a plain object instead.
+ */
+function aggregateOutputText(content: unknown): string {
+  const blocks = Array.isArray(content)
+    ? content.filter((block): block is Record<string, unknown> => !!block && typeof block === "object")
+    : content && typeof content === "object"
+      ? [content as Record<string, unknown>]
+      : [];
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (typeof block.text === "string") {
+      parts.push(block.text);
+      continue;
+    }
+    const inner = block.content;
+    if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+      const text = (inner as Record<string, unknown>).text;
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
+/** A PTC program's aggregate `run_code` call, kept for the fallback row. */
+interface RunCodeProgram {
+  description?: string;
+  code?: string;
+  output?: string;
+  failed?: boolean;
+}
+
 /** JSONL record the bridge plugin inside dsh appends per PTC dispatch. */
 interface PtcMirrorRecord {
   kind?: unknown;
@@ -732,6 +767,13 @@ export function createDshConnector(
     // ACP sessions opened through this connection that are not catalog
     // probes; only their PTC mirror records become timeline rows.
     const liveSessions = new Set<string>();
+    // PTC aggregates by toolCallId. The aggregate `run_code` rows are dropped
+    // from the wire (their mirrored sub-call rows already cover the program),
+    // but a dispatch-free program still needs one fallback row.
+    const runCodePrograms = new Map<string, RunCodeProgram>();
+    // rootCallIds of aggregates whose sub-call rows were already mirrored.
+    const mirroredRootCallIds = new Set<string>();
+    let mirroredCallsUnrooted = false;
     let stopPtcMirror: () => void = () => {};
 
     const writer = base.writable.getWriter();
@@ -914,6 +956,79 @@ export function createDshConnector(
       log("enriched permission request", { toolCallId: call.toolCallId, title: snapshot?.title });
     };
 
+    /**
+     * In PTC mode dsh reports one aggregate `run_code` tool call per program
+     * (title "run_code", kind "other"), while the per-tool dispatches only
+     * reach the PTC sidecar. Recognize the aggregate's tool_call and any
+     * follow-up tool_call_update for a tracked aggregate.
+     */
+    const isRunCodeAggregate = (update: Record<string, unknown> | undefined): boolean => {
+      if (!update) return false;
+      if (update.sessionUpdate === "tool_call") {
+        const name = update.title ?? update.name;
+        return typeof name === "string" && name.toLowerCase() === "run_code";
+      }
+      return update.sessionUpdate === "tool_call_update" &&
+        typeof update.toolCallId === "string" &&
+        runCodePrograms.has(update.toolCallId);
+    };
+
+    const handleRunCodeAggregate = (sessionId: unknown, update: Record<string, unknown>): void => {
+      const toolCallId = update.toolCallId as string;
+      if (update.sessionUpdate === "tool_call") {
+        const raw = update.rawInput;
+        let input: Record<string, unknown> = {};
+        if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+          input = raw as Record<string, unknown>;
+        } else if (typeof raw === "string") {
+          try {
+            input = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            // A non-JSON payload leaves the fallback row unlabeled.
+          }
+        }
+        runCodePrograms.set(toolCallId, {
+          description: typeof input.description === "string" ? input.description : undefined,
+          code: typeof input.code === "string" ? input.code : undefined,
+        });
+        return;
+      }
+      const program = runCodePrograms.get(toolCallId);
+      if (!program) return;
+      const output = aggregateOutputText(update.content) || aggregateOutputText(update.rawOutput);
+      if (output) program.output = output;
+      if (update.status === "failed") program.failed = true;
+      if (update.status !== "completed" && update.status !== "failed") return;
+      runCodePrograms.delete(toolCallId);
+      // The bridge writes every dispatch record before the program settles;
+      // one synchronous drain closes the watcher-latency window so the
+      // fallback cannot duplicate already-mirrored rows.
+      drainPtcEvents();
+      if (mirroredCallsUnrooted || mirroredRootCallIds.has(toolCallId)) return;
+      if (typeof sessionId !== "string" || !liveSessions.has(sessionId)) return;
+      try {
+        fromAgentController?.enqueue({
+          jsonrpc: "2.0",
+          method: DSH_PTC_RESULT_METHOD,
+          params: {
+            subCallId: `${toolCallId}:program`,
+            rootCallId: toolCallId,
+            name: "run_code",
+            arguments: { description: program.description, code: program.code },
+            isError: program.failed === true,
+            output: program.output ?? "",
+          },
+        });
+      } catch {
+        // The consumer tore the stream down; the row is dropped with it.
+        return;
+      }
+      log("surfaced ptc program without dispatched tools", {
+        toolCallId,
+        description: program.description,
+      });
+    };
+
     const fromAgent = base.readable.pipeThrough(
       new TransformStream<AcpStreamMessage, AcpStreamMessage>({
         start(controller) {
@@ -936,7 +1051,17 @@ export function createDshConnector(
                   const oldest = toolSnapshots.keys().next().value;
                   if (oldest !== undefined) toolSnapshots.delete(oldest);
                 }
-              } else if (update?.sessionUpdate === "config_option_update") {
+              }
+              if (processMode === "ptc" && isRunCodeAggregate(update)) {
+                handleRunCodeAggregate(
+                  (message.params as { sessionId?: unknown }).sessionId,
+                  update as Record<string, unknown>,
+                );
+                // Paseo would render the aggregate as an opaque "Run code"
+                // JSON row; the mirrored sub-call rows replace it.
+                return;
+              }
+              if (update?.sessionUpdate === "config_option_update") {
                 const sessionId = (message.params as { sessionId?: unknown }).sessionId;
                 if (typeof sessionId === "string") {
                   const catalog = readPermissionCatalog(permissionCatalogFile);
@@ -1077,6 +1202,10 @@ export function createDshConnector(
       } catch {
         // The consumer tore the stream down; nothing left to mirror for.
         return false;
+      }
+      if (record.kind === "call") {
+        if (typeof data.rootCallId === "string") mirroredRootCallIds.add(data.rootCallId);
+        else mirroredCallsUnrooted = true;
       }
       return true;
     };

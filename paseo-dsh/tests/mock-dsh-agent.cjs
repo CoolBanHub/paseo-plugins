@@ -157,7 +157,45 @@ rl.on("line", (line) => {
       const prompt = Array.isArray(message.params?.prompt)
         ? message.params.prompt.map((part) => part.text ?? "").join("\n")
         : "";
-      mirrorPtcDispatches(message.params?.sessionId);
+      const dispatchesTools = !prompt.includes("no dispatch");
+      if (dispatchesTools) mirrorPtcDispatches(message.params?.sessionId);
+      // Like real dsh PTC: one aggregate run_code tool call wraps the
+      // program; only the title says "run_code", and the settle update
+      // carries nested content blocks.
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: message.params?.sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call-ptc-1",
+            title: "run_code",
+            kind: "other",
+            status: "in_progress",
+            rawInput: {
+              code: "const r = await tools.bash({ command: 'ls -la' });\nconsole.log(r);",
+              description: dispatchesTools ? "List repo root" : "Compute without tools",
+            },
+          },
+        },
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: message.params?.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call-ptc-1",
+            status: "completed",
+            content: [{
+              type: "content",
+              content: { type: "text", text: dispatchesTools ? "file-a\nfile-b" : "computed offline" },
+            }],
+          },
+        },
+      });
       send({
         jsonrpc: "2.0",
         method: "session/update",

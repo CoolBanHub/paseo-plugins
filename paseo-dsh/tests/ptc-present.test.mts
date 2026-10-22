@@ -65,6 +65,7 @@ type PtcNotification = { method: string; params: Record<string, unknown> };
 
 async function openConnection() {
   const ptcNotifications: PtcNotification[] = [];
+  const sessionUpdates: Array<Record<string, unknown>> = [];
   const stream = await createDshConnector(noLog, () => ({ cwd: "/tmp", mode: "ptc" }))();
   // Paseo's adapter diverts non-ACP notification methods to the plugin's
   // transformer before the SDK connection; mirror that routing here so the
@@ -85,13 +86,15 @@ async function openConnection() {
   );
   const client = {
     requestPermission: async () => ({ outcome: { outcome: "cancelled" as const } }),
-    sessionUpdate: () => undefined,
+    sessionUpdate: (notification: Record<string, unknown>) => {
+      sessionUpdates.push(notification);
+    },
   };
   const connection = new ClientSideConnection(
     () => client as never,
     { writable: stream.writable, readable } as never,
   );
-  return { stream, connection, ptcNotifications };
+  return { stream, connection, ptcNotifications, sessionUpdates };
 }
 
 async function waitForPtcRecords(notifications: PtcNotification[], count: number): Promise<void> {
@@ -127,6 +130,21 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
       prompt: [{ type: "text", text: "Run the program" }],
     });
     await waitForPtcRecords(conn.ptcNotifications, 6);
+    // Give any erroneous fallback a chance to arrive before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // The aggregate run_code row never reaches Paseo: the mirrored sub-call
+    // rows replace it, and no dispatch-free fallback duplicates them.
+    const aggregateUpdates = conn.sessionUpdates.filter((notification) => {
+      const update = notification.update as { sessionUpdate?: string; toolCallId?: string } | undefined;
+      return update?.sessionUpdate?.startsWith("tool_call") && update.toolCallId === "call-ptc-1";
+    });
+    assert.equal(aggregateUpdates.length, 0, "aggregate run_code tool updates are suppressed");
+    assert.equal(
+      conn.ptcNotifications.filter((notification) => notification.params.name === "run_code").length,
+      0,
+      "no fallback row while the program dispatched tools",
+    );
 
     // Each dispatched sub-call is announced, then settled, in dispatch order.
     assert.deepEqual(
@@ -196,4 +214,69 @@ test("transformer ignores unrelated and malformed notifications", () => {
   assert.equal(dshPtcTimelineUpdates("session/update", {}, "session"), null);
   assert.equal(dshPtcTimelineUpdates(DSH_PTC_CALL_METHOD, { name: "bash" }, "session"), null);
   assert.equal(dshPtcTimelineUpdates(DSH_PTC_CALL_METHOD, "not-an-object", "session"), null);
+});
+
+test("a dispatch-free PTC program surfaces one fallback row", async () => {
+  const conn = await openConnection();
+  try {
+    await conn.connection.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    const session = await conn.connection.newSession({
+      cwd: "/tmp",
+      mcpServers: [],
+      _meta: { _paseo: {} },
+    } as never);
+    await conn.connection.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "Run the program with no dispatch" }],
+    });
+    await waitForPtcRecords(conn.ptcNotifications, 1);
+
+    // With no mirrored sub-calls the suppressed aggregate still leaves one
+    // settled row behind, labeled by the program's description and carrying
+    // its printed output.
+    assert.equal(
+      conn.ptcNotifications.filter((notification) => notification.params.name === "run_code").length,
+      1,
+      "exactly one fallback notification for the dispatch-free program",
+    );
+    const fallback = conn.ptcNotifications.find((notification) => notification.params.name === "run_code");
+    assert.equal(fallback?.method, DSH_PTC_RESULT_METHOD);
+    assert.deepEqual(
+      {
+        subCallId: fallback?.params.subCallId,
+        rootCallId: fallback?.params.rootCallId,
+        isError: fallback?.params.isError,
+        output: fallback?.params.output,
+      },
+      {
+        subCallId: "call-ptc-1:program",
+        rootCallId: "call-ptc-1",
+        isError: false,
+        output: "computed offline",
+      },
+    );
+    const updates = dshPtcTimelineUpdates(fallback!.method, fallback!.params, "paseo-session") ?? [];
+    const row = updates.find((update) => update.type === "timeline")?.item;
+    assert.equal(row?.type, "tool_call");
+    if (row?.type === "tool_call") {
+      assert.equal(row.status, "completed");
+      assert.deepEqual(
+        row.detail,
+        { type: "plain_text", label: "Compute without tools", text: "computed offline", icon: "square_terminal" },
+        "the fallback row renders the program description with its output",
+      );
+    }
+
+    const aggregateUpdates = conn.sessionUpdates.filter((notification) => {
+      const update = notification.update as { sessionUpdate?: string; toolCallId?: string } | undefined;
+      return update?.sessionUpdate?.startsWith("tool_call") && update.toolCallId === "call-ptc-1";
+    });
+    assert.equal(aggregateUpdates.length, 0, "the aggregate row stays suppressed");
+  } finally {
+    await conn.stream.writable.close();
+  }
 });

@@ -74,6 +74,15 @@ export function dshToolDetail(name: string, args: Record<string, unknown> | unde
     case "web_fetch":
     case "web":
       return { type: "fetch", url: text(input.url) ?? "" };
+    case "run_code":
+      // Fallback row for a PTC program that dispatched no tools: the
+      // description labels it and the code stands in for its activity.
+      return {
+        type: "plain_text",
+        label: text(input.description) ?? "Run code",
+        text: text(input.code)?.slice(0, 4000),
+        icon: "square_terminal",
+      };
     case "subagent":
       return {
         type: "sub_agent",
@@ -105,6 +114,10 @@ function withOutput(detail: ProviderToolCallDetail, output: string): ProviderToo
       return { ...detail, content: output.slice(0, 4000) };
     case "fetch":
       return { ...detail, result: output.slice(0, 4000) };
+    case "plain_text":
+      // Keep a non-empty detail text (e.g. the run_code fallback's program)
+      // unless the call produced output worth showing instead.
+      return output ? { ...detail, text: output.slice(0, 4000) } : detail;
     default:
       return detail;
   }
