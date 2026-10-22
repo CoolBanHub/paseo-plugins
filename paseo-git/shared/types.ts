@@ -86,6 +86,36 @@ export interface CommitDetail extends RawError {
   totalDeletions: number;
 }
 
+export interface TagEntry {
+  name: string;
+  shortName: string;
+  /** Tag object hash when annotated, otherwise the commit hash. */
+  hash: string;
+  /** The commit the tag ultimately points at (peeled for annotated tags). */
+  commitHash: string;
+  subject: string;
+  date: string;
+  annotated: boolean;
+}
+
+export interface TagsResult extends RawError {
+  tags: TagEntry[];
+}
+
+export interface WorktreeEntry {
+  path: string;
+  head: string;
+  /** Full branch ref; null for detached or bare worktrees. */
+  branch: string | null;
+  detached: boolean;
+  bare: boolean;
+  isMain: boolean;
+}
+
+export interface WorktreesResult extends RawError {
+  worktrees: WorktreeEntry[];
+}
+
 export interface ActionResult extends RawError {
   message: string | null;
 }

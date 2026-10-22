@@ -20,6 +20,8 @@ import {
 } from "./filters";
 import { HoverPressable, MONO_FONT, type PanelTheme } from "./parts";
 import {
+  gitBranchCreateRpc,
+  gitBranchDeleteRpc,
   gitBranchesRpc,
   gitCheckoutRpc,
   gitCommitRpc,
@@ -27,8 +29,24 @@ import {
   gitLogRpc,
   gitPullRpc,
   gitStatusRpc,
+  gitTagCreateRpc,
+  gitTagDeleteRpc,
+  gitTagsRpc,
+  gitWorktreeAddRpc,
+  gitWorktreePruneRpc,
+  gitWorktreeRemoveRpc,
+  gitWorktreesRpc,
 } from "../shared/contracts";
-import type { BranchesResult, CommitDetail, CommitSummary, LogResult, StatusResult } from "../shared/types";
+import type {
+  ActionResult,
+  BranchesResult,
+  CommitDetail,
+  CommitSummary,
+  LogResult,
+  StatusResult,
+  TagsResult,
+  WorktreesResult,
+} from "../shared/types";
 
 const PAGE_SIZE = 300;
 const AUTO_REFRESH_MS = 45_000;
@@ -43,9 +61,20 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   const checkoutRpc = useRpc(gitCheckoutRpc);
   const fetchRpc = useRpc(gitFetchRpc);
   const pullRpc = useRpc(gitPullRpc);
+  const tagsRpc = useRpc(gitTagsRpc);
+  const tagCreateRpc = useRpc(gitTagCreateRpc);
+  const tagDeleteRpc = useRpc(gitTagDeleteRpc);
+  const branchCreateRpc = useRpc(gitBranchCreateRpc);
+  const branchDeleteRpc = useRpc(gitBranchDeleteRpc);
+  const worktreesRpc = useRpc(gitWorktreesRpc);
+  const worktreeAddRpc = useRpc(gitWorktreeAddRpc);
+  const worktreeRemoveRpc = useRpc(gitWorktreeRemoveRpc);
+  const worktreePruneRpc = useRpc(gitWorktreePruneRpc);
 
   const [status, setStatus] = useState<StatusResult | null>(null);
   const [branches, setBranches] = useState<BranchesResult | null>(null);
+  const [tags, setTags] = useState<TagsResult | null>(null);
+  const [worktrees, setWorktrees] = useState<WorktreesResult | null>(null);
   const [log, setLog] = useState<LogResult | null>(null);
   const [scope, setScope] = useState<string>("ALL");
   const [search, setSearch] = useState("");
@@ -67,12 +96,16 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       if (!repoPath) return;
       if (!options.quiet) setBusy("refresh");
       try {
-        const [nextStatus, nextBranches] = await Promise.all([
+        const [nextStatus, nextBranches, nextTags, nextWorktrees] = await Promise.all([
           statusRpc({ repoPath }),
           branchesRpc({ repoPath }),
+          tagsRpc({ repoPath }),
+          worktreesRpc({ repoPath }),
         ]);
         setStatus(nextStatus);
         setBranches(nextBranches);
+        setTags(nextTags);
+        setWorktrees(nextWorktrees);
         if (nextStatus.ok) {
           const nextLog = await logRpc({ repoPath, ref: scope, limit: PAGE_SIZE, skip: 0, path: pathFilter });
           setLog(nextLog);
@@ -93,7 +126,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
         if (!options.quiet) setBusy(null);
       }
     },
-    [branchesRpc, logRpc, pathFilter, scope, statusRpc, toast],
+    [branchesRpc, logRpc, pathFilter, scope, statusRpc, tagsRpc, toast, worktreesRpc],
   );
 
   useEffect(() => {
@@ -103,6 +136,8 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
     } else {
       setStatus(null);
       setBranches(null);
+      setTags(null);
+      setWorktrees(null);
       setLog(null);
     }
     // scope intentionally excluded: changing scope reloads below.
@@ -221,6 +256,103 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
     }
   }, [afterMutation, pullRpc, toast]);
 
+  /** Shared toast/refresh plumbing for the write actions (branch/tag/worktree). */
+  const runAction = useCallback(
+    async (busyKey: string, fallbackError: string, invoke: () => Promise<ActionResult>) => {
+      const repoPath = repoPathRef.current;
+      if (!repoPath) return;
+      setBusy(busyKey);
+      try {
+        const result = await invoke();
+        if (result.ok) {
+          toast.show(result.message ?? "操作完成", { variant: "success" });
+          afterMutation();
+        } else {
+          toast.error(result.error ?? fallbackError);
+        }
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [afterMutation, toast],
+  );
+
+  const onCreateBranch = useCallback(
+    (name: string, startPoint: string, checkout: boolean) => {
+      void runAction("branch-create", "创建分支失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return branchCreateRpc({ repoPath, name, startPoint, checkout });
+      });
+    },
+    [branchCreateRpc, runAction],
+  );
+
+  const onDeleteBranch = useCallback(
+    (name: string, force: boolean) => {
+      void runAction("branch-delete", "删除分支失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return branchDeleteRpc({ repoPath, name, force });
+      });
+    },
+    [branchDeleteRpc, runAction],
+  );
+
+  const onCreateTag = useCallback(
+    (name: string, ref: string, message: string) => {
+      void runAction("tag-create", "创建标签失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return tagCreateRpc({ repoPath, name, ref, message });
+      });
+    },
+    [runAction, tagCreateRpc],
+  );
+
+  const onDeleteTag = useCallback(
+    (name: string) => {
+      void runAction("tag-delete", "删除标签失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return tagDeleteRpc({ repoPath, name });
+      });
+    },
+    [runAction, tagDeleteRpc],
+  );
+
+  const onAddWorktree = useCallback(
+    (path: string, newBranch: string, ref: string) => {
+      void runAction("worktree-add", "添加 worktree 失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return worktreeAddRpc({ repoPath, path, newBranch, ref });
+      });
+    },
+    [runAction, worktreeAddRpc],
+  );
+
+  const onRemoveWorktree = useCallback(
+    (path: string, force: boolean) => {
+      void runAction("worktree-remove", "移除 worktree 失败", async () => {
+        const repoPath = repoPathRef.current;
+        if (!repoPath) throw new Error("工作区不可用");
+        return worktreeRemoveRpc({ repoPath, path, force });
+      });
+    },
+    [runAction, worktreeRemoveRpc],
+  );
+
+  const onPruneWorktrees = useCallback(() => {
+    void runAction("worktree-prune", "清理失败", async () => {
+      const repoPath = repoPathRef.current;
+      if (!repoPath) throw new Error("工作区不可用");
+      return worktreePruneRpc({ repoPath });
+    });
+  }, [runAction, worktreePruneRpc]);
+
   const onLoadMore = useCallback(async () => {
     const repoPath = repoPathRef.current;
     if (!repoPath || !log?.ok || loadingMore) return;
@@ -287,6 +419,8 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       directory={directory}
       status={status}
       branches={branches}
+      tags={tags}
+      worktrees={worktrees}
       scope={scope}
       busy={busy}
       onSelectScope={(ref) => {
@@ -297,6 +431,13 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       onFetch={onFetch}
       onPull={onPull}
       onRefresh={() => void refresh()}
+      onCreateBranch={onCreateBranch}
+      onDeleteBranch={onDeleteBranch}
+      onCreateTag={onCreateTag}
+      onDeleteTag={onDeleteTag}
+      onAddWorktree={onAddWorktree}
+      onRemoveWorktree={onRemoveWorktree}
+      onPruneWorktrees={onPruneWorktrees}
     />
   ) : null;
 
@@ -354,6 +495,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
           <BranchScopeDropdown
             theme={theme}
             branches={branches}
+            tags={tags}
             status={status}
             scope={scope}
             onChange={(ref) => setScope(ref)}

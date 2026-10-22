@@ -37,6 +37,30 @@ const remoteBranch = z.object({
   date: isoDate,
 });
 
+const tagEntry = z.object({
+  name: z.string(),
+  shortName: z.string(),
+  hash: z.string(),
+  commitHash: z.string(),
+  subject: z.string(),
+  date: isoDate,
+  annotated: z.boolean(),
+});
+
+const worktreeEntry = z.object({
+  path: z.string(),
+  head: z.string(),
+  branch: z.string().nullable(),
+  detached: z.boolean(),
+  bare: z.boolean(),
+  isMain: z.boolean(),
+});
+
+// Ref names only: reject anything that could parse as a git option.
+// The optional flavour admits "" so callers can leave a start point unset.
+const refName = z.string().regex(/^(?!-)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/);
+const optionalRefName = z.string().regex(/^(?!-)(?:[A-Za-z0-9][A-Za-z0-9._/@+-]*)?$/);
+
 const commitSummary = z.object({
   hash: z.string(),
   shortHash: z.string(),
@@ -142,9 +166,110 @@ export const gitPathsRpc = defineRpc({
 export const gitCheckoutRpc = defineRpc({
   name: "git.checkout",
   input: repoInput.extend({
-    // Ref names only: reject anything that could parse as a git option.
-    ref: z.string().regex(/^(?!-)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/),
+    ref: refName,
   }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitBranchCreateRpc = defineRpc({
+  name: "git.branch.create",
+  input: repoInput.extend({
+    name: refName,
+    /** Commit/branch to start from; empty means current HEAD. */
+    startPoint: optionalRefName.default("HEAD"),
+    /** Also check the new branch out. */
+    checkout: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitBranchDeleteRpc = defineRpc({
+  name: "git.branch.delete",
+  input: repoInput.extend({
+    name: refName,
+    /** -D instead of -d: drop unmerged commits after confirm. */
+    force: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitTagsRpc = defineRpc({
+  name: "git.tags",
+  input: repoInput,
+  output: gitError.extend({
+    tags: z.array(tagEntry),
+  }),
+});
+
+export const gitTagCreateRpc = defineRpc({
+  name: "git.tag.create",
+  input: repoInput.extend({
+    name: refName,
+    /** Commit/branch to tag; empty means current HEAD. */
+    ref: optionalRefName.default("HEAD"),
+    /** Non-empty creates an annotated tag with this message. */
+    message: z.string().max(2000).default(""),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitTagDeleteRpc = defineRpc({
+  name: "git.tag.delete",
+  input: repoInput.extend({
+    name: refName,
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitWorktreesRpc = defineRpc({
+  name: "git.worktrees",
+  input: repoInput,
+  output: gitError.extend({
+    worktrees: z.array(worktreeEntry),
+  }),
+});
+
+export const gitWorktreeAddRpc = defineRpc({
+  name: "git.worktree.add",
+  input: repoInput.extend({
+    /** Folder name resolved next to the repo, or an absolute path. */
+    path: z.string().min(1).max(400),
+    /** Create this new branch inside the worktree (-b). */
+    newBranch: optionalRefName.default(""),
+    /** Existing ref to check out; with newBranch it is the branch point. */
+    ref: optionalRefName.default(""),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitWorktreeRemoveRpc = defineRpc({
+  name: "git.worktree.remove",
+  input: repoInput.extend({
+    /** Must match a registered non-main worktree path exactly. */
+    path: z.string().min(1).max(2000),
+    /** --force to discard uncommitted or locked content after confirm. */
+    force: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitWorktreePruneRpc = defineRpc({
+  name: "git.worktree.prune",
+  input: repoInput,
   output: gitError.extend({
     message: z.string().nullable(),
   }),

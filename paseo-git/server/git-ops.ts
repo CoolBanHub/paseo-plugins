@@ -4,6 +4,13 @@
  * daemon wires in the SDK process helper.
  */
 
+import { realpath } from "node:fs/promises";
+import {
+  basename as pathBasename,
+  dirname as pathDirname,
+  isAbsolute as pathIsAbsolute,
+  join as pathJoin,
+} from "node:path";
 import type {
   ActionResult,
   BranchEntry,
@@ -17,6 +24,10 @@ import type {
   PathsResult,
   RawError,
   StatusResult,
+  TagEntry,
+  TagsResult,
+  WorktreeEntry,
+  WorktreesResult,
 } from "../shared/types";
 
 export type {
@@ -32,6 +43,10 @@ export type {
   PathsResult,
   RawError,
   StatusResult,
+  TagEntry,
+  TagsResult,
+  WorktreeEntry,
+  WorktreesResult,
 };
 
 const FS = "\u001f"; // unit separator between fields of one record
@@ -48,6 +63,20 @@ const REF_FORMAT = [
   "%(if)%(HEAD)%(then)1%(else)0%(end)",
   "%(subject)",
 ].join(US);
+const TAG_FORMAT = [
+  "%(refname)",
+  "%(refname:short)",
+  "%(objectname)",
+  "%(objecttype)",
+  "%(*objectname)",
+  "%(creatordate:iso8601-strict)",
+  "%(subject)",
+].join(US);
+
+/** Ref names only: rejects leading dashes (option injection) and shell-unsafe bytes. */
+export function isValidRefName(name: string): boolean {
+  return /^(?!-)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/.test(name);
+}
 
 export function describeError(err: unknown): string {
   const stderr = (err as { stderr?: unknown }).stderr;
@@ -262,7 +291,7 @@ export async function gitLog(
   path = "",
 ): Promise<LogResult> {
   const failed = (error: string): LogResult => ({ ok: false, error, commits: [], hasMore: false });
-  if (ref !== "ALL" && !/^(?!-)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/.test(ref)) {
+  if (ref !== "ALL" && !isValidRefName(ref)) {
     return failed("无效的分支名");
   }
   const pathFilter = path.trim().slice(0, 512);
@@ -518,16 +547,324 @@ export async function gitPaths(run: GitRun, cwd: string, dir: string): Promise<P
 }
 
 // ---------------------------------------------------------------------------
+// tags
+// ---------------------------------------------------------------------------
+
+export function parseTagsBody(body: string): TagEntry[] {
+  const tags: TagEntry[] = [];
+  for (const record of body.split("\n")) {
+    if (record.trim().length === 0) continue;
+    const fields = record.split(US);
+    if (fields.length < 7) continue;
+    const [name, shortName, hash, objectType, peeled, date, subject] = fields;
+    if (!name || !hash) continue;
+    const annotated = objectType === "tag";
+    tags.push({
+      name,
+      shortName: shortName ?? name.slice("refs/tags/".length),
+      hash,
+      // Annotated tags point at a tag object; %(*objectname) peels to the commit.
+      commitHash: (peeled && peeled.length > 0 ? peeled : hash) ?? "",
+      subject: subject ?? "",
+      date: date ?? "",
+      annotated,
+    });
+  }
+  return tags;
+}
+
+export async function gitTags(run: GitRun, cwd: string): Promise<TagsResult> {
+  const failed = (error: string): TagsResult => ({ ok: false, error, tags: [] });
+  let root: string;
+  try {
+    root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+  try {
+    const body = await runChecked(
+      run,
+      ["for-each-ref", "--sort=-creatordate", `--format=${TAG_FORMAT}`, "refs/tags"],
+      root,
+    );
+    return { ok: true, error: null, tags: parseTagsBody(body) };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// worktrees
+// ---------------------------------------------------------------------------
+
+/** Parse `git worktree list --porcelain`: blank-line separated attribute blocks. */
+export function parseWorktreeList(body: string): WorktreeEntry[] {
+  const worktrees: WorktreeEntry[] = [];
+  let current: WorktreeEntry | null = null;
+  const flush = () => {
+    if (current && current.path.length > 0) worktrees.push(current);
+    current = null;
+  };
+  for (const line of body.split("\n")) {
+    const text = line.replace(/\r$/, "");
+    if (text.trim().length === 0) {
+      flush();
+      continue;
+    }
+    if (text.startsWith("worktree ")) {
+      flush();
+      current = {
+        path: text.slice("worktree ".length).trim(),
+        head: "",
+        branch: null,
+        detached: false,
+        bare: false,
+        isMain: false,
+      };
+    } else if (!current) {
+      continue;
+    } else if (text.startsWith("HEAD ")) {
+      current.head = text.slice("HEAD ".length).trim();
+    } else if (text.startsWith("branch ")) {
+      current.branch = text.slice("branch ".length).trim();
+    } else if (text === "bare") {
+      current.bare = true;
+    } else if (text === "detached") {
+      current.detached = true;
+    }
+    // "locked <reason>" / "prunable <reason>" carry no UI weight yet.
+  }
+  flush();
+  if (worktrees.length > 0) worktrees[0]!.isMain = true;
+  return worktrees;
+}
+
+async function gitRoot(run: GitRun, cwd: string): Promise<{ root: string } | { error: string }> {
+  try {
+    return { root: (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim() };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * git reports physical paths while callers hand us symlinked ones (e.g.
+ * macOS /var vs /private/var); normalise every worktree path through
+ * realpath so add/list/remove compare against the same strings.
+ */
+async function realpathSafe(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    return path;
+  }
+}
+
+async function listWorktreeEntries(run: GitRun, root: string): Promise<WorktreeEntry[]> {
+  const body = await runChecked(run, ["worktree", "list", "--porcelain"], root);
+  const entries = parseWorktreeList(body);
+  await Promise.all(
+    entries.map(async (entry) => {
+      entry.path = await realpathSafe(entry.path);
+    }),
+  );
+  return entries;
+}
+
+export async function gitWorktrees(run: GitRun, cwd: string): Promise<WorktreesResult> {
+  const failed = (error: string): WorktreesResult => ({ ok: false, error, worktrees: [] });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    return { ok: true, error: null, worktrees: await listWorktreeEntries(run, rootInfo.root) };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Relative folder names land next to the repository (like the usual
+ * `git worktree add ../name`); absolute paths pass through. Traversal and
+ * empty components are rejected before git ever sees them.
+ */
+export function resolveWorktreePath(root: string, input: string): string | null {
+  const trimmed = input.trim().replace(/\/+$/, "");
+  if (trimmed.length === 0 || trimmed.includes("\0")) return null;
+  if (pathIsAbsolute(trimmed)) return trimmed;
+  const parts = trimmed.split(/[\\/]/);
+  if (parts.some((part) => part.length === 0 || part === "..")) return null;
+  return pathJoin(pathDirname(root), ...parts);
+}
+
+export async function gitWorktreeAdd(
+  run: GitRun,
+  cwd: string,
+  path: string,
+  newBranch: string,
+  ref: string,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (newBranch.length > 0 && !isValidRefName(newBranch)) return failed("无效的分支名");
+  if (ref.length > 0 && !isValidRefName(ref)) return failed("无效的起点");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const resolved = resolveWorktreePath(rootInfo.root, path);
+  if (resolved === null) return failed("无效的目录名");
+  // The target does not exist yet; canonicalise through its (existing) parent.
+  const canonical = pathJoin(await realpathSafe(pathDirname(resolved)), pathBasename(resolved));
+  try {
+    const args = ["worktree", "add"];
+    if (newBranch.length > 0) args.push("-b", newBranch);
+    args.push(canonical);
+    if (ref.length > 0) args.push(ref);
+    await runChecked(run, args, rootInfo.root, 60_000);
+    return { ok: true, error: null, message: `已添加 worktree ${canonical}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitWorktreeRemove(
+  run: GitRun,
+  cwd: string,
+  path: string,
+  force: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    // Match a registered worktree exactly: never remove by fuzzy path.
+    const worktrees = await listWorktreeEntries(run, rootInfo.root);
+    const requested = await realpathSafe(path.trim());
+    const target = worktrees.find((worktree) => worktree.path === requested);
+    if (!target) return failed("worktree 不存在");
+    if (target.isMain) return failed("主 worktree 不能移除");
+    const args = ["worktree", "remove"];
+    if (force) args.push("--force");
+    args.push(target.path);
+    await runChecked(run, args, rootInfo.root, 30_000);
+    return { ok: true, error: null, message: `已移除 worktree ${target.path}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitWorktreePrune(run: GitRun, cwd: string): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["worktree", "prune"], rootInfo.root, 30_000);
+    return { ok: true, error: null, message: "已清理失效的 worktree 记录" };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // actions
 // ---------------------------------------------------------------------------
 
 export async function gitCheckout(run: GitRun, cwd: string, ref: string): Promise<ActionResult> {
   try {
     const root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
-    const stdout = await runChecked(run, ["checkout", ref], root, 30_000);
-    return { ok: true, error: null, message: stdout.trim() || `已切换到 ${ref}` };
+    await runChecked(run, ["checkout", ref], root, 30_000);
+    // git's switch notes go to stderr, so detect the outcome state directly:
+    // symbolic-ref exits non-zero when HEAD is detached (tag/commit checkout).
+    let detached = false;
+    try {
+      await runChecked(run, ["symbolic-ref", "-q", "HEAD"], root);
+    } catch {
+      detached = true;
+    }
+    const message = detached ? `已检出 ${ref}（分离头指针）` : `已切换到 ${ref}`;
+    return { ok: true, error: null, message };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err), message: null };
+  }
+}
+
+export async function gitBranchCreate(
+  run: GitRun,
+  cwd: string,
+  name: string,
+  startPoint: string,
+  checkout: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!isValidRefName(name)) return failed("无效的分支名");
+  if (startPoint.length > 0 && !isValidRefName(startPoint)) return failed("无效的起点");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const args = checkout ? ["checkout", "-b", name] : ["branch", name];
+    if (startPoint.length > 0) args.push(startPoint);
+    await runChecked(run, args, rootInfo.root, 30_000);
+    return {
+      ok: true,
+      error: null,
+      message: checkout ? `已创建并检出 ${name}` : `已创建分支 ${name}`,
+    };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitBranchDelete(
+  run: GitRun,
+  cwd: string,
+  name: string,
+  force: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!isValidRefName(name)) return failed("无效的分支名");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    // -d keeps unmerged commits safe; -D only after the UI confirms.
+    await runChecked(run, ["branch", force ? "-D" : "-d", name], rootInfo.root, 15_000);
+    return { ok: true, error: null, message: `已删除分支 ${name}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitTagCreate(
+  run: GitRun,
+  cwd: string,
+  name: string,
+  ref: string,
+  message: string,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!isValidRefName(name)) return failed("无效的标签名");
+  if (ref.length > 0 && !isValidRefName(ref)) return failed("无效的目标");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const args = ["tag"];
+    const note = message.trim();
+    if (note.length > 0) args.push("-a", name, "-m", note.slice(0, 2000));
+    else args.push(name);
+    if (ref.length > 0) args.push(ref);
+    await runChecked(run, args, rootInfo.root, 15_000);
+    return { ok: true, error: null, message: `已创建标签 ${name}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitTagDelete(run: GitRun, cwd: string, name: string): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!isValidRefName(name)) return failed("无效的标签名");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["tag", "-d", name], rootInfo.root, 15_000);
+    return { ok: true, error: null, message: `已删除标签 ${name}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
   }
 }
 

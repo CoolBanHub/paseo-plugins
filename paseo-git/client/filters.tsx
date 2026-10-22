@@ -6,11 +6,11 @@ import { hashStringColor, mixWithBackground } from "./colors";
 import { isDateKey } from "./format";
 import { HoverPressable, MONO_FONT, type PanelTheme } from "./parts";
 import { gitPathsRpc } from "../shared/contracts";
-import type { BranchesResult, PathsResult, StatusResult } from "../shared/types";
+import type { BranchesResult, PathsResult, StatusResult, TagsResult } from "../shared/types";
 
 
 /** Fit a dialog inside the current window; keeps phones from clipping. */
-function dialogWidth(max: number): number {
+export function dialogWidth(max: number): number {
   const screen = Dimensions.get("window").width;
   return Math.max(240, Math.min(max, screen - 28));
 }
@@ -156,12 +156,14 @@ function OptionRow({
 export function BranchScopeDropdown({
   theme,
   branches,
+  tags,
   status,
   scope,
   onChange,
 }: {
   theme: PanelTheme;
   branches: BranchesResult | null;
+  tags: TagsResult | null;
   status: StatusResult | null;
   scope: string;
   onChange: (ref: string) => void;
@@ -172,8 +174,9 @@ export function BranchScopeDropdown({
   const match = (name: string) => needle.length === 0 || name.toLowerCase().includes(needle);
   const locals = (branches?.locals ?? []).filter((branch) => match(branch.shortName));
   const remotes = (branches?.remotes ?? []).filter((branch) => match(branch.shortName));
+  const tagList = (tags?.tags ?? []).filter((tag) => match(tag.shortName));
   const label =
-    scope === "ALL" ? "所有分支" : scope.replace(/^refs\/(heads|remotes)\//, "");
+    scope === "ALL" ? "所有分支" : scope.replace(/^refs\/(heads|remotes|tags)\//, "");
 
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
@@ -264,7 +267,26 @@ export function BranchScopeDropdown({
                   }}
                 />
               ))}
-              {locals.length === 0 && remotes.length === 0 ? (
+              {tagList.length > 0 ? (
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingHorizontal: 8, paddingTop: 6 }}>
+                  标签（{tagList.length}）
+                </Text>
+              ) : null}
+              {tagList.map((tag) => (
+                <OptionRow
+                  key={tag.name}
+                  theme={theme}
+                  icon="Tag"
+                  label={tag.shortName}
+                  detail={tag.commitHash.slice(0, 7)}
+                  selected={scope === tag.name}
+                  onPress={() => {
+                    onChange(tag.name);
+                    setOpen(false);
+                  }}
+                />
+              ))}
+              {locals.length === 0 && remotes.length === 0 && tagList.length === 0 ? (
                 <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, paddingVertical: 6 }}>
                   {status?.ok === false ? "读取分支失败" : "没有匹配的分支"}
                 </Text>

@@ -43,3 +43,9 @@ export function basename(path: string): string {
   const parts = path.replace(/\\/g, "/").split("/").filter((part) => part.length > 0);
   return parts[parts.length - 1] ?? path;
 }
+
+export function dirname(path: string): string {
+  const parts = path.replace(/\\/g, "/").split("/").filter((part) => part.length > 0);
+  parts.pop();
+  return parts.length > 0 ? parts.join("/") : path;
+}

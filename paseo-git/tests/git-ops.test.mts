@@ -1,18 +1,33 @@
 import assert from "node:assert/strict";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
 import { test } from "node:test";
 import {
+  gitBranchCreate,
+  gitBranchDelete,
   gitBranches,
   gitCommit,
   gitLog,
   gitPaths,
   gitStatus,
   gitCheckout,
+  gitTagCreate,
+  gitTagDelete,
+  gitTags,
+  gitWorktreeAdd,
+  gitWorktreePrune,
+  gitWorktreeRemove,
+  gitWorktrees,
   listChildPaths,
   parseForEachRef,
   parseLogBody,
   parseNameStatusTokens,
   parseNumstatTokens,
   parseStatusBody,
+  parseTagsBody,
+  parseWorktreeList,
+  resolveWorktreePath,
 } from "../server/git-ops.ts";
 import { createBinaryCommit, git, testRun, withFixtureRepo } from "./fixture.mts";
 
@@ -270,4 +285,270 @@ test("parseNameStatusTokens 处理重命名顺序", () => {
   assert.equal(entries.length, 2);
   assert.deepEqual(entries[0], { path: "new.txt", status: "R", oldPath: "old.txt" });
   assert.deepEqual(entries[1], { path: "a.ts", status: "M", oldPath: null });
+});
+
+// ---------------------------------------------------------------------------
+// tags
+// ---------------------------------------------------------------------------
+
+test("gitTags 列出轻量标签并解析指向的提交", async () => {
+  await withFixtureRepo(async (repo) => {
+    const result = await gitTags(testRun, repo.root);
+    assert.equal(result.ok, true);
+    const v1 = result.tags.find((tag) => tag.shortName === "v1");
+    assert.ok(v1, "fixture 的 v1 标签在列表中");
+    assert.equal(v1?.annotated, false);
+    assert.equal(v1?.hash, repo.hashes.c1);
+    assert.equal(v1?.commitHash, repo.hashes.c1);
+  });
+});
+
+test("gitTagCreate 附注/轻量标签与 gitTagDelete", async () => {
+  await withFixtureRepo(async (repo) => {
+    const annotated = await gitTagCreate(testRun, repo.root, "v2.0", repo.hashes.c2, "发布说明");
+    assert.equal(annotated.ok, true, annotated.error ?? "");
+
+    const light = await gitTagCreate(testRun, repo.root, "light", "", "");
+    assert.equal(light.ok, true, light.error ?? "");
+
+    const result = await gitTags(testRun, repo.root);
+    const v2 = result.tags.find((tag) => tag.shortName === "v2.0");
+    assert.ok(v2);
+    assert.equal(v2?.annotated, true, "带说明的标签是附注标签");
+    assert.equal(v2?.commitHash, repo.hashes.c2, "附注标签剥壳后指向 c2");
+    assert.notEqual(v2?.hash, repo.hashes.c2, "附注标签本体是 tag 对象");
+
+    const lightEntry = result.tags.find((tag) => tag.shortName === "light");
+    assert.ok(lightEntry);
+    assert.equal(lightEntry?.annotated, false);
+    assert.equal(lightEntry?.commitHash, repo.hashes.c6, "默认打在 HEAD 上");
+
+    const deleted = await gitTagDelete(testRun, repo.root, "v1");
+    assert.equal(deleted.ok, true, deleted.error ?? "");
+    const after = await gitTags(testRun, repo.root);
+    assert.ok(!after.tags.some((tag) => tag.shortName === "v1"));
+
+    const invalid = await gitTagCreate(testRun, repo.root, "-bad", "", "");
+    assert.equal(invalid.ok, false);
+    assert.match(invalid.error ?? "", /无效的标签名/);
+
+    const duplicate = await gitTagCreate(testRun, repo.root, "v2.0", "", "");
+    assert.equal(duplicate.ok, false, "同名标签被 git 拒绝");
+  });
+});
+
+test("gitCheckout 标签进入分离头指针并给出友好提示", async () => {
+  await withFixtureRepo(async (repo) => {
+    // 清掉 fixture 制造的未提交改动，避免检出被拒
+    await git(repo.root, "checkout", "-q", repo.hashes.c6);
+    await git(repo.root, "reset", "--hard", "-q");
+    await git(repo.root, "clean", "-fdq");
+
+    const result = await gitCheckout(testRun, repo.root, "v1");
+    assert.equal(result.ok, true, result.error ?? "");
+    assert.match(result.message ?? "", /分离头指针/);
+    const status = await gitStatus(testRun, repo.root);
+    assert.equal(status.detached, true);
+
+    const back = await gitCheckout(testRun, repo.root, "main");
+    assert.equal(back.ok, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// branch create / delete
+// ---------------------------------------------------------------------------
+
+test("gitBranchCreate 建分支并可选检出", async () => {
+  await withFixtureRepo(async (repo) => {
+    const created = await gitBranchCreate(testRun, repo.root, "topic", "side", false);
+    assert.equal(created.ok, true, created.error ?? "");
+    const branches = await gitBranches(testRun, repo.root);
+    const topic = branches.locals.find((branch) => branch.shortName === "topic");
+    assert.ok(topic);
+    assert.equal(topic?.hash, repo.hashes.c5, "从 side 切出");
+    assert.equal(topic?.isCurrent, false);
+
+    const checkedOut = await gitBranchCreate(testRun, repo.root, "quick", "HEAD", true);
+    assert.equal(checkedOut.ok, true, checkedOut.error ?? "");
+    const status = await gitStatus(testRun, repo.root);
+    assert.equal(status.currentBranch, "quick");
+
+    const invalid = await gitBranchCreate(testRun, repo.root, "-x", "", false);
+    assert.equal(invalid.ok, false);
+    assert.match(invalid.error ?? "", /无效的分支名/);
+
+    const duplicate = await gitBranchCreate(testRun, repo.root, "topic", "", false);
+    assert.equal(duplicate.ok, false, "重名分支被 git 拒绝");
+  });
+});
+
+test("gitBranchDelete 安全删除与强制删除", async () => {
+  await withFixtureRepo(async (repo) => {
+    const safe = await gitBranchDelete(testRun, repo.root, "side", false);
+    assert.equal(safe.ok, false, "side 有未合并提交，-d 拒绝");
+    assert.match(safe.error ?? "", /not fully merged|未合并/i);
+
+    const forced = await gitBranchDelete(testRun, repo.root, "side", true);
+    assert.equal(forced.ok, true, forced.error ?? "");
+    const branches = await gitBranches(testRun, repo.root);
+    assert.ok(!branches.locals.some((branch) => branch.shortName === "side"));
+
+    const current = await gitBranchDelete(testRun, repo.root, "main", false);
+    assert.equal(current.ok, false, "不能删除当前分支");
+
+    const merged = await gitBranchDelete(testRun, repo.root, "feature", false);
+    assert.equal(merged.ok, true, "已合并的 feature 可安全删除");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktrees
+// ---------------------------------------------------------------------------
+
+test("parseWorktreeList 解析 porcelain 块", () => {
+  const body = [
+    "worktree /repo/main",
+    "HEAD aaaa",
+    "branch refs/heads/main",
+    "",
+    "worktree /repo/feature",
+    "HEAD bbbb",
+    "detached",
+    "",
+    "worktree /repo/bare.git",
+    "bare",
+    "",
+  ].join("\n");
+  const worktrees = parseWorktreeList(body);
+  assert.equal(worktrees.length, 3);
+  assert.deepEqual(worktrees[0], {
+    path: "/repo/main",
+    head: "aaaa",
+    branch: "refs/heads/main",
+    detached: false,
+    bare: false,
+    isMain: true,
+  });
+  assert.equal(worktrees[1]?.detached, true);
+  assert.equal(worktrees[1]?.branch, null);
+  assert.equal(worktrees[1]?.isMain, false);
+  assert.equal(worktrees[2]?.bare, true);
+
+  assert.equal(parseWorktreeList("").length, 0);
+});
+
+test("resolveWorktreePath 相对目录落在仓库同级并拒绝穿越", () => {
+  assert.equal(resolveWorktreePath("/repo/root", "../escape"), null);
+  assert.equal(resolveWorktreePath("/repo/root", "a//b"), null);
+  assert.equal(resolveWorktreePath("/repo/root", "  "), null);
+  assert.equal(resolveWorktreePath("/repo/root", "/abs/path"), "/abs/path");
+  assert.equal(resolveWorktreePath("/repo/root", "feature-x"), "/repo/feature-x");
+});
+
+test("gitWorktrees 列出 / gitWorktreeAdd 添加 / gitWorktreeRemove 移除", async () => {
+  await withFixtureRepo(async (repo) => {
+    const parent = await mkdtemp(join(tmpdir(), "paseo-git-wt-"));
+    try {
+      const initial = await gitWorktrees(testRun, repo.root);
+      assert.equal(initial.ok, true);
+      assert.equal(initial.worktrees.length, 1);
+      assert.equal(initial.worktrees[0]?.isMain, true);
+      assert.equal(initial.worktrees[0]?.branch, "refs/heads/main");
+
+      const wtPath = join(parent, "feature-x");
+      const added = await gitWorktreeAdd(testRun, repo.root, wtPath, "wt-feature", "");
+      assert.equal(added.ok, true, added.error ?? "");
+
+      const listed = await gitWorktrees(testRun, repo.root);
+      assert.equal(listed.worktrees.length, 2);
+      const realWt = await realpath(wtPath);
+      const entry = listed.worktrees.find((worktree) => worktree.path === realWt);
+      assert.ok(entry);
+      assert.equal(entry?.branch, "refs/heads/wt-feature");
+      assert.equal(entry?.detached, false);
+      assert.equal(entry?.isMain, false);
+
+      const removed = await gitWorktreeRemove(testRun, repo.root, wtPath, false);
+      assert.equal(removed.ok, true, removed.error ?? "");
+      const after = await gitWorktrees(testRun, repo.root);
+      assert.equal(after.worktrees.length, 1);
+
+      const mainRemove = await gitWorktreeRemove(testRun, repo.root, repo.root, false);
+      assert.equal(mainRemove.ok, false, "主 worktree 不能移除");
+      assert.match(mainRemove.error ?? "", /主 worktree/);
+
+      const unknown = await gitWorktreeRemove(testRun, repo.root, join(parent, "nope"), false);
+      assert.equal(unknown.ok, false);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+});
+
+test("gitWorktreeAdd 直接检出分支与非法路径", async () => {
+  await withFixtureRepo(async (repo) => {
+    const parent = await mkdtemp(join(tmpdir(), "paseo-git-wt-"));
+    try {
+      // 无新分支：直接检出已存在的 side（main 上未占用）
+      const wtPath = join(parent, "on-side");
+      const added = await gitWorktreeAdd(testRun, repo.root, wtPath, "", "side");
+      assert.equal(added.ok, true, added.error ?? "");
+      const listed = await gitWorktrees(testRun, repo.root);
+      const realWt = await realpath(wtPath);
+      const entry = listed.worktrees.find((worktree) => worktree.path === realWt);
+      assert.equal(entry?.branch, "refs/heads/side");
+
+      // side 已被占用，再检出会被 git 拒绝（无需真正建目录）
+      const conflict = await gitWorktreeAdd(testRun, repo.root, join(parent, "again"), "", "side");
+      assert.equal(conflict.ok, false);
+
+      // 相对路径解析到仓库同级目录
+      const relative = await gitWorktreeAdd(testRun, repo.root, "sibling-wt", "wt-rel", "");
+      assert.equal(relative.ok, true, relative.error ?? "");
+      const relativeListed = await gitWorktrees(testRun, repo.root);
+      const root = relativeListed.worktrees[0]?.path ?? repo.root;
+      assert.ok(
+        relativeListed.worktrees.some((worktree) => worktree.path === join(dirname(root), "sibling-wt")),
+        "相对目录落在仓库同级",
+      );
+
+      const traversal = await gitWorktreeAdd(testRun, repo.root, "../evil", "", "");
+      assert.equal(traversal.ok, false);
+      assert.match(traversal.error ?? "", /无效的目录名/);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+      // 清理落在仓库同级的 sibling-wt
+      const listed = await gitWorktrees(testRun, repo.root);
+      const root = listed.worktrees[0]?.path ?? repo.root;
+      await rm(join(dirname(root), "sibling-wt"), { recursive: true, force: true });
+    }
+  });
+});
+
+test("gitWorktreePrune 清理失效记录", async () => {
+  await withFixtureRepo(async (repo) => {
+    const parent = await mkdtemp(join(tmpdir(), "paseo-git-wt-"));
+    try {
+      const wtPath = join(parent, "stale");
+      const added = await gitWorktreeAdd(testRun, repo.root, wtPath, "wt-stale", "");
+      assert.equal(added.ok, true, added.error ?? "");
+      // 直接删掉目录模拟外部移除：记录仍挂着，prune 后消失
+      await rm(wtPath, { recursive: true, force: true });
+      const before = await gitWorktrees(testRun, repo.root);
+      assert.equal(before.worktrees.length, 2);
+
+      const pruned = await gitWorktreePrune(testRun, repo.root);
+      assert.equal(pruned.ok, true, pruned.error ?? "");
+      const after = await gitWorktrees(testRun, repo.root);
+      assert.equal(after.worktrees.length, 1);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+});
+
+test("parseTagsBody 忽略残缺记录", () => {
+  assert.equal(parseTagsBody("").length, 0);
+  assert.equal(parseTagsBody("garbage\n\n").length, 0);
 });
