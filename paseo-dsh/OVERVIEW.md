@@ -78,11 +78,21 @@ selection in the project agent configuration and passes it to the ACP process
 when a session starts. Existing sessions retain their composition; create a
 new session to use another mode.
 
-The dsh permission preset is exposed as a separate **Permissions** session
+The dsh permission preset is exposed as a separate **权限** session
 setting. It uses dsh's live permission-preset catalog and service, so changing
 it updates that dsh session's sandbox and approval policy without changing its
-Agent preset. Paseo remembers the selection by project path and applies it to
-new dsh sessions opened in that project.
+Agent preset. Option labels mirror the dsh desktop app's zh-CN strings
+(仅可查看 / 工作区内修改 / 完全权限) while the underlying values passed to
+dsh stay protocol-level (`read-only` / `workspace-write` /
+`danger-full-access`). Paseo remembers the selection by project path and
+applies it to new dsh sessions opened in that project. Paseo persists
+discovered settings per agent and only re-discovers when the catalog cache
+key changes, so the key hashes the plugin's own server sources and
+package.json besides the dsh profiles — every plugin update automatically
+invalidates the cached catalog on the next plugin reload. (Plugins run as
+esbuild CommonJS bundles where `import.meta` is unavailable, so the source
+root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
+`DSH_PLUGIN_ROOT` as an override.)
 
 ## Capabilities and limits
 
@@ -103,18 +113,31 @@ new dsh sessions opened in that project.
   tool call id, so the connector enriches them with the title and input
   from the observed tool-call updates (Paseo's adapter otherwise fails on
   the missing raw input and dsh reports "no approval channel available").
-  The separate Permissions setting maps to dsh's current permission preset
-  service, including optional presets such as Auto-review when the ACP profile
+  The separate 权限 setting maps to dsh's current permission preset
+  service, including optional presets such as Auto review when the ACP profile
   has them enabled.
 - Session import lists persisted dsh sessions for the project directory
   (dsh returns no titles, so entries appear by session id).
+- The plugin is kept on the same `@getpaseo/plugin` protocol version as the
+  Paseo daemon. It also normalizes dsh failed tool updates that omit an error
+  payload, because Paseo requires a JSON error for failed timeline tool items.
 - Paseo's catalog probe and every session open spawn a fresh
-  `dsh --profile acp` process; dsh persists each ACP-created session, so
-  catalog probes can leave short empty sessions in `~/.dsh/sessions`
-  that also show up in the dsh web UI sidebar (hidden from Paseo's list
-  by the connector).
+  `dsh --profile acp` process; dsh persists each ACP-created session.
+  The connector removes probe sessions after the catalog connection closes
+  (and sweeps probes older than a minute after a reload), so they no longer accumulate as
+  untitled rows in the dsh web UI sidebar. Sessions containing user,
+  assistant or tool events, archived sessions, and Workspace members are
+  never removed.
 - Tool output, images and dsh-specific presentation cards outside the
   standard ACP update surface are not carried over.
+- In PTC presets every tool runs inside one `run_code` program, and dsh's
+  ACP bridge only reports that aggregate call. The bridge plugin mounted
+  into each spawn mirrors dsh's internal per-tool dispatch events into a
+  JSONL sidecar; the connector tails it and surfaces every sub-call as its
+  own detailed Paseo timeline row (Shell, Read, Edit, Search, Fetch — the
+  same rows the ZCode provider shows), including per-call status, output
+  and todo list updates. Only live sessions' records are mirrored, and the
+  sidecar is removed when the process exits.
 
 ## Development
 

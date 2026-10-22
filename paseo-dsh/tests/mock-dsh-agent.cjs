@@ -1,7 +1,9 @@
 // Minimal fake dsh ACP agent for connector tests. Speaks newline-delimited
 // JSON-RPC on stdio and mimics the parts of dsh's ACP surface the connector
 // compensates for: no loadSession capability, session/load rejected,
-// session/resume supported.
+// session/resume supported. PTC prompts also append the same JSONL mirror
+// records the connector's in-dsh bridge plugin writes for PTC sub-calls.
+const fs = require("node:fs");
 const readline = require("node:readline");
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -9,6 +11,45 @@ let nextId = 1;
 const created = [];
 
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+
+// Reproduce the bridge plugin's PTC mirror: one started + finished sub-call
+// pair per tool, mirroring a real run_code program's dispatches.
+function mirrorPtcDispatches(sessionId) {
+  const file = process.env.DSH_PTC_EVENT_FILE;
+  if (!file || !sessionId) return;
+  const dispatches = [
+    {
+      name: "bash",
+      arguments: { command: "ls -la", description: "List repo root" },
+      isError: false,
+      content: [{ type: "text", text: "file-a\nfile-b" }],
+    },
+    {
+      name: "edit",
+      arguments: { file_path: "/tmp/src/a.ts", old_string: "x", new_string: "y" },
+      isError: true,
+      content: [{ type: "text", text: "edit failed: no match" }],
+    },
+    {
+      name: "todo_write",
+      arguments: {
+        todos: [
+          { content: "scan the repo", status: "completed" },
+          { content: "fix the bug", status: "in_progress" },
+        ],
+      },
+      isError: false,
+      content: [],
+    },
+  ];
+  dispatches.forEach((dispatch, index) => {
+    const subCallId = `call-ptc-1:ptc:${index + 1}`;
+    const write = (kind, extra) =>
+      fs.appendFileSync(file, `${JSON.stringify({ kind, sessionId, data: { rootCallId: "call-ptc-1", subCallId, ...dispatch, ...extra } })}\n`);
+    write("call");
+    write("result");
+  });
+}
 
 rl.on("line", (line) => {
   if (!line.trim()) return;
@@ -116,6 +157,20 @@ rl.on("line", (line) => {
       const prompt = Array.isArray(message.params?.prompt)
         ? message.params.prompt.map((part) => part.text ?? "").join("\n")
         : "";
+      mirrorPtcDispatches(message.params?.sessionId);
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: message.params?.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call-perm-1",
+            status: "failed",
+            content: [],
+          },
+        },
+      });
       send({
         jsonrpc: "2.0",
         method: "session/update",

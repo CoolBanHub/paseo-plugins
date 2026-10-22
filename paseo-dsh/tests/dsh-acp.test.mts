@@ -6,7 +6,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClientSideConnection } from "@agentclientprotocol/sdk";
 import { createDshConnector } from "../server/dsh-acp.ts";
-import { dshCatalogCacheKey, writeWebModelOverlay } from "../server/dsh-catalog.ts";
+import {
+  DEFAULT_PERMISSION_OPTIONS,
+  PERMISSION_LABELS,
+  PERMISSION_SETTING_NAME,
+  dshCatalogShape,
+} from "../server/dsh-labels.ts";
+import { dshCatalogCacheKey, resolvePluginSourceRoot, writeWebModelOverlay } from "../server/dsh-catalog.ts";
 import {
   currentDshSessionLaunchContext,
   withDshSessionLaunchContext,
@@ -55,6 +61,7 @@ process.env.DSH_NODE_PATH = readdirSync(nvmNodeRoot)
   .map((version) => join(nvmNodeRoot, version, "bin", "node"))
   .find((path) => existsSync(path)) ?? process.execPath;
 process.env.PASEO_HOME = home;
+process.env.DSH_HOME = home;
 process.env.DSH_WEB_PRESET_ROOT = presetPatchRoot;
 process.env.DSH_WEB_PROFILE_ROOT = webProfileRoot;
 process.env.DSH_ACP_PROFILE_ROOT = acpProfileRoot;
@@ -82,6 +89,7 @@ async function openConnection(options?: { mode?: string }) {
 
 test("connector adapts dsh ACP for Paseo", async (t) => {
   const first = await openConnection({ mode: "ptc" });
+  let probeDir: string | undefined;
   try {
     const initialized = await first.connection.initialize({
       protocolVersion: 1,
@@ -92,6 +100,11 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
 
     // Discovery probe: session/new without _meta._paseo.
     const probe = await first.connection.newSession({ cwd: "/tmp", mcpServers: [] });
+    // Model the persisted log dsh writes for a probe. Closing the connector
+    // must remove it instead of leaving an untitled dsh Web row behind.
+    probeDir = join(home, "sessions", "--tmp--", probe.sessionId);
+    mkdirSync(probeDir, { recursive: true });
+    writeFileSync(join(probeDir, "session.v4.jsonl"), '{"type":"session","version":4}\n');
     // Real open: session/new with _meta._paseo (Paseo always sends it).
     const real = await first.connection.newSession({
       cwd: "/tmp",
@@ -116,7 +129,16 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
     assert.equal(permissions?.category, "dsh_permission_preset", "permission preset exposed separately from mode");
     assert.deepEqual(
       (permissions?.options ?? []).map((option) => option.value),
-      ["workspace-write", "read-only", "danger-full-access"],
+      ["read-only", "workspace-write", "danger-full-access"],
+    );
+    assert.deepEqual(
+      (permissions?.options ?? []).map((option) => ({ value: option.value, name: option.name })),
+      [
+        { value: "read-only", name: "仅可查看" },
+        { value: "workspace-write", name: "工作区内修改" },
+        { value: "danger-full-access", name: "完全权限" },
+      ],
+      "permission labels mirror the dsh desktop app's zh-CN strings while values stay dsh-level",
     );
     const modelChange = await first.connection.setSessionConfigOption({
       sessionId: real.sessionId,
@@ -155,6 +177,15 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
       .map((update) => update?.content?.text ?? "")
       .join("\n");
     assert.match(promptEcho, /Make the requested edits/);
+    const failedToolUpdate = first.sessionUpdates.find((notification) => {
+      const update = notification.update as { sessionUpdate?: string } | undefined;
+      return update?.sessionUpdate === "tool_call_update";
+    });
+    assert.deepEqual(
+      (failedToolUpdate?.update as { rawOutput?: unknown }).rawOutput,
+      { message: "dsh tool call failed without an error payload" },
+      "failed dsh tool calls receive a JSON error payload for Paseo timeline validation",
+    );
 
     // dsh's minimal permission request must reach the client enriched with
     // the observed tool_call snapshot (Paseo's adapter crashes on a missing
@@ -182,6 +213,8 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
   } finally {
     await first.stream.writable.close();
   }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(probeDir !== undefined && existsSync(probeDir), false, "probe session removed after connector closes");
 
   // A fresh connector (new dsh process, same Paseo home) must keep hiding
   // probe sessions via the persisted registry.
@@ -272,6 +305,76 @@ test("catalog cache key changes when either profile changes", async (t) => {
   assert.notEqual(afterWebChange, before);
   writeFileSync(join(acp, "cordis.patch.yml"), "model: deepseek-v4-pro\n");
   assert.notEqual(dshCatalogCacheKey(options, profiles), afterWebChange);
+});
+
+test("permission labels map one-to-one to dsh preset values and feed the catalog key", () => {
+  for (const option of DEFAULT_PERMISSION_OPTIONS) {
+    assert.equal(
+      PERMISSION_LABELS[option.value],
+      option.name,
+      `label lookup must match the option list for ${option.value}`,
+    );
+    assert.ok(dshCatalogShape.includes(option.name), `catalog shape covers ${option.value}`);
+  }
+  for (const value of Object.keys(PERMISSION_LABELS)) {
+    assert.ok(
+      DEFAULT_PERMISSION_OPTIONS.some((option) => option.value === value) || value === "auto",
+      `label entry ${value} must belong to the option list (auto is catalog-only)`,
+    );
+  }
+  assert.ok(dshCatalogShape.includes(PERMISSION_SETTING_NAME));
+});
+
+test("catalog cache key changes when any plugin source changes", async (t) => {
+  const pluginRoot = mkdtempSync(join(tmpdir(), "dsh-plugin-cache-test-"));
+  t.after(() => rmSync(pluginRoot, { recursive: true, force: true }));
+  mkdirSync(join(pluginRoot, "server"));
+  writeFileSync(join(pluginRoot, "package.json"), '{"version":"0.1.0"}');
+  writeFileSync(join(pluginRoot, "index.server.ts"), "export default function contribute() {}\n");
+  writeFileSync(join(pluginRoot, "server", "dsh-acp.ts"), "export const optionLabels = ['en'];\n");
+
+  const options = { scope: "workspace" as const, cwd: "/tmp" };
+  const stable = () => dshCatalogCacheKey(options, "/nonexistent-profiles", pluginRoot);
+  assert.equal(stable(), stable(), "same sources hash to the same key");
+
+  const beforeSources = stable();
+  writeFileSync(join(pluginRoot, "server", "dsh-acp.ts"), "export const optionLabels = ['zh'];\n");
+  assert.notEqual(stable(), beforeSources, "plugin source edits invalidate the cached catalog");
+
+  const beforeVersion = stable();
+  writeFileSync(join(pluginRoot, "package.json"), '{"version":"0.2.0"}');
+  assert.notEqual(stable(), beforeVersion, "dependency/version bumps invalidate the cached catalog");
+
+  // A relocated or partial plugin tree must not break key computation; the
+  // shape fingerprint keeps label edits covered even without source bytes.
+  assert.ok(typeof dshCatalogCacheKey(options, "/nonexistent-profiles", join(pluginRoot, "missing")) === "string");
+});
+
+test("plugin source root resolves from the daemon config and env override", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "dsh-home-test-"));
+  const pluginRoot = mkdtempSync(join(tmpdir(), "dsh-root-test-"));
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(pluginRoot, { recursive: true, force: true });
+    delete process.env.DSH_PLUGIN_ROOT;
+  });
+  mkdirSync(join(pluginRoot, "server"));
+  writeFileSync(
+    join(home, "config.json"),
+    JSON.stringify({ plugins: { dsh: { source: "directory", path: pluginRoot, enabled: true } } }),
+  );
+
+  assert.equal(resolvePluginSourceRoot("dsh", home), pluginRoot, "directory plugins resolve via config.json");
+
+  process.env.DSH_PLUGIN_ROOT = pluginRoot;
+  assert.equal(resolvePluginSourceRoot("dsh", home), pluginRoot, "env override wins");
+
+  delete process.env.DSH_PLUGIN_ROOT;
+  assert.equal(
+    resolvePluginSourceRoot("dsh", join(home, "missing")),
+    undefined,
+    "missing config degrades to no source root",
+  );
 });
 
 test("Web model overlay keeps ACP route settings and current model capabilities", async (t) => {

@@ -8,7 +8,9 @@ import {
   renameSync,
   rmSync,
   statSync,
+  watch,
   writeFileSync,
+  type FSWatcher,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -18,6 +20,21 @@ import { ndJsonStream } from "@agentclientprotocol/sdk";
 import type { AcpConnector, AcpStream, AcpStreamMessage } from "@getpaseo/plugin/server/acp";
 import type { DshSessionLaunchContext } from "./session-launch-context";
 import { writeWebModelOverlay } from "./dsh-catalog.ts";
+import { DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
+import {
+  DEFAULT_PERMISSION_OPTIONS,
+  DSH_MODES,
+  PERMISSION_LABELS,
+  PERMISSION_SETTING_DESCRIPTION,
+  PERMISSION_SETTING_ID,
+  PERMISSION_SETTING_NAME,
+} from "./dsh-labels.ts";
+import type { DshModeId } from "./dsh-labels.ts";
+import {
+  loadProtectedSessionIds,
+  removeEmptyProbeSession,
+  sweepEmptyProbeSessions,
+} from "./probe-cleanup.ts";
 
 /**
  * Locate the dsh bin script (a Node JS file). The daemon's PATH may not
@@ -121,13 +138,14 @@ function versionTupleOf(nodePath: string): number[] | undefined {
 
 const nodeVersionCache = new Map<string, number[]>();
 
-const AGENT_PRESET_BRIDGE_SOURCE = `import { readFileSync, writeFileSync } from "node:fs";
+const AGENT_PRESET_BRIDGE_SOURCE = `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 
 const PRESETS = new Set(["standard", "ptc", "minimal", "cordis"]);
 const permissionAgents = new Map();
 const appliedPermissions = new Map();
 const controlFile = process.env.DSH_PERMISSION_CONTROL_FILE;
 const catalogFile = process.env.DSH_PERMISSION_CATALOG_FILE;
+const ptcEventFile = process.env.DSH_PTC_EVENT_FILE;
 
 export const name = "paseo-dsh-agent-preset-bridge";
 export const inject = ["agentPresets", "sessionProjections", "permissionPresets"];
@@ -170,10 +188,47 @@ async function applyPermission(ctx, agent, preset) {
   }
 }
 
+// Mirror dsh's internal PTC sub-call events into a JSONL sidecar the Paseo
+// connector tails (see ptc-present.ts). dsh's own ACP bridge only projects
+// the aggregate run_code tool call; the per-tool dispatches recorded here
+// are what dsh's clients render as detailed rows.
+function ptcMirror(ctx) {
+  if (!ptcEventFile) return;
+  const cap = (value) => {
+    if (typeof value === "string") return value.length > 20000 ? value.slice(0, 20000) : value;
+    if (Array.isArray(value)) return value.map(cap);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cap(item)]));
+    }
+    return value;
+  };
+  ctx.on("session/event", (session, event) => {
+    if (event.type !== "tool/ptc-dispatch-start" && event.type !== "tool/ptc-dispatch") return;
+    try {
+      appendFileSync(ptcEventFile, JSON.stringify({
+        kind: event.type === "tool/ptc-dispatch-start" ? "call" : "result",
+        sessionId: session.header.id,
+        data: cap({
+          rootCallId: event.data.rootCallId,
+          parentCallId: event.data.parentCallId,
+          subCallId: event.data.subCallId,
+          name: event.data.name,
+          arguments: event.data.arguments,
+          isError: event.data.isError,
+          content: event.data.content,
+        }),
+      }) + "\\n");
+    } catch (error) {
+      ctx.logger.warn("paseo-dsh: ptc event mirror failed", error);
+    }
+  });
+}
+
 export function apply(ctx) {
   const requested = process.env.DSH_AGENT_PRESET;
   const fallback = PRESETS.has(requested) ? requested : "standard";
   writeCatalog(ctx);
+  ptcMirror(ctx);
   ctx.on("agent/created", async ({ agent }) => {
     const recorded = ctx.sessionProjections.stateOf(agent.session, "agentPreset");
     const preset = typeof recorded === "string" ? recorded : fallback;
@@ -209,15 +264,6 @@ const AGENT_PRESET_INTEGRATION_PATCH = `- insert:
       name: ./agent-preset-bridge.js
       inject: [agentPresets, sessionProjections, permissionPresets]
 `;
-
-const DSH_MODES = [
-  { id: "standard", name: "标准模式", description: "日常编码任务的标准工具组合。" },
-  { id: "ptc", name: "PTC 模式", description: "使用 dsh 的 PTC 工具呈现处理批量工具任务。" },
-  { id: "minimal", name: "极简模式", description: "使用 dsh 的精简工具组合。" },
-  { id: "cordis", name: "创造模式", description: "使用 dsh 的创造者工具组合。" },
-] as const;
-
-type DshModeId = (typeof DSH_MODES)[number]["id"];
 
 function normalizeModeId(mode: string | undefined): DshModeId {
   if (mode === "ptc" || mode === "minimal" || mode === "cordis") return mode;
@@ -284,8 +330,11 @@ function readPermissionCatalog(file: string): {
     }
   } catch {
     // Use the built-in preset list when a dsh profile has no catalog bridge yet.
+    // dsh composes sessions under workspace-write by default, which the
+    // option list alone (ordered read-only first, like dsh's catalog) cannot
+    // express.
   }
-  return { options: DEFAULT_PERMISSION_OPTIONS };
+  return { options: DEFAULT_PERMISSION_OPTIONS, defaultPreset: "workspace-write" };
 }
 
 function permissionConfigOption(
@@ -297,8 +346,8 @@ function permissionConfigOption(
     : options[0]?.value ?? "workspace-write";
   return {
     id: PERMISSION_SETTING_ID,
-    name: "Permissions",
-    description: "Choose the dsh permission preset for this project session.",
+    name: PERMISSION_SETTING_NAME,
+    description: PERMISSION_SETTING_DESCRIPTION,
     category: "dsh_permission_preset",
     type: "select",
     currentValue: selected,
@@ -404,6 +453,10 @@ class ProbeRegistry {
     return this.ids.has(id);
   }
 
+  sessionIds(): string[] {
+    return [...this.ids];
+  }
+
   add(id: string): void {
     if (this.ids.has(id)) return;
     this.ids.add(id);
@@ -440,19 +493,6 @@ type ConfigOption = {
   type?: unknown;
   currentValue?: unknown;
   options?: Array<SelectOption & Record<string, unknown>>;
-};
-
-const PERMISSION_SETTING_ID = "paseo_dsh_permission_preset";
-const DEFAULT_PERMISSION_OPTIONS = [
-  { value: "workspace-write", name: "Default permissions" },
-  { value: "read-only", name: "Read only" },
-  { value: "danger-full-access", name: "Full access" },
-];
-const PERMISSION_LABELS: Record<string, string> = {
-  "workspace-write": "Default permissions",
-  "read-only": "Read only",
-  "danger-full-access": "Full access",
-  auto: "Auto-review",
 };
 
 /**
@@ -492,6 +532,44 @@ function describeWireMessage(message: AcpStreamMessage): string {
 }
 
 /**
+ * ACP dsh reports failed tool calls without `rawOutput`. Paseo's timeline
+ * schema requires a JSON error for failed tool items, so supply a stable
+ * diagnostic before the ACP adapter snapshots the update.
+ */
+function normalizeFailedToolUpdate(message: AcpStreamMessage): void {
+  if (!("method" in message) || message.method !== "session/update" || !("params" in message)) return;
+  const params = message.params as { update?: Record<string, unknown> } | undefined;
+  const update = params?.update;
+  if (
+    update?.sessionUpdate === "tool_call_update" &&
+    update.status === "failed" &&
+    (update.rawOutput === undefined || update.rawOutput === null)
+  ) {
+    update.rawOutput = { message: "dsh tool call failed without an error payload" };
+  }
+}
+
+/**
+ * Join the text blocks of a dsh content array into the single output string
+ * the PTC timeline rows display.
+ */
+function ptcResultText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is Record<string, unknown> => !!block && typeof block === "object")
+    .map((block) => (typeof block.text === "string" ? block.text : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** JSONL record the bridge plugin inside dsh appends per PTC dispatch. */
+interface PtcMirrorRecord {
+  kind?: unknown;
+  sessionId?: unknown;
+  data?: Record<string, unknown>;
+}
+
+/**
  * Spawn `dsh --profile acp` and expose its stdio as an AcpStream.
  *
  * dsh implements ACP v1 with `session/resume` for reattaching persisted
@@ -516,6 +594,35 @@ export function createDshConnector(
   const probes = new ProbeRegistry(join(dataDir, "probe-sessions.json"));
   const projectPermissions = new ProjectPermissionStore(join(dataDir, "project-permissions.json"));
 
+  // Recover probes left behind by a crash or plugin reload. A minute is
+  // enough for an in-flight catalog probe to finish; archived Sessions and
+  // Workspace members are protected by the cleanup helper.
+  try {
+    const removed = sweepEmptyProbeSessions(probes.sessionIds(), {
+      protectedIds: loadProtectedSessionIds(),
+      minAgeMs: 60_000,
+    });
+    for (const sessionId of removed) log("removed stale catalog probe session", { sessionId });
+  } catch (error) {
+    log("catalog probe sweep failed", { error: String(error) });
+  }
+
+  // PTC mirror sidecars from crashed or reloaded connectors. Live ones are
+  // owned by a running child; anything an hour old is a leftover.
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (!file.startsWith("ptc-events-")) continue;
+      const path = join(dataDir, file);
+      try {
+        if (Date.now() - statSync(path).mtimeMs > 60 * 60_000) rmSync(path, { force: true });
+      } catch {
+        // Unreadable leftovers are harmless; leave them for the next sweep.
+      }
+    }
+  } catch {
+    // dataDir may not exist yet on a fresh install.
+  }
+
   return async (): Promise<AcpStream> => {
     const script = resolveDshScript();
     if (!script) {
@@ -532,12 +639,15 @@ export function createDshConnector(
     const modelIds = writeWebModelOverlay(dshProfileRoot("acp"), dshProfileRoot("web"), modelOverlayPath);
     const permissionControlFile = join(dataDir, `permission-control-${randomUUID()}.json`);
     const permissionCatalogFile = join(dataDir, `permission-catalog-${randomUUID()}.json`);
+    const ptcEventFile = join(dataDir, `ptc-events-${randomUUID()}.jsonl`);
     mkdirSync(dataDir, { recursive: true });
     writeFileSync(permissionControlFile, "{}", { mode: 0o600 });
+    writeFileSync(ptcEventFile, "", { mode: 0o600 });
     const env = { ...process.env };
     env.DSH_AGENT_PRESET = initialMode;
     env.DSH_PERMISSION_CONTROL_FILE = permissionControlFile;
     env.DSH_PERMISSION_CATALOG_FILE = permissionCatalogFile;
+    env.DSH_PTC_EVENT_FILE = ptcEventFile;
     log("starting dsh acp", {
       node,
       script,
@@ -557,12 +667,41 @@ export function createDshConnector(
         if (line.trim()) log(line.trim());
       }
     });
+
+    // Catalog discovery opens throwaway sessions through this process. Once
+    // it is done, remove their session logs so dsh Web does not accumulate
+    // untitled "Ungrouped" rows. The timer covers a long-lived ACP process
+    // that never exits after a probe.
+    const probeCleanupIds = new Set<string>();
+    const cleanupProbe = (sessionId: string): void => {
+      if (!probeCleanupIds.has(sessionId)) return;
+      try {
+        if (removeEmptyProbeSession(sessionId)) {
+          probeCleanupIds.delete(sessionId);
+          log("cleaned catalog probe session", { sessionId });
+        }
+      } catch (error) {
+        log("catalog probe cleanup failed", { sessionId, error: String(error) });
+      }
+    };
+
+    const scheduleProbeCleanup = (delayMs: number): void => {
+      if (probeCleanupIds.size === 0) return;
+      // Give dsh a moment to flush the probe log before unlinking it.
+      const timer = setTimeout(() => {
+        for (const sessionId of [...probeCleanupIds]) cleanupProbe(sessionId);
+      }, delayMs);
+      timer.unref();
+    };
+
     child.once("exit", (code, signal) => {
       rmSync(permissionControlFile, { force: true });
       rmSync(permissionCatalogFile, { force: true });
+      stopPtcMirror();
       if (child.exitCode !== null || child.signalCode !== null) {
         log("dsh acp exited", { code, signal: signal ?? undefined });
       }
+      scheduleProbeCleanup(250);
     });
 
     const base = ndJsonStream(
@@ -590,6 +729,10 @@ export function createDshConnector(
       const meta = (params as { _meta?: { _paseo?: unknown } } | undefined)?._meta;
       return !(meta && "_paseo" in meta);
     };
+    // ACP sessions opened through this connection that are not catalog
+    // probes; only their PTC mirror records become timeline rows.
+    const liveSessions = new Set<string>();
+    let stopPtcMirror: () => void = () => {};
 
     const writer = base.writable.getWriter();
     let writerClosed = false;
@@ -709,6 +852,9 @@ export function createDshConnector(
         await writer.write(message as never);
       },
       async close() {
+        // Paseo may keep the ACP process alive after discovery; closing the
+        // client stream is the definitive end of the catalog probe.
+        scheduleProbeCleanup(250);
         if (writerClosed) return;
         writerClosed = true;
         try {
@@ -716,9 +862,16 @@ export function createDshConnector(
         } catch {
           // The child may already be gone; nothing left to drain.
         }
-        // stdin EOF makes dsh drain and exit; enforce a deadline.
+        // stdin EOF makes dsh drain and exit; enforce a deadline. The sidecar
+        // is removed after the deadline too, so a child that never exits
+        // cannot leak it (the exit handler normally gets there first).
         const timer = setTimeout(() => child.kill("SIGTERM"), 5_000);
-        child.once("exit", () => clearTimeout(timer));
+        const sidecarTimer = setTimeout(stopPtcMirror, 5_500);
+        sidecarTimer.unref();
+        child.once("exit", () => {
+          clearTimeout(timer);
+          clearTimeout(sidecarTimer);
+        });
       },
       async abort(reason) {
         if (!writerClosed) {
@@ -768,6 +921,7 @@ export function createDshConnector(
         },
         transform(message, controller) {
           wireLog("agent->", message);
+          normalizeFailedToolUpdate(message);
           if ("method" in message && !("result" in message)) {
             if (message.method === "session/update" && !("id" in message)) {
               const params = message.params as { update?: Record<string, unknown> } | undefined;
@@ -834,6 +988,7 @@ export function createDshConnector(
                 const sessionId = typeof result.sessionId === "string"
                   ? result.sessionId
                   : request.sessionId;
+                if (sessionId && !request.probe) liveSessions.add(sessionId);
                 if (sessionId) {
                   const cwd = request.cwd ?? launchContext?.cwd;
                   if (cwd) sessionCwds.set(sessionId, cwd);
@@ -866,8 +1021,12 @@ export function createDshConnector(
                 sessionConfigOptions.set(request.sessionId, decorated);
               }
               if (request?.probe && typeof result.sessionId === "string") {
-                probes.add(result.sessionId);
-                log("hid catalog probe session", { sessionId: result.sessionId });
+                const probeSessionId = result.sessionId;
+                probes.add(probeSessionId);
+                probeCleanupIds.add(probeSessionId);
+                const timer = setTimeout(() => cleanupProbe(probeSessionId), 60_000);
+                timer.unref();
+                log("hid catalog probe session", { sessionId: probeSessionId });
               }
               if (request?.list && Array.isArray(result.sessions)) {
                 const visible = result.sessions.filter(
@@ -886,6 +1045,82 @@ export function createDshConnector(
         },
       }),
     );
+
+    /**
+     * Tail the PTC mirror sidecar the bridge plugin inside dsh appends to,
+     * and re-emit each record of a live session as a vendor notification.
+     * Paseo's ACP adapter routes non-ACP notification methods to the plugin
+     * transformer (see ptc-present.ts), which renders one detailed timeline
+     * row per sub-call instead of a bare "Run code" aggregate.
+     */
+    let ptcOffset = 0;
+    const emitPtcRecord = (record: PtcMirrorRecord): boolean => {
+      if (!fromAgentController) return false;
+      if (typeof record.sessionId !== "string" || !liveSessions.has(record.sessionId)) return true;
+      const data = record.data;
+      if (!data || typeof data.subCallId !== "string" || typeof data.name !== "string") return true;
+      try {
+        fromAgentController.enqueue({
+          jsonrpc: "2.0",
+          method: record.kind === "call" ? DSH_PTC_CALL_METHOD : DSH_PTC_RESULT_METHOD,
+          params: {
+            subCallId: data.subCallId,
+            rootCallId: typeof data.rootCallId === "string" ? data.rootCallId : undefined,
+            name: data.name,
+            arguments: data.arguments && typeof data.arguments === "object" && !Array.isArray(data.arguments)
+              ? data.arguments
+              : {},
+            isError: data.isError === true,
+            output: ptcResultText(data.content),
+          },
+        });
+      } catch {
+        // The consumer tore the stream down; nothing left to mirror for.
+        return false;
+      }
+      return true;
+    };
+    const drainPtcEvents = (): void => {
+      let text: string;
+      try {
+        text = readFileSync(ptcEventFile, "utf8");
+      } catch {
+        return;
+      }
+      if (text.length < ptcOffset) ptcOffset = 0; // the file was replaced
+      const chunk = text.slice(ptcOffset);
+      // Only consume up to the last complete line: a read racing the
+      // bridge's append can observe a partially written record.
+      const lastNewline = chunk.lastIndexOf("\n");
+      if (lastNewline === -1) return;
+      ptcOffset += lastNewline + 1;
+      let consumerAlive = true;
+      for (const line of chunk.slice(0, lastNewline).split("\n")) {
+        if (!line.trim() || !consumerAlive) continue;
+        let record: PtcMirrorRecord;
+        try {
+          record = JSON.parse(line) as PtcMirrorRecord;
+        } catch {
+          log("ptc mirror record was skipped", { record: line.slice(0, 200) });
+          continue;
+        }
+        consumerAlive = emitPtcRecord(record);
+      }
+    };
+    const ptcWatcher: FSWatcher = watch(ptcEventFile, () => drainPtcEvents());
+    // A vanished sidecar (crash cleanup) must not crash the daemon.
+    ptcWatcher.on("error", () => {});
+    const ptcPoll = setInterval(drainPtcEvents, 250);
+    ptcPoll.unref?.();
+    let ptcMirrorStopped = false;
+    stopPtcMirror = () => {
+      if (ptcMirrorStopped) return;
+      ptcMirrorStopped = true;
+      ptcWatcher.close();
+      clearInterval(ptcPoll);
+      drainPtcEvents();
+      rmSync(ptcEventFile, { force: true });
+    };
 
     return { writable: toAgent, readable: fromAgent };
   };
