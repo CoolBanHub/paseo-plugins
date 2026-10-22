@@ -69,6 +69,11 @@ local ZCode sessions are listed in Paseo's session picker.
   created outside Paseo. The plugin's archive operation does not fix that
   desktop button. Keeping the shared session store is intentional.
 - Model-catalog probes use deferred persistence and leave no saved session.
+- Paseo caches the provider catalog (models, mode labels) per agent and only
+  re-discovers when the catalog cache key changes, so the key hashes the
+  zcode CLI's identity (the model list is queried live from it) plus this
+  plugin's own server sources and package.json. Plugin updates and ZCode app
+  updates both invalidate the cached catalog on the next plugin reload.
 - Coding-plan account providers (BigModel / Z.ai plans logged in inside the
   ZCode desktop app) are registered into the CLI at runtime and their models
   are selectable; credentials are read and decrypted locally from

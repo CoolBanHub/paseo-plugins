@@ -32,6 +32,7 @@ import {
   type AccountProvider,
 } from "./zcode-account";
 import { ZcodeTaskIndex } from "./zcode-task-index";
+import { zcodeCatalogCacheKey } from "./zcode-catalog-key";
 
 const SUPPORTED_CAPABILITIES = [
   "prompt.message",
@@ -410,7 +411,7 @@ export function createZcodeProvider(): ProviderRegistration {
     label: "ZCode",
     description: "ZCode (GLM) coding agent running locally through the ZCode app-server protocol.",
     icon: "zcode.svg",
-    getCatalogCacheKey: async () => "zcode-local",
+    getCatalogCacheKey: async () => zcodeCatalogCacheKey({ cliPath: resolveZcodeCliPath() }),
     connect: async (request) => {
       const cliPath = resolveZcodeCliPath();
       const log = (message: string, detail?: unknown) =>
