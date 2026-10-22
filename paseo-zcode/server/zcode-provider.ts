@@ -44,12 +44,14 @@ const SUPPORTED_CAPABILITIES = [
   "permission",
 ] as const;
 
+// Labels and descriptions mirror the ZCode desktop app's zh-CN strings
+// (mode.label.glm.* / mode.description.glm.*); ids stay protocol-level.
 const ZCODE_MODES: ProviderMode[] = [
-  { id: "build", label: "Build" },
-  { id: "edit", label: "Edit" },
-  { id: "plan", label: "Plan" },
-  { id: "yolo", label: "Yolo", isUnattended: true },
-  { id: "guarded", label: "Guarded" },
+  { id: "plan", label: "计划模式", description: "编辑前先出计划。" },
+  { id: "build", label: "变更前确认", description: "改文件前先问我。" },
+  { id: "edit", label: "自动编辑", description: "自动编辑文件。" },
+  { id: "guarded", label: "自主模式", description: "在有风险时询问" },
+  { id: "yolo", label: "完全访问", description: "减少确认次数。", isUnattended: true },
 ];
 
 const ZCODE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
