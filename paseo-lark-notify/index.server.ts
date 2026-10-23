@@ -11,6 +11,9 @@ export default function contribute(server: PluginServerContext) {
     },
   });
 
+  const offCreated = server.on("agent.created", (event) => notifier.handleCreated(event));
+  const offTurnStarted = server.on("agent.turn_started", (event) => notifier.handleTurnStarted(event));
+  const offTurnEnded = server.on("agent.turn_ended", (event) => notifier.handleTurnEnded(event));
   const offPermission = server.on("agent.permission_requested", (event) => {
     void notifier.handlePermission(event);
   });
@@ -19,6 +22,9 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    offCreated();
+    offTurnStarted();
+    offTurnEnded();
     offPermission();
     offClosed();
   };
