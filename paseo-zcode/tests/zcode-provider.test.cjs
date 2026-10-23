@@ -164,7 +164,7 @@ async function fixture(t, options = {}) {
     },
     notify: (patch, revision) => stateListener({ sessionId: fSessionId(), scope: "session", revision, patch }),
     sessionEvent: (event) => eventListener({ seq: 1, timestamp: Date.now(), payload: {}, ...event }),
-    serverRequest: (id, params) => serverRequestListener({ id, method: "interaction/requestPermission", params }),
+    serverRequest: (id, params, method = "interaction/requestPermission") => serverRequestListener({ id, method, params }),
     serverReplies,
     setTodos: (todos) => { states.get(fSessionId()).todos = structuredClone(todos); },
     calls: (method) => requests.filter((request) => request.method === method).map((request) => request.params),
@@ -233,6 +233,73 @@ test("pending permission reannouncements share one detailed Paseo card", async (
 
   f.serverRequest("server-permission-3", { ...params, requestId: "permission-logical-2", toolCallId: "tool-call-2" });
   assert.equal(f.events.filter((event) => event.type === "session.permission").length, 2);
+});
+
+test("plan approval user-input requests become an actionable Paseo plan card", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM, mode: "yolo" });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  const plan = "# MCP integration plan\n\nAdd an MCP tools package and tests.";
+
+  f.serverRequest("server-plan-approval-1", {
+    sessionId,
+    requestId: "plan-approval-1",
+    toolCallId: "exit-plan-mode-1",
+    toolName: "ExitPlanMode",
+    prompt: "Review this implementation plan.",
+    schema: { interaction: "plan_approval", toolName: "ExitPlanMode" },
+    input: { plan },
+    questions: [{
+      header: "Plan",
+      question: "Review this implementation plan.",
+      options: [{ label: "Approve", value: "approve", description: "Exit plan mode and start implementation." }],
+    }],
+  }, "interaction/requestUserInput");
+
+  const card = f.events.find((event) => event.type === "session.permission");
+  assert.equal(card.sessionId, "paseo-session");
+  assert.equal(card.request.kind, "plan");
+  assert.equal(card.request.name, "ExitPlanMode");
+  assert.deepEqual(card.request.detail, { type: "plan", text: plan });
+  assert.deepEqual(card.request.actions, [
+    { id: "approve", label: "批准并开始实施", behavior: "allow", intent: "implement_resume" },
+    { id: "decline", label: "拒绝计划", behavior: "deny", intent: "dismiss" },
+  ]);
+  assert.deepEqual(f.serverReplies, []);
+
+  await f.connection.send({
+    type: "session.permission",
+    sessionId: "paseo-session",
+    permissionId: "server-plan-approval-1",
+    response: { behavior: "allow", selectedActionId: "approve" },
+  });
+  assert.deepEqual(f.serverReplies, [{
+    id: "server-plan-approval-1",
+    result: { action: "accept", content: { answer: "approve" } },
+  }]);
+});
+
+test("declining a plan approval resolves the ZCode user-input request as declined", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM, mode: "yolo" });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.serverRequest("server-plan-approval-2", {
+    sessionId,
+    requestId: "plan-approval-2",
+    toolName: "ExitPlanMode",
+    schema: { interaction: "plan_approval", toolName: "ExitPlanMode" },
+    input: { plan: "Implementation plan" },
+    questions: [{ header: "Plan", question: "Review plan.", options: [{ label: "Approve", value: "approve" }] }],
+  }, "interaction/requestUserInput");
+
+  await f.connection.send({
+    type: "session.permission",
+    sessionId: "paseo-session",
+    permissionId: "server-plan-approval-2",
+    response: { behavior: "deny", selectedActionId: "decline" },
+  });
+  assert.deepEqual(f.serverReplies, [{ id: "server-plan-approval-2", result: { action: "decline" } }]);
 });
 
 test("ZCode todo snapshots and TodoWrite updates reach the Paseo timeline", async (t) => {

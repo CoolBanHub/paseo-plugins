@@ -55,6 +55,9 @@ local ZCode sessions are listed in Paseo's session picker.
 - Permission cards include the requested command and reason. ZCode's repeated
   announcements for one outstanding permission are coalesced into one card;
   separate permission request IDs remain separate prompts.
+- Plan approval requests from `ExitPlanMode` appear as actionable plan cards in
+  Paseo; approving returns the answer ZCode expects to leave plan mode and
+  begin implementation.
 - Image prompts are supported through ZCode's native image attachments on
   `session/send`; they do not depend on MCP. Paseo passes image MIME type and
   base64 data through the official ZCode app-server protocol.

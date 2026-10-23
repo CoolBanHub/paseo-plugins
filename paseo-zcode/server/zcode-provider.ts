@@ -187,6 +187,8 @@ interface CreateOrResumeResult {
 interface PendingPermission {
   request: ZcodeServerRequest;
   logicalId?: string;
+  kind: "permission" | "user_input";
+  answer?: string;
 }
 
 interface TurnState {
@@ -601,7 +603,7 @@ export function createZcodeProvider(): ProviderRegistration {
             return true;
           }
           const permissionId = String(request.id);
-          permissions.set(permissionId, { request, logicalId });
+          permissions.set(permissionId, { request, logicalId, kind: "permission" });
           if (logicalId) pendingPermissionIds.set(logicalId, permissionId);
           const options = Array.isArray(params.options) ? (params.options as Array<Record<string, unknown>>) : [];
           const toolInput = params.input && typeof params.input === "object" && !Array.isArray(params.input)
@@ -629,6 +631,92 @@ export function createZcodeProvider(): ProviderRegistration {
                   behavior: isDeny ? ("deny" as const) : ("allow" as const),
                 };
               }),
+            },
+          });
+          return true;
+        }
+        if (request.method === "interaction/requestUserInput") {
+          const params = request.params ?? {};
+          const zcodeSessionId = String(params.sessionId ?? "");
+          const state = sessions.get(zcodeSessionId);
+          const schema = params.schema && typeof params.schema === "object" && !Array.isArray(params.schema)
+            ? params.schema as Record<string, unknown>
+            : undefined;
+          const input = params.input && typeof params.input === "object" && !Array.isArray(params.input)
+            ? params.input as Record<string, unknown>
+            : undefined;
+          const toolName = String(params.toolName ?? schema?.toolName ?? "user_input");
+          const logicalId = typeof params.requestId === "string" && params.requestId
+            ? `${zcodeSessionId}:${params.requestId}`
+            : undefined;
+          const isPlanApproval = schema?.interaction === "plan_approval"
+            || toolName === "ExitPlanMode";
+          if (!isPlanApproval) {
+            log("unsupported user input request, declining", { sessionId: zcodeSessionId, toolName });
+            client.replyServerRequest(request.id, { action: "decline" });
+            return true;
+          }
+          log("user input request", {
+            sessionId: zcodeSessionId,
+            toolName,
+            requestId: params.requestId,
+            kind: "plan",
+          });
+          if (!state) {
+            log("user input for unknown session, declining", zcodeSessionId);
+            client.replyServerRequest(request.id, { action: "decline" });
+            return true;
+          }
+          if (logicalId && pendingPermissionIds.has(logicalId)) {
+            log("user input reannouncement coalesced", { sessionId: zcodeSessionId, toolName });
+            return true;
+          }
+
+          const permissionId = String(request.id);
+          const questions = Array.isArray(params.questions) ? params.questions as Array<Record<string, unknown>> : [];
+          const firstQuestion = questions[0];
+          const options = firstQuestion && Array.isArray(firstQuestion.options)
+            ? firstQuestion.options as Array<Record<string, unknown>>
+            : [];
+          const actions = options.slice(0, 3).map((option) => {
+            const raw = String(option.value ?? option.id ?? option.optionId ?? option.label ?? "answer");
+            return {
+              id: raw,
+              label: raw === "approve" ? "批准并开始实施" : String(option.label ?? option.name ?? raw),
+              behavior: "allow" as const,
+              intent: "implement_resume" as const,
+            };
+          });
+          const fallbackAnswer = "approve";
+          const plan = typeof input?.plan === "string" ? input.plan : undefined;
+          permissions.set(permissionId, {
+            request,
+            logicalId,
+            kind: "user_input",
+            answer: fallbackAnswer,
+          });
+          if (logicalId) pendingPermissionIds.set(logicalId, permissionId);
+          emit({
+            type: "session.permission",
+            sessionId: state.paseoSessionId,
+            request: {
+              id: permissionId,
+              name: toolName,
+              kind: "plan",
+              title: "请求批准实施计划",
+              description: firstQuestion && typeof firstQuestion.question === "string"
+                ? firstQuestion.question
+                : "批准后退出计划模式并开始实施。",
+              detail: plan ? { type: "plan", text: plan } : undefined,
+              actions: [
+                ...(actions.length ? actions : [{
+                  id: fallbackAnswer,
+                  label: "批准并开始实施",
+                  behavior: "allow" as const,
+                  intent: "implement_resume" as const,
+                }]),
+                { id: "decline", label: "拒绝计划", behavior: "deny" as const, intent: "dismiss" as const },
+              ],
             },
           });
           return true;
@@ -1120,7 +1208,16 @@ export function createZcodeProvider(): ProviderRegistration {
             if (pending.logicalId && pendingPermissionIds.get(pending.logicalId) === input.permissionId) {
               pendingPermissionIds.delete(pending.logicalId);
             }
-            client.replyServerRequest(pending.request.id, { approved: input.response.behavior === "allow" });
+            if (pending.kind === "user_input") {
+              if (input.response.behavior === "allow") {
+                const answer = input.response.selectedActionId ?? pending.answer ?? "approve";
+                client.replyServerRequest(pending.request.id, { action: "accept", content: { answer } });
+              } else {
+                client.replyServerRequest(pending.request.id, { action: "decline" });
+              }
+            } else {
+              client.replyServerRequest(pending.request.id, { approved: input.response.behavior === "allow" });
+            }
             emit({ type: "session.permission_resolved", sessionId: input.sessionId, permissionId: input.permissionId });
             return;
           }
