@@ -14,6 +14,10 @@ export type TurnEndedEvent = PluginLifecycleEvents["agent.turn_ended"];
 export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"];
 export type ClosedEvent = PluginLifecycleEvents["agent.closed"];
 
+/** Newer Paseo daemons annotate lifecycle closes; older daemons omit it. */
+type CloseReason = "explicit" | "daemon_shutdown" | "provider_reload" | "session_reload";
+type ClosedEventWithReason = ClosedEvent & { reason?: CloseReason };
+
 const MAX_SEEN = 500;
 const MAX_AGENTS = 500;
 /** Daemon restarts close many agents at once; stay quiet during startup. */
@@ -165,6 +169,8 @@ export function createNotifier(options: NotifierOptions) {
 
   async function handleClosed(event: ClosedEvent): Promise<void> {
     try {
+      const closeReason = (event as ClosedEventWithReason).reason;
+      if (closeReason && closeReason !== "explicit") return;
       const state = agents.get(event.agent.id);
       const summary: SessionSummary = {
         outcome: state ? state.outcome : null,

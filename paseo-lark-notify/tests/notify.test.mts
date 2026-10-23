@@ -219,6 +219,24 @@ test("session close includes what the turn produced", async () => {
   assert.match(sent[0]?.text || "", /\*\*最后回复\*\*：已经修复并验证/);
 });
 
+test("skips closes caused by daemon shutdown or provider reload", async () => {
+  const { notifier, sent } = fixture();
+  notifier.handleCreated({ agent } as never);
+  await notifier.handleClosed({ agent, reason: "daemon_shutdown" } as never);
+  notifier.handleCreated({ agent } as never);
+  await notifier.handleClosed({ agent, reason: "provider_reload" } as never);
+  notifier.handleCreated({ agent } as never);
+  await notifier.handleClosed({ agent, reason: "session_reload" } as never);
+  assert.equal(sent.length, 0);
+});
+
+test("keeps explicit close notifications with the annotated reason", async () => {
+  const { notifier, sent } = fixture();
+  notifier.handleCreated({ agent } as never);
+  await notifier.handleClosed({ agent, reason: "explicit" } as never);
+  assert.equal(sent.length, 1);
+});
+
 test("skips child agents unless includeSubagents is set", async () => {
   const child = { ...agent, id: "agent-child", parentAgentId: "agent-1" };
   const quiet = fixture();
