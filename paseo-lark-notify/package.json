@@ -1,0 +1,27 @@
+{
+  "name": "lark-notify",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Feishu/Lark private-chat notifications for Paseo agent events",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "index.client.tsx",
+    "index.server.ts",
+    "server/"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.mts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.12.0",
+    "@types/node": "^24.19.2",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "typescript": "^5.9.3"
+  }
+}
