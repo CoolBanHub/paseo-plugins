@@ -96,7 +96,10 @@ async function fixture(t, options = {}) {
       });
       return { result: snapshot(id) };
     }
-    if (method === "session/read") return { result: snapshot(params.sessionId) };
+    if (method === "session/read") return { result: {
+      ...snapshot(params.sessionId),
+      messages: structuredClone(options.historyMessages ?? []),
+    } };
     if (method === "session/list") return { result: { sessions: [...states.keys()].map((id) => snapshot(id).session) } };
     if (method === "session/setModel") {
       if (beforeSet) await beforeSet();
@@ -133,8 +136,9 @@ async function fixture(t, options = {}) {
   t.after(() => connection.close());
   const events = [];
   connection.onEvent((event) => events.push(structuredClone(event)));
-  const open = (config = {}, persistence) => connection.send({
+  const open = (config = {}, persistence, history = "skip") => connection.send({
     type: "session.open", requestId: "open", sessionId: "paseo-session", persistence,
+    history,
     config: { cwd: "/mock/workspace", env: {}, mcpServers: {}, settings: {}, persist: true, ...config },
   });
   const configure = (changes) => connection.send({ type: "session.configure", requestId: "configure", sessionId: "paseo-session", changes });
@@ -380,6 +384,65 @@ test("resuming without an override preserves the saved model and reasoning", asy
   await f.prompt();
   assert.equal(f.config().model, BINGLM);
   assert.equal(f.calls("session/send").at(-1).modelSelection.options.reasoningLevel, "high");
+});
+
+test("resuming replays visible ZCode history before session.ready when requested", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "user", messageId: "user-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "user-part-1", text: "Question" }],
+      },
+      {
+        info: { role: "user", messageId: "hidden-1", semantics: { transcriptVisibility: "hidden" } },
+        parts: [{ type: "text", partId: "hidden-part-1", text: "Injected instructions" }],
+      },
+      {
+        info: { role: "user", messageId: "unknown-visibility-1" },
+        parts: [{ type: "text", partId: "unknown-visibility-part-1", text: "Unclassified runtime content" }],
+      },
+      {
+        info: { role: "assistant", messageId: "assistant-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [
+          { type: "reasoning", partId: "reasoning-1", text: "Thinking" },
+          { type: "text", partId: "assistant-part-1", text: "Answer" },
+          {
+            type: "tool", partId: "tool-part-1", callId: "tool-1", tool: "Bash",
+            state: { status: "completed", input: { command: "pwd" }, output: "/workspace" },
+          },
+        ],
+      },
+    ],
+  });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
+
+  const history = f.events.filter((event) => event.type === "timeline.item");
+  assert.deepEqual(history.map((event) => event.item.type), [
+    "user_message", "reasoning", "assistant_message", "tool_call",
+  ]);
+  assert.deepEqual(history.map((event) => event.item.id), [
+    "user-1", "reasoning-1", "assistant-1:text:0", "tool-1",
+  ]);
+  assert.equal(history[0].item.text, "Question");
+  assert.equal(history[2].item.text, "Answer");
+  assert.equal(history[3].item.status, "completed");
+  assert.deepEqual(history[3].item.detail, { type: "shell", command: "pwd", output: "/workspace" });
+  assert.ok(!history.some((event) => event.item.text === "Injected instructions"));
+  assert.ok(!history.some((event) => event.item.text === "Unclassified runtime content"));
+  assert.ok(f.events.findIndex((event) => event.type === "timeline.item") < f.events.findIndex((event) => event.type === "session.ready"));
+  assert.equal(f.calls("session/read").filter((call) => call.messageLimit === 1000).length, 1);
+});
+
+test("resuming with history skip does not fetch or replay the old ZCode transcript", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [{ info: { role: "user", messageId: "user-1" }, parts: [{ type: "text", text: "Old prompt" }] }],
+  });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "skip");
+
+  assert.equal(f.calls("session/read").filter((call) => call.messageLimit === 1000).length, 0);
+  assert.equal(f.events.filter((event) => event.type === "timeline.item" && event.item.type === "user_message").length, 0);
 });
 
 test("changing only mode preserves the selected provider and reasoning", async (t) => {

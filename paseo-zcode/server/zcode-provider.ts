@@ -182,6 +182,7 @@ interface CreateOrResumeResult {
     status: "pending" | "in_progress" | "completed";
     priority?: "high" | "medium" | "low";
   }>;
+  messages?: unknown[];
 }
 
 interface PendingPermission {
@@ -399,6 +400,87 @@ function emitBackgroundJobs(
 ): void {
   if (!jobs) return;
   for (const job of jobs) emitBackgroundJob(emit, state, job);
+}
+
+function historyOutput(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return value === undefined ? undefined : JSON.stringify(value);
+  const chunks = value
+    .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
+    .map((part) => typeof part.text === "string" ? part.text : "")
+    .filter(Boolean);
+  return chunks.length ? chunks.join("\n") : undefined;
+}
+
+/** Convert the native ZCode snapshot returned by session/read into Paseo timeline rows. */
+export function zcodeHistoryTimelineItems(messages: unknown, sessionId: string): ProviderTimelineItem[] {
+  if (!Array.isArray(messages)) return [];
+  const items: ProviderTimelineItem[] = [];
+  for (const [messageIndex, raw] of messages.entries()) {
+    if (!raw || typeof raw !== "object") continue;
+    const message = raw as Record<string, unknown>;
+    const info = message.info && typeof message.info === "object"
+      ? message.info as Record<string, unknown>
+      : undefined;
+    // Only replay transcript rows ZCode explicitly marked user-visible. Older
+    // or incomplete snapshots without visibility metadata must not leak the
+    // injected runtime context that shares the same message store.
+    const semantics = info?.semantics && typeof info.semantics === "object"
+      ? info.semantics as Record<string, unknown>
+      : undefined;
+    if (semantics?.transcriptVisibility !== "visible") continue;
+    const parts = Array.isArray(message.parts) ? message.parts : [];
+    const role = info?.role;
+    const messageId = typeof info?.messageId === "string" ? info.messageId : `zcode:history:${sessionId}:${messageIndex}`;
+    if (role === "user") {
+      const text = parts
+        .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
+        .map((part) => part.type === "text" && typeof part.text === "string" ? part.text
+          : part.type === "image" ? "[图片]" : part.type === "file" ? "[文件]" : "")
+        .filter(Boolean)
+        .join("");
+      if (text) items.push({ type: "user_message", id: messageId, messageId, text });
+      continue;
+    }
+    if (role !== "assistant") continue;
+    let pendingText = "";
+    let textIndex = 0;
+    const flushText = () => {
+      if (!pendingText) return;
+      const id = `${messageId}:text:${textIndex++}`;
+      items.push({ type: "assistant_message", id, messageId: id, text: pendingText });
+      pendingText = "";
+    };
+    for (const [partIndex, rawPart] of parts.entries()) {
+      if (!rawPart || typeof rawPart !== "object") continue;
+      const part = rawPart as Record<string, unknown>;
+      const partId = typeof part.partId === "string" ? part.partId : `${messageId}:part:${partIndex}`;
+      if (part.type === "text" && typeof part.text === "string") {
+        pendingText += part.text;
+      } else if (part.type === "reasoning" && typeof part.text === "string" && part.text) {
+        flushText();
+        items.push({ type: "reasoning", id: partId, text: part.text });
+      } else if (part.type === "tool") {
+        flushText();
+        const name = typeof part.tool === "string" ? part.tool : typeof part.name === "string" ? part.name : "tool";
+        const callId = typeof part.callId === "string" ? part.callId : `${messageId}:tool:${partIndex}`;
+        const snapshot = part.state && typeof part.state === "object" ? part.state as Record<string, unknown> : {};
+        const rawStatus = String(snapshot.status ?? part.status ?? "completed");
+        const status = rawStatus === "error" || rawStatus === "failed" ? "failed"
+          : rawStatus === "running" || rawStatus === "pending" ? "running" : "completed";
+        const input = snapshot.input && typeof snapshot.input === "object" && !Array.isArray(snapshot.input)
+          ? snapshot.input as Record<string, unknown>
+          : undefined;
+        const output = historyOutput(snapshot.output);
+        const detail = output === undefined ? buildToolDetail(name, input) : withOutput(buildToolDetail(name, input), output);
+        items.push(status === "failed"
+          ? { type: "tool_call", id: callId, callId, name, status, error: String(snapshot.error ?? output ?? `${name} failed`), detail }
+          : { type: "tool_call", id: callId, callId, name, status, error: null, detail });
+      }
+    }
+    flushText();
+  }
+  return items;
 }
 
 interface CatalogCache {
@@ -1089,7 +1171,9 @@ export function createZcodeProvider(): ProviderRegistration {
             const persisted = input.persistence?.data as { zcodeSessionId?: string } | undefined;
             const existingId = persisted?.zcodeSessionId;
             let result: CreateOrResumeResult;
+            let resuming = false;
             if (existingId && existingId.startsWith("sess_")) {
+              resuming = true;
               result = (await client.requestOk("session/resume", { sessionId: existingId }, 60_000)) as unknown as CreateOrResumeResult;
             } else {
               const cwd = input.config.cwd || bridgeDir;
@@ -1113,6 +1197,21 @@ export function createZcodeProvider(): ProviderRegistration {
             // Subscribe before mutations: Plan mode is confirmed only by
             // session.updated { mode, planEnabled }, not by the snapshot.
             await client.requestOk("session/subscribe", { sessionId: zcodeSessionId, deliveryKind: "desktop-continuous" });
+            let historyMessages = result.messages;
+            if (resuming && input.history === "replay") {
+              try {
+                const snapshot = await client.requestOk("session/read", {
+                  sessionId: zcodeSessionId,
+                  messageLimit: 1000,
+                }) as unknown as CreateOrResumeResult;
+                historyMessages = snapshot.messages ?? historyMessages;
+              } catch (error) {
+                log("history replay unavailable; keeping the resumed session open", {
+                  sessionId: zcodeSessionId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
             const current = result.settings?.model?.current ?? result.session.model;
             const selection = resolveModelSelection(
               catalog,
@@ -1138,6 +1237,11 @@ export function createZcodeProvider(): ProviderRegistration {
             });
             emit({ type: "session.persistence", sessionId: input.sessionId, persistence });
             emitSessionConfig(state, state.catalog ?? catalog);
+            if (resuming && input.history === "replay") {
+              for (const item of zcodeHistoryTimelineItems(historyMessages, zcodeSessionId)) {
+                emit({ type: "timeline.item", sessionId: input.sessionId, item });
+              }
+            }
             emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
             emit({ type: "request.completed", requestId: input.requestId });
             emitTodos(emit, state, result.todos);

@@ -82,9 +82,11 @@ local ZCode sessions are listed in Paseo's session picker.
   are selectable; credentials are read and decrypted locally from
   `~/.zcode/v2/credentials.json` and supplied per model request, mirroring
   what the desktop app does. Plan rate limits apply as usual.
-- Session history replay of older sessions is best-effort; timelines for
-  sessions that were idle before Paseo attached may open empty while the
-  underlying ZCode session keeps its full context.
+- When Paseo reopens a persisted session with `history: replay`, the provider
+  reads up to the latest 1,000 messages from the native ZCode snapshot and
+  replays visible user, reasoning, assistant and tool rows before marking the
+  session ready. Hidden runtime context remains hidden. A `history: skip` open
+  still reconnects without rebuilding the old timeline.
 - The plugin runs unsandboxed as the Paseo daemon user and launches the ZCode
   CLI with your existing credentials. Official-plugin MCP servers that need
   desktop auth headers (for example hexin) are not available inside
