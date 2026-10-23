@@ -3,6 +3,8 @@
 //   node --experimental-strip-types tests/adapter-perm-probe.mts
 import { runAcpProvider } from "@getpaseo/plugin/server/acp";
 import { PROVIDER_PROTOCOL_VERSION } from "@getpaseo/plugin/server/provider";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createDshConnector } from "../server/dsh-acp.ts";
 
 const log = (message: string, detail?: unknown) =>
@@ -56,7 +58,7 @@ await send({
   type: "session.open",
   requestId: "r-open",
   sessionId: "paseo-session-1",
-  config: { cwd: "~/dsh-perm-test", settings: {}, persist: false, env: {}, mcpServers: {} },
+  config: { cwd: join(homedir(), "dsh-perm-test"), settings: {}, persist: false, env: {}, mcpServers: {} },
   history: "skip",
 });
 await Promise.race([readyPromise, new Promise((r) => setTimeout(r, 60_000))]);
@@ -68,7 +70,7 @@ await send({
   prompt: {
     clientMessageId: "m1",
     delivery: "auto",
-    input: { type: "message", content: [{ type: "text", text: "Create a file at ~/dsh-probe-outside2.txt with content hi. Do not retry more than twice." }] },
+    input: { type: "message", content: [{ type: "text", text: `Create a file at ${join(homedir(), "dsh-probe-outside2.txt")} with content hi. Do not retry more than twice.` }] },
   },
 });
 console.log("prompt settled");
