@@ -104,7 +104,7 @@ export function dshToolDetail(name: string, args: Record<string, unknown> | unde
 }
 
 /** Attach a finished sub-call's output where Paseo's row detail expects it. */
-function withOutput(detail: ProviderToolCallDetail, output: string): ProviderToolCallDetail {
+export function dshToolDetailWithOutput(detail: ProviderToolCallDetail, output: string): ProviderToolCallDetail {
   switch (detail.type) {
     case "shell":
       return { ...detail, output: output.slice(0, 8000) };
@@ -203,7 +203,7 @@ export function dshPtcTimelineUpdates(
       name: record.name,
       status: "failed" as const,
       error: output || `${record.name} failed`,
-      detail: withOutput(detail, output),
+      detail: dshToolDetailWithOutput(detail, output),
     }
     : {
       type: "tool_call" as const,
@@ -212,7 +212,7 @@ export function dshPtcTimelineUpdates(
       name: record.name,
       status: "completed" as const,
       error: null,
-      detail: withOutput(detail, output),
+      detail: dshToolDetailWithOutput(detail, output),
     };
   const updates: AcpVendorUpdate[] = [{ type: "timeline", item: settledItem }];
   if (record.name === "todo_write") {

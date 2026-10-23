@@ -18,6 +18,17 @@ import * as zlib from "node:zlib";
 
 const SESSION_LOG_PATTERN = /^session\..*\.jsonl(?:\.zstd)?$/;
 const MAX_PROBE_LOG_BYTES = 512 * 1024;
+const MAX_PROBE_OUTPUT_BYTES = 2 * 1024 * 1024;
+const MAX_HISTORY_LOG_BYTES = 32 * 1024 * 1024;
+const MAX_HISTORY_OUTPUT_BYTES = 128 * 1024 * 1024;
+const MAX_HISTORY_EVENTS = 50_000;
+
+export interface DshSessionEvent {
+  type: string;
+  seq?: number;
+  time?: number;
+  data?: Record<string, unknown>;
+}
 
 export interface ProbeCleanupOptions {
   /** dsh home; defaults to `DSH_HOME` or `~/.dsh`. */
@@ -52,21 +63,59 @@ function sessionLogPath(sessionDir: string): string | undefined {
   return undefined;
 }
 
-function readSessionLog(sessionDir: string): string | undefined {
+function readSessionLog(sessionDir: string, maxBytes = MAX_PROBE_LOG_BYTES): string | undefined {
   const path = sessionLogPath(sessionDir);
   if (!path) return undefined;
   try {
-    if (statSync(path).size > MAX_PROBE_LOG_BYTES) return undefined;
+    if (statSync(path).size > maxBytes) return undefined;
     const data = readFileSync(path);
     if (!path.endsWith(".zstd")) return data.toString("utf8");
     const decompress = (zlib as typeof zlib & {
-      zstdDecompressSync?: (buffer: Buffer) => Buffer;
+      zstdDecompressSync?: (buffer: Buffer, options?: { maxOutputLength?: number }) => Buffer;
     }).zstdDecompressSync;
     if (typeof decompress !== "function") return undefined;
-    return decompress(data).toString("utf8");
+    const maxOutputLength = maxBytes === MAX_PROBE_LOG_BYTES
+      ? MAX_PROBE_OUTPUT_BYTES
+      : MAX_HISTORY_OUTPUT_BYTES;
+    return decompress(data, { maxOutputLength }).toString("utf8");
   } catch {
     return undefined;
   }
+}
+
+/** Read a bounded, validated copy of one durable dsh session log for UI replay. */
+export function readDshSessionEvents(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home"> = {},
+): DshSessionEvent[] | undefined {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
+  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
+  if (!sessionDir) return undefined;
+  const log = readSessionLog(sessionDir, MAX_HISTORY_LOG_BYTES);
+  if (log === undefined) return undefined;
+  const events: DshSessionEvent[] = [];
+  try {
+    for (const line of log.split("\n")) {
+      if (!line) continue;
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const event = parsed as Record<string, unknown>;
+      if (event.type === "session") continue;
+      if (typeof event.type !== "string") continue;
+      events.push({
+        type: event.type,
+        ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
+        ...(typeof event.time === "number" ? { time: event.time } : {}),
+        ...(event.data && typeof event.data === "object" && !Array.isArray(event.data)
+          ? { data: event.data as Record<string, unknown> }
+          : {}),
+      });
+      if (events.length > MAX_HISTORY_EVENTS) return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return events;
 }
 
 function hasConversationEvent(log: string): boolean {

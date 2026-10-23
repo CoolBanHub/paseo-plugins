@@ -34,9 +34,14 @@ The connector translates in flight:
   Paseo enables session persistence and listing;
 - outgoing `session/load` requests are rewritten to `session/resume`.
 
-Because `session/resume` does not replay history, a dsh session imported
-or reopened in Paseo opens with an empty timeline while the underlying
-dsh session keeps its full context. New sessions stream normally.
+Because `session/resume` does not replay history, the plugin reads the bounded
+dsh JSONL session log when Paseo reopens a persisted session with
+`history: replay`. Visible user, assistant, reasoning, tool and PTC sub-call
+rows are emitted before the restored session becomes ready; injected runtime
+context remains hidden. A `history: skip` open reconnects without rebuilding
+the old timeline. Replay is limited to the latest 4,000 timeline rows; the
+compressed session log and decompressed content are capped at 32 MiB and
+128 MiB. The underlying dsh session keeps its full context either way.
 
 ### dsh discovery
 
@@ -55,7 +60,8 @@ dsh's launcher refuses Electron runtime fingerprints.
 
 ## Requirements
 
-- Node 18+ available to the Paseo daemon.
+- Node 22.15+ available to the Paseo daemon (the current dsh session store uses
+  Node's built-in Zstandard support).
 - dsh installed via npx cache (run `npx @deepseek-ai/dsh web` once) or
   globally, or `DSH_BIN` pointing at its bin script.
 - A working LLM route for the `acp` profile. The auto-initialized profile

@@ -4,6 +4,7 @@ import { createDshConnector } from "./server/dsh-acp";
 import { dshCatalogCacheKey } from "./server/dsh-catalog";
 import { dshPtcTransformer } from "./server/ptc-present";
 import { currentDshSessionLaunchContext, withDshSessionLaunchContext } from "./server/session-launch-context";
+import { withDshHistoryReplay } from "./server/history-replay";
 
 export default function contribute(server: PluginServerContext) {
   const acpProvider = runAcpProvider({
@@ -22,9 +23,9 @@ export default function contribute(server: PluginServerContext) {
     ),
   });
 
-  server.registerProvider(withDshSessionLaunchContext({
+  server.registerProvider(withDshHistoryReplay(withDshSessionLaunchContext({
     ...acpProvider,
     getCatalogCacheKey: async (options) => dshCatalogCacheKey(options),
-  }));
+  })));
   return () => {};
 }
