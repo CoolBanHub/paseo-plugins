@@ -202,21 +202,12 @@ export function formatPermissionMessage(agent: AgentSummary, request: Permission
   return lines.join("\n");
 }
 
-export function formatSessionEndMessage(agent: AgentSummary, session: SessionSummary): string {
-  const meta: string[] = [];
-  if (session.turns > 0) meta.push(session.turns + " 轮");
-  if (session.durationMs !== null) meta.push(formatDuration(session.durationMs));
-
+export function formatTurnEndMessage(agent: AgentSummary, session: SessionSummary): string {
   const lines = [
-    "**🏁 会话结束**",
+    "**🏁 本轮任务完成**",
     "",
     "**项目**：" + projectName(agent.cwd),
-    "**会话**：" +
-      (agent.title || "未命名会话") +
-      "（" +
-      agent.provider +
-      (meta.length ? "，" + meta.join("，") : "") +
-      "）",
+    "**会话**：" + (agent.title || "未命名会话") + "（" + agent.provider + "，第 " + session.turns + " 轮）",
     "**结果**：" + outcomeLabel(session.outcome, session.lastError),
   ];
 

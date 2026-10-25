@@ -10,7 +10,7 @@ import {
   displayPath,
   formatDuration,
   formatPermissionMessage,
-  formatSessionEndMessage,
+  formatTurnEndMessage,
   projectName,
   summarizeTimeline,
 } from "../server/format.ts";
@@ -56,10 +56,7 @@ interface Sent {
   identity: string;
 }
 
-function fixture(
-  values: Partial<typeof DEFAULT_NOTIFY_VALUES> = {},
-  options: { now?: () => number; warmupMs?: number } = {},
-) {
+function fixture(values: Partial<typeof DEFAULT_NOTIFY_VALUES> = {}) {
   const sent: Sent[] = [];
   const notifier = createNotifier({
     readValues: async () => ({ ...DEFAULT_NOTIFY_VALUES, ...values }),
@@ -69,8 +66,6 @@ function fixture(
       sent.push({ openId: payload.openId, text: payload.text, identity: payload.identity });
       return "om_1";
     },
-    now: options.now || (() => 1000),
-    warmupMs: options.warmupMs === undefined ? 0 : options.warmupMs,
     log: () => {},
   });
   return { notifier, sent };
@@ -109,18 +104,19 @@ test("permission message falls back to input keys", () => {
   assert.match(text, /\/tmp\/notes\.md/);
 });
 
-test("session message reports project, outcome, duration, reply and action", () => {
-  const text = formatSessionEndMessage(agent, completedSession);
+test("turn message reports project, outcome, reply and action", () => {
+  const text = formatTurnEndMessage(agent, completedSession);
+  assert.match(text, /本轮任务完成/);
   assert.match(text, /\*\*项目\*\*：CoolBanHub\/paseo-plugins/);
-  assert.match(text, /\*\*会话\*\*：修复登录按钮（claude，3 轮，2 分 5 秒）/);
+  assert.match(text, /\*\*会话\*\*：修复登录按钮（claude，第 3 轮）/);
   assert.match(text, /\*\*结果\*\*：已完成/);
   assert.match(text, /\*\*最后回复\*\*：已修复登录按钮并补了测试/);
   assert.match(text, /\*\*最后动作\*\*：Bash · 执行命令：npm test/);
   assert.match(text, /\*\*目录\*\*：/);
 });
 
-test("failed sessions surface the error", () => {
-  const text = formatSessionEndMessage(agent, {
+test("failed turns surface the error", () => {
+  const text = formatTurnEndMessage(agent, {
     ...completedSession,
     outcome: "failed",
     lastError: "provider crashed",
@@ -205,62 +201,46 @@ test("honours the permission toggle", async () => {
   assert.equal(sent.length, 0);
 });
 
-test("session close includes what the turn produced", async () => {
+test("sends one notification when a turn ends, while the agent stays available", async () => {
   const { notifier, sent } = fixture();
   notifier.handleCreated({ agent } as never);
-  notifier.handleTurnEnded({
+  await notifier.handleTurnEnded({
     agent,
     outcome: { kind: "completed" },
     timeline: [{ type: "assistant_message", text: "已经修复并验证" }],
   } as never);
-  await notifier.handleClosed({ agent } as never);
   assert.equal(sent.length, 1);
+  assert.match(sent[0]?.text || "", /本轮任务完成/);
+  assert.match(sent[0]?.text || "", /第 1 轮/);
   assert.match(sent[0]?.text || "", /\*\*结果\*\*：已完成/);
   assert.match(sent[0]?.text || "", /\*\*最后回复\*\*：已经修复并验证/);
-});
-
-test("skips closes caused by daemon shutdown or provider reload", async () => {
-  const { notifier, sent } = fixture();
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent, reason: "daemon_shutdown" } as never);
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent, reason: "provider_reload" } as never);
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent, reason: "session_reload" } as never);
-  assert.equal(sent.length, 0);
-});
-
-test("keeps explicit close notifications with the annotated reason", async () => {
-  const { notifier, sent } = fixture();
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent, reason: "explicit" } as never);
-  assert.equal(sent.length, 1);
+  await notifier.handleTurnEnded({
+    agent,
+    outcome: { kind: "completed" },
+    timeline: [{ type: "assistant_message", text: "第二轮也完成" }],
+  } as never);
+  assert.equal(sent.length, 2);
+  assert.match(sent[1]?.text || "", /第 2 轮/);
+  assert.match(sent[1]?.text || "", /第二轮也完成/);
 });
 
 test("skips child agents unless includeSubagents is set", async () => {
   const child = { ...agent, id: "agent-child", parentAgentId: "agent-1" };
   const quiet = fixture();
   quiet.notifier.handleCreated({ agent: child } as never);
-  await quiet.notifier.handleClosed({ agent: child } as never);
+  await quiet.notifier.handleTurnEnded({ agent: child, outcome: { kind: "completed" }, timeline: [] } as never);
   assert.equal(quiet.sent.length, 0);
 
   const loud = fixture({ includeSubagents: true });
   loud.notifier.handleCreated({ agent: child } as never);
-  await loud.notifier.handleClosed({ agent: child } as never);
+  await loud.notifier.handleTurnEnded({ agent: child, outcome: { kind: "completed" }, timeline: [] } as never);
   assert.equal(loud.sent.length, 1);
 });
 
-test("stays quiet during the startup warmup window", async () => {
-  let clock = 1000;
-  const { notifier, sent } = fixture({}, { now: () => clock, warmupMs: 60_000 });
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent } as never);
+test("honours the turn-completion notification toggle", async () => {
+  const { notifier, sent } = fixture({ notifySessionEnd: false });
+  await notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never);
   assert.equal(sent.length, 0);
-
-  clock += 60_000;
-  notifier.handleCreated({ agent } as never);
-  await notifier.handleClosed({ agent } as never);
-  assert.equal(sent.length, 1);
 });
 
 test("resolves the recipient from lark-cli when openId is empty", async () => {

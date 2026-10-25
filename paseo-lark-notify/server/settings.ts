@@ -14,8 +14,9 @@ export const notifyValuesSchema = z.object({
   /** Bot messages need no send_as_user scope and never impersonate the user. */
   identity: z.enum(["bot", "user"]).default("bot"),
   notifyPermission: z.boolean().default(true),
+  /** Retained as notifySessionEnd for compatibility with existing host settings. */
   notifySessionEnd: z.boolean().default(true),
-  /** Child agents also emit agent.closed; keep them quiet by default. */
+  /** Child agents also emit turn-ended events; keep them quiet by default. */
   includeSubagents: z.boolean().default(false),
 });
 

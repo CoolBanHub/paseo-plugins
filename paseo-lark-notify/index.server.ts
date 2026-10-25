@@ -17,15 +17,10 @@ export default function contribute(server: PluginServerContext) {
   const offPermission = server.on("agent.permission_requested", (event) => {
     void notifier.handlePermission(event);
   });
-  const offClosed = server.on("agent.closed", (event) => {
-    void notifier.handleClosed(event);
-  });
-
   return () => {
     offCreated();
     offTurnStarted();
     offTurnEnded();
     offPermission();
-    offClosed();
   };
 }

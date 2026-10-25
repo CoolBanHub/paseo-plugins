@@ -1,7 +1,7 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import {
   formatPermissionMessage,
-  formatSessionEndMessage,
+  formatTurnEndMessage,
   summarizeTimeline,
   type SessionSummary,
 } from "./format.ts";
@@ -12,24 +12,12 @@ export type CreatedEvent = PluginLifecycleEvents["agent.created"];
 export type TurnStartedEvent = PluginLifecycleEvents["agent.turn_started"];
 export type TurnEndedEvent = PluginLifecycleEvents["agent.turn_ended"];
 export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"];
-export type ClosedEvent = PluginLifecycleEvents["agent.closed"];
-
-/** Newer Paseo daemons annotate lifecycle closes; older daemons omit it. */
-type CloseReason = "explicit" | "daemon_shutdown" | "provider_reload" | "session_reload";
-type ClosedEventWithReason = ClosedEvent & { reason?: CloseReason };
 
 const MAX_SEEN = 500;
 const MAX_AGENTS = 500;
-/** Daemon restarts close many agents at once; stay quiet during startup. */
-const DEFAULT_WARMUP_MS = 60_000;
 
 interface AgentState {
-  startedAt: number;
   turns: number;
-  outcome: SessionSummary["outcome"];
-  lastText: string | null;
-  lastAction: string | null;
-  lastError: string | null;
 }
 
 export interface NotifierOptions {
@@ -37,18 +25,13 @@ export interface NotifierOptions {
   resolveCli?: (explicit: string) => string | null;
   readOpenId?: (cliPath: string) => Promise<string | null>;
   send?: (options: SendDmOptions) => Promise<string | null>;
-  now?: () => number;
-  warmupMs?: number;
   log?: (message: string, detail?: unknown) => void;
 }
 
 export function createNotifier(options: NotifierOptions) {
-  const now = options.now || (() => Date.now());
-  const startedAt = now();
   const resolveCli = options.resolveCli || ((explicit: string) => resolveLarkCli(explicit));
   const readOpenId = options.readOpenId || readSelfOpenId;
   const send = options.send || sendDm;
-  const warmupMs = options.warmupMs === undefined ? DEFAULT_WARMUP_MS : options.warmupMs;
   const log =
     options.log ||
     ((message: string, detail?: unknown) => {
@@ -57,7 +40,6 @@ export function createNotifier(options: NotifierOptions) {
 
   const agents = new Map<string, AgentState>();
   const seenPermissions = new Set<string>();
-  const seenCloses = new Set<string>();
   let cachedOpenId: string | null = null;
   let warnedMissingCli = false;
   let warnedMissingOpenId = false;
@@ -71,12 +53,7 @@ export function createNotifier(options: NotifierOptions) {
     let state = agents.get(agentId);
     if (state) return state;
     state = {
-      startedAt: now(),
       turns: 0,
-      outcome: null,
-      lastText: null,
-      lastAction: null,
-      lastError: null,
     };
     agents.set(agentId, state);
     if (agents.size > MAX_AGENTS) {
@@ -130,12 +107,7 @@ export function createNotifier(options: NotifierOptions) {
 
   function handleCreated(event: CreatedEvent): void {
     agents.set(event.agent.id, {
-      startedAt: now(),
       turns: 0,
-      outcome: null,
-      lastText: null,
-      lastAction: null,
-      lastError: null,
     });
   }
 
@@ -143,16 +115,26 @@ export function createNotifier(options: NotifierOptions) {
     ensureAgent(event.agent.id);
   }
 
-  function handleTurnEnded(event: TurnEndedEvent): void {
+  async function handleTurnEnded(event: TurnEndedEvent): Promise<void> {
     const state = ensureAgent(event.agent.id);
     state.turns += 1;
-    state.outcome = event.outcome.kind;
-    if (event.outcome.kind === "failed") {
-      state.lastError = event.outcome.error.message;
-    }
     const summary = summarizeTimeline(event.timeline);
-    if (summary.lastText) state.lastText = summary.lastText;
-    if (summary.lastAction) state.lastAction = summary.lastAction;
+
+    try {
+      const values = await options.readValues();
+      if (!values.notifySessionEnd) return;
+      if (event.agent.parentAgentId && !values.includeSubagents) return;
+      await deliver(values, formatTurnEndMessage(event.agent, {
+        outcome: event.outcome.kind,
+        turns: state.turns,
+        durationMs: null,
+        lastText: summary.lastText,
+        lastAction: summary.lastAction,
+        lastError: event.outcome.kind === "failed" ? event.outcome.error.message : null,
+      }));
+    } catch (error) {
+      log("本轮任务完成通知处理失败", error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function handlePermission(event: PermissionEvent): Promise<void> {
@@ -167,32 +149,5 @@ export function createNotifier(options: NotifierOptions) {
     }
   }
 
-  async function handleClosed(event: ClosedEvent): Promise<void> {
-    try {
-      const closeReason = (event as ClosedEventWithReason).reason;
-      if (closeReason && closeReason !== "explicit") return;
-      const state = agents.get(event.agent.id);
-      const summary: SessionSummary = {
-        outcome: state ? state.outcome : null,
-        turns: state ? state.turns : 0,
-        durationMs: state ? now() - state.startedAt : null,
-        lastText: state ? state.lastText : null,
-        lastAction: state ? state.lastAction : null,
-        lastError: state ? state.lastError : null,
-      };
-      agents.delete(event.agent.id);
-
-      const values = await options.readValues();
-      if (!values.notifySessionEnd) return;
-      if (event.agent.parentAgentId && !values.includeSubagents) return;
-      if (now() - startedAt < warmupMs) return;
-      if (seenCloses.has(event.agent.id)) return;
-      remember(seenCloses, event.agent.id);
-      await deliver(values, formatSessionEndMessage(event.agent, summary));
-    } catch (error) {
-      log("会话结束通知处理失败", error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  return { handleCreated, handleTurnStarted, handleTurnEnded, handlePermission, handleClosed };
+  return { handleCreated, handleTurnStarted, handleTurnEnded, handlePermission };
 }

@@ -1,6 +1,6 @@
 # 飞书通知（lark-notify）
 
-把 Paseo 里「智能体需要你确认」和「会话结束」两件事，通过 `lark-cli` 以机器人身份私聊发到飞书。
+把 Paseo 里「智能体需要你确认」和「每轮任务完成」两件事，通过 `lark-cli` 以机器人身份私聊发到飞书。
 
 ## 为什么是插件
 
@@ -11,7 +11,7 @@ Paseo 的插件服务端可以订阅生命周期事件，事件是守护进程�
 | 事件 | 触发时机 | 通知 |
 | --- | --- | --- |
 | `agent.permission_requested` | 智能体发起权限/计划/提问请求，等待你处理 | 🔐 需要你确认（项目、会话、请求、命令/文件等详情、可选操作） |
-| `agent.closed` | 会话被关闭 | 🏁 会话结束（项目、会话、结果、轮次与耗时、最后回复、最后动作、目录） |
+| `agent.turn_ended` | 一轮任务结束 | 🏁 本轮任务完成（项目、会话、结果、轮次、最后回复、最后动作、目录） |
 
 ## 前置条件
 
@@ -31,16 +31,15 @@ host 级设置（`lark_notify`，version 1），未配置时全部走默认值�
 | `larkCliPath` | `""` | lark-cli 绝对路径；空表示自动发现（PATH → nvm → Homebrew → /usr/local） |
 | `identity` | `bot` | `bot` 或 `user`；后者需要 send_as_user scope |
 | `notifyPermission` | `true` | 是否通知权限请求 |
-| `notifySessionEnd` | `true` | 是否通知会话结束 |
-| `includeSubagents` | `false` | 子代理关闭是否也通知 |
+| `notifySessionEnd` | `true` | 是否通知每轮任务完成（保留旧字段名以兼容已有配置） |
+| `includeSubagents` | `false` | 子代理每轮任务完成是否也通知 |
 
 ## 行为细节
 
-- 只通知显式结束的会话；守护进程关闭、provider reload 和会话 reload 产生的 `agent.closed` 会静默跳过；旧版 Paseo 未提供关闭原因时按显式结束处理；
-- 启动后 60 秒内仍忽略无关闭原因的 `agent.closed`：兼容旧版守护进程重启时的一次性关闭，避免轰炸；
-- 会话结束的「结果 / 最后回复 / 最后动作」来自本轮 `agent.turn_ended` 事件时间线，不额外拉取历史；
+- 每次 `agent.turn_ended` 都发送一条通知；agent 回到 idle 后仍可继续工作，后续每轮完成会再次通知；
+- 每轮通知的「结果 / 最后回复 / 最后动作」来自该轮事件时间线，不额外拉取历史；
 - 最后回复会剔除混在中文答案前的英文推理句，避免把思维链发到聊天里；
-- 权限请求按 `request.id` 去重，会话关闭按 `agent.id` 去重，内存表上限 500；
+- 权限请求按 `request.id` 去重，agent 轮次数在内存中记录，上限 500；
 - 发送失败只写插件日志（`paseo plugin logs lark-notify`），不影响智能体；
 - 找不到 lark-cli 或 openId 时每类只告警一次，随后静默跳过。
 
