@@ -12,7 +12,7 @@ function temporaryHome(): string {
   return mkdtempSync(join(tmpdir(), "dsh-history-replay-"));
 }
 
-function writeSessionLog(home: string, sessionId: string, events: readonly Record<string, unknown>[], compressed = true): string {
+function writeSessionLog(home: string, sessionId: string, events: readonly DshSessionEvent[], compressed = true): string {
   const dir = join(home, "sessions", "--tmp--", sessionId);
   mkdirSync(dir, { recursive: true });
   const body = `${JSON.stringify({ type: "session", version: 4, id: sessionId, cwd: "/tmp" })}\n`
@@ -22,7 +22,7 @@ function writeSessionLog(home: string, sessionId: string, events: readonly Recor
   return path;
 }
 
-const conversationEvents: Record<string, unknown>[] = [
+const conversationEvents: DshSessionEvent[] = [
   { type: "user/message", seq: 1, data: { id: "user-id", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Hello" }] } },
   { type: "user/message", seq: 2, data: { id: "hidden-id", role: "user", source: { kind: "runtime-context", form: "snapshot" }, content: [{ type: "text", text: "Do not display this context" }] } },
   { type: "assistant/message", seq: 3, data: { message: { id: "assistant-id", role: "assistant", content: [{ type: "reasoning", text: "Thinking" }, { type: "text", text: "Hi there" }] } } },
@@ -43,7 +43,7 @@ test("reads bounded dsh JSONL histories from compressed and plain session logs",
 
 test("maps visible dsh conversation, generic tools and PTC sub-calls to stable timeline rows", () => {
   const ptcEvents: DshSessionEvent[] = [
-    ...conversationEvents as DshSessionEvent[],
+    ...conversationEvents,
     { type: "tool/call", seq: 6, data: { callId: "run-1", name: "run_code", arguments: "{}" } },
     { type: "tool/ptc-dispatch-start", seq: 7, data: { rootCallId: "run-1", subCallId: "sub-1", name: "bash", arguments: { command: "echo ok" } } },
     { type: "tool/ptc-dispatch", seq: 8, data: { rootCallId: "run-1", subCallId: "sub-1", name: "bash", arguments: { command: "echo ok" }, content: [{ type: "text", text: "ok" }] } },

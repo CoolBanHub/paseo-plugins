@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClientSideConnection } from "@agentclientprotocol/sdk";
@@ -56,10 +56,7 @@ mkdirSync(dirname(registryFile), { recursive: true });
 writeFileSync(registryFile, `${JSON.stringify({ ids: ["legacy-probe"] })}\n`);
 
 process.env.DSH_BIN = mockAgent;
-const nvmNodeRoot = join(homedir(), ".nvm", "versions", "node");
-process.env.DSH_NODE_PATH = readdirSync(nvmNodeRoot)
-  .map((version) => join(nvmNodeRoot, version, "bin", "node"))
-  .find((path) => existsSync(path)) ?? process.execPath;
+process.env.DSH_NODE_PATH = process.execPath;
 process.env.PASEO_HOME = home;
 process.env.DSH_HOME = home;
 process.env.DSH_WEB_PRESET_ROOT = presetPatchRoot;
@@ -118,6 +115,7 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
     );
     assert.equal(real.modes?.currentModeId, "ptc");
     const thinking = (real.configOptions ?? []).find((option) => option.category === "thought_level");
+    assert.ok(thinking?.type === "select");
     assert.deepEqual(
       (thinking?.options ?? []).map((option) => ("value" in option ? option.value : undefined)),
       ["off", "high", "max"],
@@ -126,13 +124,14 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
     assert.equal(thinking?.currentValue, "off", "empty current thinking value re-pointed");
 
     const permissions = (real.configOptions ?? []).find((option) => option.id === "paseo_dsh_permission_preset");
+    assert.ok(permissions?.type === "select");
     assert.equal(permissions?.category, "dsh_permission_preset", "permission preset exposed separately from mode");
     assert.deepEqual(
-      (permissions?.options ?? []).map((option) => option.value),
+      permissions.options.map((option) => "value" in option ? option.value : undefined),
       ["read-only", "workspace-write", "danger-full-access"],
     );
     assert.deepEqual(
-      (permissions?.options ?? []).map((option) => ({ value: option.value, name: option.name })),
+      permissions.options.map((option) => "value" in option ? { value: option.value, name: option.name } : undefined),
       [
         { value: "read-only", name: "仅可查看" },
         { value: "workspace-write", name: "工作区内修改" },
@@ -202,7 +201,7 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
 
     // Paseo resumes via session/load; the mock (like dsh) rejects it, so
     // success proves the rewrite to session/resume.
-    const resumed = await first.connection.loadSession({ sessionId: real.sessionId, cwd: "/tmp" });
+    const resumed = await first.connection.loadSession({ sessionId: real.sessionId, cwd: "/tmp", mcpServers: [] });
     assert.ok(resumed, "session/load translated to session/resume");
 
     const listed = await first.connection.listSessions({ cwd: "/tmp" });

@@ -34,6 +34,7 @@ if (initialized.agentCapabilities?.loadSession !== true) throw new Error("loadSe
 const session = await connection.newSession({ cwd: "/tmp", mcpServers: [] });
 console.log("STEP2 session/new:", session.sessionId);
 const model = (session.configOptions ?? []).find((o) => o.category === "model");
+if (model?.type !== "select") throw new Error("model selector was not exposed");
 console.log("STEP2 model option current:", model?.currentValue, "choices:", JSON.stringify(model?.options).slice(0, 400));
 const modelChoices = model?.options.flatMap((option) => "group" in option ? option.options : [option]) ?? [];
 const deepseekFlash = modelChoices.find((option) => {
@@ -51,13 +52,14 @@ const selected = await connection.setSessionConfigOption({
   value: deepseekFlash.value,
 });
 const thinking = selected.configOptions.find((option) => option.category === "thought_level");
+if (thinking?.type !== "select") throw new Error("thinking selector was not exposed");
 console.log("STEP2 DeepSeek-V4.1-Flash thinking options:", JSON.stringify(thinking?.options));
 if (!thinking?.options.some((option) => "value" in option && option.value === "max")) {
   throw new Error("bai/deepseek-v4.1-flash did not expose the max thinking option");
 }
 
 const permissionSetting = selected.configOptions.find((option) => option.id === "paseo_dsh_permission_preset");
-if (!permissionSetting) throw new Error("dsh permission preset setting was not exposed");
+if (permissionSetting?.type !== "select") throw new Error("dsh permission preset setting was not exposed");
 console.log("STEP2 dsh permission options:", JSON.stringify(permissionSetting.options));
 await connection.setSessionConfigOption({
   sessionId: session.sessionId,

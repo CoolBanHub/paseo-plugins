@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClientSideConnection } from "@agentclientprotocol/sdk";
@@ -48,12 +48,7 @@ for (const preset of ["standard", "ptc", "minimal", "cordis"]) {
   writeFileSync(join(presetPatchRoot, `${preset}.patch.yml`), `# ${preset}\n`);
 }
 process.env.DSH_BIN = mockAgent;
-const nvmNodeRoot = join(homedir(), ".nvm", "versions", "node");
-// The mock agent runs on node, not electron, so any node works.
-const nvmNodes = existsSync(nvmNodeRoot)
-  ? readdirSync(nvmNodeRoot).map((version) => join(nvmNodeRoot, version, "bin", "node"))
-  : [];
-process.env.DSH_NODE_PATH = nvmNodes.find((path) => existsSync(path)) ?? process.execPath;
+process.env.DSH_NODE_PATH = process.execPath;
 process.env.PASEO_HOME = home;
 process.env.DSH_HOME = home;
 process.env.DSH_WEB_PRESET_ROOT = presetPatchRoot;
@@ -170,7 +165,8 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
         dshPtcTimelineUpdates(notification.method, notification.params, "paseo-session") ?? [])
       .filter((update) => update.type === "timeline")
       .map((update) => update.item);
-    const bashRows = items.filter((item) => item.type === "tool_call" && item.name === "bash");
+    const toolItems = items.filter((item) => item.type === "tool_call");
+    const bashRows = toolItems.filter((item) => item.name === "bash");
     assert.equal(bashRows.length, 2, "bash is announced running, then settled");
     assert.equal(bashRows[0].status, "running");
     assert.deepEqual(
@@ -178,7 +174,7 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
       { type: "shell", command: "ls -la", output: "file-a\nfile-b" },
       "settled bash dispatch renders as a Shell row with its command and output",
     );
-    const editRows = items.filter((item) => item.type === "tool_call" && item.name === "edit");
+    const editRows = toolItems.filter((item) => item.name === "edit");
     const settledEdit = editRows.at(-1);
     assert.equal(settledEdit?.status, "failed");
     assert.equal(settledEdit?.error, "edit failed: no match");
