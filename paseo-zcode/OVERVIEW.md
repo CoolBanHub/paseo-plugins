@@ -1,5 +1,7 @@
 # ZCode for Paseo
 
+在 Paseo 插件列表中的显示名称为 `ZCode（GLM）`。
+
 Registers the local ZCode (GLM) coding agent as a native Paseo provider. ZCode
 sessions appear in Paseo alongside Claude Code and Codex: you can start
 sessions, send prompts, watch the timeline (reasoning, tool calls, replies),
