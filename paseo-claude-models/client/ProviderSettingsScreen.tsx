@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Platform, Pressable, Switch, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/react-native";
 import {
@@ -6,7 +7,6 @@ import {
   SettingsInput,
   SettingsSection,
   SettingsSelect,
-  SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
 import {
   deleteProviderRpc,
@@ -17,11 +17,119 @@ import {
 import { PROVIDER_PRESETS, type AuthHeader, type ProviderProtocol } from "../shared/presets";
 
 /**
- * Host-level settings screen, as a list: every configured provider is a
- * section with its endpoint, model count, key hint, an enable switch and
- * edit/delete actions; add and edit open the form. API keys are stored on
- * the daemon side and never leave it — the screen only sees a masked hint.
+ * Host-level settings screen: providers as cards (endpoint, model chips, key
+ * hint, enable switch; tap a card to edit), plus an add card. API keys are
+ * stored on the daemon side and never leave it — the screen only sees a
+ * masked hint.
  */
+
+type Theme = PluginSurfaceProps["theme"];
+
+const MONO_FONT = Platform.select({
+  ios: "Menlo",
+  android: "monospace",
+  macos: "SF Mono",
+  default: "ui-monospace, monospace",
+});
+
+/** Pressable plus a typed hover state (RN's style callback only reports pressed). */
+function HoverPressable({
+  onPress, style, children, ...rest
+}: {
+  onPress?: () => void;
+  style?: (state: { hovered: boolean; pressed: boolean }) => StyleProp<ViewStyle>;
+  children?: ReactNode;
+} & Omit<React.ComponentProps<typeof Pressable>, "onPress" | "style">) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <Pressable
+      {...rest}
+      onPress={onPress}
+      onHoverIn={() => setHovered(true)}
+      onHoverOut={() => setHovered(false)}
+      style={style === undefined ? undefined : ({ pressed }) => style({ hovered, pressed })}
+    >
+      {children}
+    </Pressable>
+  );
+}
+
+function ModelChip({ label, theme }: { label: string; theme: Theme }) {
+  return (
+    <View style={{ backgroundColor: theme.colors.surface2, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 }}>
+      <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }}>
+        {label}
+      </Text>
+    </View>
+  );
+}
+
+function ProviderCard({
+  provider, busy, theme, onEdit, onToggle,
+}: {
+  provider: ProviderView;
+  busy: boolean;
+  theme: Theme;
+  onEdit(): void;
+  onToggle(enabled: boolean): void;
+}) {
+  const shown = provider.models.slice(0, 3);
+  const hidden = provider.models.length - shown.length;
+  return (
+    <HoverPressable
+      accessibilityRole="button"
+      accessibilityLabel={`编辑 ${provider.label}`}
+      disabled={busy}
+      onPress={onEdit}
+      style={({ hovered, pressed }) => ({
+        backgroundColor: pressed || hovered ? theme.colors.surface1 : theme.colors.surface0,
+        borderColor: hovered ? theme.colors.accent : theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 10,
+        padding: 12,
+        opacity: provider.enabled ? 1 : 0.55,
+      })}
+    >
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <View
+          accessibilityLabel={provider.enabled ? "已启用" : "已停用"}
+          style={{
+            width: 8, height: 8, borderRadius: 4,
+            backgroundColor: provider.enabled ? theme.colors.statusSuccess : theme.colors.foregroundMuted,
+          }}
+        />
+        <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 14, fontWeight: "600", flexShrink: 1 }}>
+          {provider.label}
+        </Text>
+        <View style={{ flex: 1 }} />
+        <Switch
+          accessibilityLabel={`${provider.enabled ? "停用" : "启用"} ${provider.label}`}
+          value={provider.enabled}
+          disabled={busy}
+          onValueChange={onToggle}
+          trackColor={{ true: theme.colors.accent, false: theme.colors.surface2 }}
+          thumbColor={theme.colors.foreground}
+        />
+      </View>
+      <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: MONO_FONT, marginTop: 6 }}>
+        {provider.baseUrl}
+      </Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 4, marginTop: 8 }}>
+        {shown.map((model) => <ModelChip key={model.id} label={model.label} theme={theme} />)}
+        {hidden > 0 ? (
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>+{hidden}</Text>
+        ) : null}
+        <View style={{ flex: 1 }} />
+        <Text numberOfLines={1} style={{
+          color: provider.keyConfigured ? theme.colors.foregroundMuted : theme.colors.statusWarning,
+          fontSize: 11,
+        }}>
+          {provider.keyHint ?? "未配置 Key"}
+        </Text>
+      </View>
+    </HoverPressable>
+  );
+}
 
 type ModelDraft = { id: string; label: string; contextWindow: string };
 
@@ -67,11 +175,10 @@ const formFromView = (provider: ProviderView): FormState => ({
   })),
 });
 
-export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
+export function ProviderSettingsScreen({ theme }: PluginSurfaceProps) {
   const toast = useToast();
   const listRpc = useRpc(listProvidersRpc);
   const saveRpc = useRpc(saveProviderRpc);
-  const deleteRpc = useRpc(deleteProviderRpc);
 
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [busy, setBusy] = useState(false);
@@ -118,28 +225,11 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
     }
   }, [busy, saveRpc, toast]);
 
-  const remove = useCallback(async (provider: ProviderView) => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const result = await deleteRpc({ id: provider.id });
-      if (result.ok) {
-        setProviders(result.providers);
-        toast.show(`已删除 ${provider.label}`);
-      } else {
-        toast.error(`删除失败：${result.error ?? "未知错误"}`);
-      }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, deleteRpc, toast]);
-
   if (editing !== null) {
     return (
       <ProviderForm
         initial={editing === "new" ? null : editing}
+        theme={theme}
         onDone={() => {
           setEditing(null);
           void reload();
@@ -153,56 +243,51 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
       title="Claude 自定义模型"
       info="把自有 API Key 的模型（DeepSeek、GLM、Kimi 等）加入 Claude 的模型选择器；请求经本机代理按所选模型路由到对应厂商"
     >
-      {providers.length === 0 ? (
-        <SettingsAction
-          label="还没有 Provider"
-          hint="添加后其模型会出现在 Claude 的模型选择器（描述为「自定义模型 · …」）"
-          actionLabel="添加"
+      <View style={{ gap: 8, marginTop: 4 }}>
+        {providers.map((provider) => (
+          <ProviderCard
+            key={provider.id}
+            provider={provider}
+            busy={busy}
+            theme={theme}
+            onEdit={() => setEditing(provider)}
+            onToggle={(value) => { void toggle(provider, value); }}
+          />
+        ))}
+        <HoverPressable
+          accessibilityRole="button"
+          accessibilityLabel="添加 Provider"
+          disabled={busy}
           onPress={() => setEditing("new")}
-        />
-      ) : providers.map((provider) => (
-        <SettingsSection
-          key={provider.id}
-          title={provider.label}
-          info={`${provider.baseUrl} · ${provider.models.length} 个模型 · ${provider.keyHint ?? "未配置 Key"}${provider.enabled ? "" : " · 已停用"}`}
+          style={({ hovered }) => ({
+            borderColor: hovered ? theme.colors.accent : theme.colors.border,
+            borderWidth: 1,
+            borderStyle: "dashed",
+            borderRadius: 10,
+            padding: 12,
+            alignItems: "center",
+            gap: 4,
+          })}
         >
-          <SettingsSwitch
-            label="启用"
-            hint="停用后模型从选择器移除；已开会话的下一条请求会失败"
-            value={provider.enabled}
-            onValueChange={(value) => { void toggle(provider, value); }}
-            disabled={busy}
-          />
-          <SettingsAction
-            label="编辑配置"
-            hint="名称、端点、鉴权、API Key 与模型列表"
-            actionLabel="编辑"
-            onPress={() => setEditing(provider)}
-            disabled={busy}
-          />
-          <SettingsAction
-            label={`删除 ${provider.label}`}
-            hint="配置与 Key 一并删除，模型从选择器移除"
-            actionLabel="删除"
-            onPress={() => { void remove(provider); }}
-            disabled={busy}
-          />
-        </SettingsSection>
-      ))}
-      <SettingsAction
-        label="新建 Provider"
-        hint="从 DeepSeek / GLM / Kimi / 通义千问预设开始，或自定义任意 Anthropic / OpenAI 兼容端点"
-        actionLabel="添加"
-        onPress={() => setEditing("new")}
-        disabled={busy}
-      />
+          <Text style={{ color: theme.colors.accent, fontSize: 13, fontWeight: "600" }}>
+            {providers.length === 0 ? "＋ 添加第一个 Provider" : "＋ 添加 Provider"}
+          </Text>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+            {providers.length === 0
+              ? "添加后其模型会出现在 Claude 的模型选择器（描述为「自定义模型 · …」）"
+              : "DeepSeek / GLM / Kimi / 通义千问 / 自定义端点"}
+          </Text>
+        </HoverPressable>
+      </View>
     </SettingsSection>
   );
 }
 
-function ProviderForm({ initial, onDone }: { initial: ProviderView | null; onDone(): void }) {
+function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null; theme: Theme; onDone(): void }) {
   const toast = useToast();
   const saveRpc = useRpc(saveProviderRpc);
+  const deleteRpc = useRpc(deleteProviderRpc);
+  const [deleting, setDeleting] = useState(false);
 
   const [form, setForm] = useState<FormState>(() => (initial ? formFromView(initial) : presetForm("deepseek")));
   // Inputs are uncontrolled; bumping this remounts them with fresh values.
@@ -269,6 +354,24 @@ function ProviderForm({ initial, onDone }: { initial: ProviderView | null; onDon
       setSaving(false);
     }
   }, [form, initial, onDone, saveRpc, saving, toast]);
+
+  const remove = useCallback(async () => {
+    if (!initial || saving || deleting) return;
+    setDeleting(true);
+    try {
+      const result = await deleteRpc({ id: initial.id });
+      if (result.ok) {
+        toast.show(`已删除 ${initial.label}`);
+        onDone();
+      } else {
+        toast.error(`删除失败：${result.error ?? "未知错误"}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleting(false);
+    }
+  }, [deleteRpc, deleting, initial, onDone, saving, toast]);
 
   return (
     <SettingsSection
@@ -382,6 +485,27 @@ function ProviderForm({ initial, onDone }: { initial: ProviderView | null; onDon
           onPress={onDone}
           disabled={saving}
         />
+        {initial ? (
+          <HoverPressable
+            accessibilityRole="button"
+            accessibilityLabel={`删除 ${initial.label}`}
+            disabled={saving || deleting}
+            onPress={() => { void remove(); }}
+            style={({ hovered }) => ({
+              borderColor: hovered ? theme.colors.statusDanger : theme.colors.border,
+              borderWidth: 1,
+              borderRadius: 10,
+              padding: 10,
+              alignItems: "center",
+              marginTop: 4,
+              opacity: deleting ? 0.55 : 1,
+            })}
+          >
+            <Text style={{ color: theme.colors.statusDanger, fontSize: 12, fontWeight: "600" }}>
+              {deleting ? "删除中…" : `删除 ${initial.label}（配置与 Key 一并删除）`}
+            </Text>
+          </HoverPressable>
+        ) : null}
       </SettingsSection>
     </SettingsSection>
   );
