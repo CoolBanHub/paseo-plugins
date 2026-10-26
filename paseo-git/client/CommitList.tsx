@@ -149,7 +149,7 @@ function refChipStyle(ref: string, theme: PanelTheme): { label: string; color: s
     return { label: ref.slice("tag: ".length), color: theme.colors.statusSuccess, background: mixWithBackground(theme.colors.statusSuccess, theme.colors.surface0, 0.82) };
   }
   if (ref.includes("/")) {
-    return { label: ref, color: theme.colors.foregroundMuted, background: theme.colors.surface2 };
+    return { label: ref, color: theme.colors.accent, background: mixWithBackground(theme.colors.accent, theme.colors.surface0, 0.82) };
   }
   return { label: ref, color: theme.colors.statusWarning, background: mixWithBackground(theme.colors.statusWarning, theme.colors.surface0, 0.82) };
 }
