@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/react-native";
 import {
@@ -17,9 +17,10 @@ import {
 import { PROVIDER_PRESETS, type AuthHeader, type ProviderProtocol } from "../shared/presets";
 
 /**
- * Host-level settings screen: manage the personal model providers whose
- * models appear in Paseo's Claude model picker. API keys are stored on the
- * daemon side and never leave it — the screen only sees a masked hint.
+ * Host-level settings screen, as a list: every configured provider is a
+ * section with its endpoint, model count, key hint, an enable switch and
+ * edit/delete actions; add and edit open the form. API keys are stored on
+ * the daemon side and never leave it — the screen only sees a masked hint.
  */
 
 type ModelDraft = { id: string; label: string; contextWindow: string };
@@ -31,26 +32,12 @@ type FormState = {
   protocol: ProviderProtocol;
   authHeader: AuthHeader;
   apiKey: string;
-  enabled: boolean;
   models: ModelDraft[];
 };
 
-const NEW = "__new__";
-
-const emptyForm = (): FormState => ({
-  presetId: "custom",
-  label: "",
-  baseUrl: "",
-  protocol: "anthropic",
-  authHeader: "bearer",
-  apiKey: "",
-  enabled: true,
-  models: [],
-});
-
 const presetForm = (presetId: string): FormState => {
   const preset = PROVIDER_PRESETS.find((entry) => entry.id === presetId);
-  if (!preset) return emptyForm();
+  if (!preset) return presetForm("deepseek");
   return {
     presetId,
     label: preset.id === "custom" ? "" : preset.label,
@@ -58,7 +45,6 @@ const presetForm = (presetId: string): FormState => {
     protocol: preset.protocol,
     authHeader: preset.authHeader,
     apiKey: "",
-    enabled: true,
     models: preset.models.map((model) => ({
       id: model.id,
       label: model.label,
@@ -74,7 +60,6 @@ const formFromView = (provider: ProviderView): FormState => ({
   protocol: provider.protocol,
   authHeader: provider.authHeader,
   apiKey: "",
-  enabled: provider.enabled,
   models: provider.models.map((model) => ({
     id: model.id,
     label: model.label,
@@ -89,11 +74,9 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
   const deleteRpc = useRpc(deleteProviderRpc);
 
   const [providers, setProviders] = useState<ProviderView[]>([]);
-  const [target, setTarget] = useState<string>(NEW);
-  const [form, setForm] = useState<FormState>(emptyForm);
-  // Inputs are uncontrolled; bumping this remounts them with fresh values.
-  const [formVersion, setFormVersion] = useState(0);
-  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  /** null: the list; "new": blank form; a provider: its edit form. */
+  const [editing, setEditing] = useState<"new" | ProviderView | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -109,26 +92,127 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
     void reload();
   }, [reload]);
 
-  const editing = useMemo(
-    () => (target === NEW ? null : providers.find((provider) => provider.id === target) ?? null),
-    [providers, target],
+  const toggle = useCallback(async (provider: ProviderView, enabled: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await saveRpc({
+        id: provider.id,
+        label: provider.label,
+        baseUrl: provider.baseUrl,
+        protocol: provider.protocol,
+        authHeader: provider.authHeader,
+        enabled,
+        models: provider.models,
+      });
+      if (result.ok) {
+        setProviders(result.providers);
+        toast.show(enabled ? `已启用 ${provider.label}，模型回到选择器` : `已停用 ${provider.label}，模型已从选择器移除`);
+      } else {
+        toast.error(`操作失败：${result.error ?? "未知错误"}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, saveRpc, toast]);
+
+  const remove = useCallback(async (provider: ProviderView) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await deleteRpc({ id: provider.id });
+      if (result.ok) {
+        setProviders(result.providers);
+        toast.show(`已删除 ${provider.label}`);
+      } else {
+        toast.error(`删除失败：${result.error ?? "未知错误"}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, deleteRpc, toast]);
+
+  if (editing !== null) {
+    return (
+      <ProviderForm
+        initial={editing === "new" ? null : editing}
+        onDone={() => {
+          setEditing(null);
+          void reload();
+        }}
+      />
+    );
+  }
+
+  return (
+    <SettingsSection
+      title="Claude 自定义模型"
+      info="把自有 API Key 的模型（DeepSeek、GLM、Kimi 等）加入 Claude 的模型选择器；请求经本机代理按所选模型路由到对应厂商"
+    >
+      {providers.length === 0 ? (
+        <SettingsAction
+          label="还没有 Provider"
+          hint="添加后其模型会出现在 Claude 的模型选择器（描述为「自定义模型 · …」）"
+          actionLabel="添加"
+          onPress={() => setEditing("new")}
+        />
+      ) : providers.map((provider) => (
+        <SettingsSection
+          key={provider.id}
+          title={provider.label}
+          info={`${provider.baseUrl} · ${provider.models.length} 个模型 · ${provider.keyHint ?? "未配置 Key"}${provider.enabled ? "" : " · 已停用"}`}
+        >
+          <SettingsSwitch
+            label="启用"
+            hint="停用后模型从选择器移除；已开会话的下一条请求会失败"
+            value={provider.enabled}
+            onValueChange={(value) => { void toggle(provider, value); }}
+            disabled={busy}
+          />
+          <SettingsAction
+            label="编辑配置"
+            hint="名称、端点、鉴权、API Key 与模型列表"
+            actionLabel="编辑"
+            onPress={() => setEditing(provider)}
+            disabled={busy}
+          />
+          <SettingsAction
+            label={`删除 ${provider.label}`}
+            hint="配置与 Key 一并删除，模型从选择器移除"
+            actionLabel="删除"
+            onPress={() => { void remove(provider); }}
+            disabled={busy}
+          />
+        </SettingsSection>
+      ))}
+      <SettingsAction
+        label="新建 Provider"
+        hint="从 DeepSeek / GLM / Kimi / 通义千问预设开始，或自定义任意 Anthropic / OpenAI 兼容端点"
+        actionLabel="添加"
+        onPress={() => setEditing("new")}
+        disabled={busy}
+      />
+    </SettingsSection>
   );
+}
+
+function ProviderForm({ initial, onDone }: { initial: ProviderView | null; onDone(): void }) {
+  const toast = useToast();
+  const saveRpc = useRpc(saveProviderRpc);
+
+  const [form, setForm] = useState<FormState>(() => (initial ? formFromView(initial) : presetForm("deepseek")));
+  // Inputs are uncontrolled; bumping this remounts them with fresh values.
+  const [formVersion, setFormVersion] = useState(0);
+  const [saving, setSaving] = useState(false);
 
   const applyForm = useCallback((next: FormState) => {
     setForm(next);
     setFormVersion((version) => version + 1);
   }, []);
-
-  const onTargetChange = useCallback((value: string) => {
-    setTarget(value);
-    if (value === NEW) { applyForm(emptyForm()); return; }
-    const provider = providers.find((entry) => entry.id === value);
-    if (provider) applyForm(formFromView(provider));
-  }, [applyForm, providers]);
-
-  const onPresetChange = useCallback((value: string) => {
-    applyForm(presetForm(value));
-  }, [applyForm]);
 
   const key = (field: string) => `${field}-${formVersion}`;
 
@@ -164,20 +248,18 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
     setSaving(true);
     try {
       const result = await saveRpc({
-        ...(editing ? { id: editing.id } : {}),
+        ...(initial ? { id: initial.id } : {}),
         label: form.label.trim(),
         baseUrl: form.baseUrl.trim(),
         protocol: form.protocol,
         authHeader: form.authHeader,
-        enabled: form.enabled,
+        enabled: true,
         models,
         ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
       });
       if (result.ok) {
-        setProviders(result.providers);
         toast.show(`已保存 ${form.label.trim()}，其模型已加入 Claude 的模型选择器`);
-        setTarget(NEW);
-        applyForm(emptyForm());
+        onDone();
       } else {
         toast.error(`保存失败：${result.error ?? "未知错误"}`);
       }
@@ -186,72 +268,22 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
     } finally {
       setSaving(false);
     }
-  }, [applyForm, editing, form, saveRpc, saving, toast]);
-
-  const remove = useCallback(async () => {
-    if (!editing || saving) return;
-    setSaving(true);
-    try {
-      const result = await deleteRpc({ id: editing.id });
-      if (result.ok) {
-        setProviders(result.providers);
-        toast.show(`已删除 ${editing.label}`);
-        setTarget(NEW);
-        applyForm(emptyForm());
-      } else {
-        toast.error(`删除失败：${result.error ?? "未知错误"}`);
-      }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }, [applyForm, deleteRpc, editing, saving, toast]);
+  }, [form, initial, onDone, saveRpc, saving, toast]);
 
   return (
     <SettingsSection
-      title="Claude 自定义模型"
-      info="把 DeepSeek、GLM、Kimi 等自有 API Key 的模型加入 Claude 的模型选择器；新会话选择后即走对应厂商，请求经本机代理转发"
+      title={initial ? `编辑 ${initial.label}` : "新建 Provider"}
+      info="保存后模型立即进入 Claude 的模型选择器"
     >
-      <SettingsSection title="Provider" info="内置预设可改：端点、鉴权与模型列表都以表单为准">
+      <SettingsSection title="基本信息">
         <SettingsSelect
-          label="编辑对象"
-          value={target}
-          options={[
-            { label: "＋ 新建 Provider", value: NEW },
-            ...providers.map((provider) => ({ label: provider.label, value: provider.id })),
-          ]}
-          onValueChange={onTargetChange}
+          label="从预设开始"
+          value={form.presetId}
+          options={PROVIDER_PRESETS.map((preset) => ({ label: preset.label, value: preset.id }))}
+          onValueChange={(value) => applyForm(presetForm(value))}
+          hint={PROVIDER_PRESETS.find((preset) => preset.id === form.presetId)?.keyHint}
+          disabled={!!initial}
         />
-        {editing ? (
-          <SettingsSelect
-            label="套用预设"
-            value={form.presetId}
-            options={PROVIDER_PRESETS.map((preset) => ({ label: preset.label, value: preset.id }))}
-            onValueChange={onPresetChange}
-            hint="选择预设会用该预设覆盖下方表单"
-          />
-        ) : (
-          <SettingsSelect
-            label="从预设开始"
-            value={form.presetId}
-            options={PROVIDER_PRESETS.map((preset) => ({ label: preset.label, value: preset.id }))}
-            onValueChange={onPresetChange}
-            hint={PROVIDER_PRESETS.find((preset) => preset.id === form.presetId)?.keyHint}
-          />
-        )}
-        {editing ? (
-          <SettingsAction
-            label={`删除 ${editing.label}`}
-            hint="模型会从选择器移除；已开会话的下一条请求会失败，请关闭后再删除"
-            actionLabel="删除"
-            onPress={() => { void remove(); }}
-            disabled={saving}
-          />
-        ) : null}
-      </SettingsSection>
-
-      <SettingsSection title="连接">
         <SettingsInput
           key={key("label")}
           label="名称"
@@ -288,17 +320,10 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
         <SettingsInput
           key={key("apiKey")}
           label="API Key"
-          placeholder={editing?.keyHint ? `已保存 ${editing.keyHint}，留空保持不变` : "粘贴 API Key"}
+          placeholder={initial?.keyHint ? `已保存 ${initial.keyHint}，留空保持不变` : "粘贴 API Key"}
           initialValue=""
           secureTextEntry
           onChangeText={(text) => setForm((current) => ({ ...current, apiKey: text }))}
-          hint={PROVIDER_PRESETS.find((preset) => preset.id === form.presetId)?.keyHint}
-        />
-        <SettingsSwitch
-          label="启用"
-          hint="关闭后模型不再出现在选择器"
-          value={form.enabled}
-          onValueChange={(value) => setForm((current) => ({ ...current, enabled: value }))}
         />
       </SettingsSection>
 
@@ -325,7 +350,7 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
               placeholder="200000"
               initialValue={model.contextWindow}
               onChangeText={(text) => setModel(index, { contextWindow: text })}
-              hint="留空按 200k 处理自动压缩"
+              hint="留空按 Claude Code 默认的 200k 处理自动压缩"
             />
             <SettingsAction
               label="移除这个模型"
@@ -346,9 +371,15 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
 
       <SettingsSection title="保存">
         <SettingsAction
-          label={editing ? `保存对 ${editing.label} 的修改` : "保存为新 Provider"}
+          label={initial ? `保存对 ${initial.label} 的修改` : "保存为新 Provider"}
           actionLabel={saving ? "保存中…" : "保存"}
           onPress={() => { void save(); }}
+          disabled={saving}
+        />
+        <SettingsAction
+          label="放弃更改"
+          actionLabel="取消"
+          onPress={onDone}
           disabled={saving}
         />
       </SettingsSection>
