@@ -71,7 +71,7 @@ function slugify(label: string): string {
 export function dataDirectory(explicit?: string): string {
   if (explicit) return explicit;
   const paseoHome = process.env.PASEO_HOME?.trim() || join(homedir(), ".paseo");
-  return join(paseoHome, "plugin-data", "custom-models");
+  return join(paseoHome, "plugin-data", "claude-models");
 }
 
 type PersistedFile = { version: 1; providers: StoredProvider[] };

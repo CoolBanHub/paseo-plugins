@@ -1,5 +1,5 @@
 {
-  "name": "custom-models",
+  "name": "claude-models",
   "private": true,
   "version": "0.1.0",
   "description": "Personal model providers (DeepSeek, GLM, Kimi, any Anthropic/OpenAI-compatible endpoint) injected into Paseo's Claude model picker",

@@ -34,7 +34,7 @@ export default function contribute(server: PluginServerContext) {
   const syncMenu = async (): Promise<void> => {
     if (!lastPaseo) return;
     await syncClaudeModels(lastPaseo, registry.menuModels())
-      .catch((error) => console.warn("[custom-models] 模型菜单同步失败", error));
+      .catch((error) => console.warn("[claude-models] 模型菜单同步失败", error));
   };
   const ensureSynced = async (): Promise<void> => {
     if (initialSyncDone) return;
@@ -109,7 +109,7 @@ export default function contribute(server: PluginServerContext) {
       }, plain.env) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[custom-models] 会话 ${request.agentId} 打开模型线路失败`, error);
+      console.warn(`[claude-models] 会话 ${request.agentId} 打开模型线路失败`, error);
       throw new Error(`自定义模型不可用：${message}`);
     }
   });

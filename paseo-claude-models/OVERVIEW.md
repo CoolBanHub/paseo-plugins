@@ -1,10 +1,10 @@
-# 自定义模型（custom-models）
+# 自定义模型（claude-models）
 
 把自有 API Key 的模型——DeepSeek、GLM、Kimi、通义千问，或任意 Anthropic / OpenAI 兼容端点（vLLM、Ollama、OpenRouter 等）——加入 Paseo 内置 Claude provider 的模型选择器。在 Paseo 里随意选模型开 Claude Code 会话，请求经插件内置的本机代理桥按所选模型路由到对应厂商。
 
 ## 工作原理
 
-- **配置与密钥**：全部存在 `$PASEO_HOME/plugin-data/custom-models/`——`providers.json`（0600）与 `keys/<id>.secret`（0600）。API Key 不进 Paseo 配置、不回传渲染端（界面只显示末四位提示）。
+- **配置与密钥**：全部存在 `$PASEO_HOME/plugin-data/claude-models/`——`providers.json`（0600）与 `keys/<id>.secret`（0600）。API Key 不进 Paseo 配置、不回传渲染端（界面只显示末四位提示）。
 - **模型注入**：通过 `paseo.config.patch` 写入 Claude provider 的 `additionalModels`。菜单 ID 带 `cm:` 前缀（如 `cm:glm-4.6`），description 带「自定义模型 · 」标记用于幂等同步；用户自己在设置里加的条目永远保留。
 - **请求路由**：`agent.create` 标记选中的模型，`agent.session_open` 钩子把会话 env 的 `ANTHROPIC_BASE_URL` 指向插件内置的 127.0.0.1 代理桥，并注入每会话随机的 capability 作为 `ANTHROPIC_AUTH_TOKEN`（桥只存其 SHA-256）。桥按每个请求 body 里的 `model` 字段找到所属 Provider，带用户自己的 Key 直连厂商。
 - **协议**：Anthropic 兼容端点（DeepSeek/GLM/Kimi/百炼等）原样直通；OpenAI Chat 兼容端点经 Anthropic↔Chat 协议转换（转换器与 SSE 工具移植自 cc-switch / paseo-team-work 的同源实现，MIT 许可）。
@@ -40,7 +40,7 @@ npm test          # 含端到端桥测试（真实回环 socket + mock 厂商）
 npm run typecheck
 ```
 
-改动后执行 `paseo plugin reload custom-models`（桥自动恢复端口与路由；建议避开正在流式输出的自定义模型会话）。
+改动后执行 `paseo plugin reload claude-models`（桥自动恢复端口与路由；建议避开正在流式输出的自定义模型会话）。
 
 ## 已知限制
 

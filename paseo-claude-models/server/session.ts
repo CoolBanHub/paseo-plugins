@@ -8,7 +8,7 @@ import { menuModelId } from "../shared/model-id.ts";
  */
 
 /** Set by the agent.create hook; read (and removed) by the session_open hook. */
-export const MODEL_SELECTED_ENV = "CUSTOM_MODELS_SELECTED";
+export const MODEL_SELECTED_ENV = "CLAUDE_MODELS_SELECTED";
 
 export type SessionModel = { id: string; contextWindow?: number };
 

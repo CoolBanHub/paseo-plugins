@@ -443,7 +443,7 @@ export function createBridge(options: BridgeOptions) {
     try { listenerPort = await ensureListener(state.port); } catch { listenerPort = 0; }
     if (!listenerPort || listenerPort !== state.port) {
       if (listenerPort) {
-        console.warn(`[custom-models] 本地代理没能在原端口（${state.port}）恢复，已改用端口 ${listenerPort}；已开的自定义模型会话需重新打开`);
+        console.warn(`[claude-models] 本地代理没能在原端口（${state.port}）恢复，已改用端口 ${listenerPort}；已开的自定义模型会话需重新打开`);
       }
       return;
     }

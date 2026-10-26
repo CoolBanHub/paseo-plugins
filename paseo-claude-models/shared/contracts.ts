@@ -55,19 +55,19 @@ const providersResult = z.object({
 });
 
 export const listProvidersRpc = defineRpc({
-  name: "custom-models.providers.list",
+  name: "claude-models.providers.list",
   input: z.object({}),
   output: providersResult,
 });
 
 export const saveProviderRpc = defineRpc({
-  name: "custom-models.providers.save",
+  name: "claude-models.providers.save",
   input: providerInputSchema,
   output: providersResult,
 });
 
 export const deleteProviderRpc = defineRpc({
-  name: "custom-models.providers.delete",
+  name: "claude-models.providers.delete",
   input: z.object({ id: z.string() }),
   output: providersResult,
 });

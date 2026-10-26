@@ -210,7 +210,7 @@ export function ProviderSettingsScreen(_props: PluginSurfaceProps) {
 
   return (
     <SettingsSection
-      title="自定义模型"
+      title="Claude 自定义模型"
       info="把 DeepSeek、GLM、Kimi 等自有 API Key 的模型加入 Claude 的模型选择器；新会话选择后即走对应厂商，请求经本机代理转发"
     >
       <SettingsSection title="Provider" info="内置预设可改：端点、鉴权与模型列表都以表单为准">
