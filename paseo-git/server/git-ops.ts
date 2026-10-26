@@ -953,3 +953,53 @@ export async function gitPull(run: GitRun, cwd: string): Promise<ActionResult> {
     return { ok: false, error: err instanceof Error ? err.message : String(err), message: null };
   }
 }
+
+export interface PushResult extends ActionResult {
+  /** True when the push was refused only because the branch has no upstream. */
+  needsUpstream: boolean;
+}
+
+/** One toast-sized line, counted before pushing so the number survives the update. */
+export function formatPushSummary(upstream: string, commits: number): string {
+  if (commits === 0) return "远端已是最新，没有可推送的提交";
+  return `已推送 ${commits} 个提交到 ${upstream}`;
+}
+
+/**
+ * Push the current branch. Without an upstream the push is refused with
+ * `needsUpstream: true` — the panel asks, then retries with setUpstream to
+ * run `push -u origin <branch>` (branch name comes from the repo itself,
+ * never the client).
+ */
+export async function gitPush(run: GitRun, cwd: string, setUpstream: boolean): Promise<PushResult> {
+  const failed = (error: string): PushResult => ({ ok: false, error, message: null, needsUpstream: false });
+  let root: string;
+  try {
+    root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+  try {
+    const branch = (await runChecked(run, ["rev-parse", "--abbrev-ref", "HEAD"], root)).trim();
+    if (branch === "HEAD") return failed("当前处于分离头指针状态，没有分支可推送");
+    let upstream: string | null = null;
+    try {
+      upstream = (await runChecked(run, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root)).trim();
+    } catch {
+      upstream = null; // branch.<name>.remote / .push not configured yet
+    }
+    if (upstream === null) {
+      if (!setUpstream) {
+        return { ok: false, error: `分支 ${branch} 没有上游分支`, message: null, needsUpstream: true };
+      }
+      await runChecked(run, ["push", "-u", "origin", branch], root, 120_000);
+      return { ok: true, error: null, message: `已推送 ${branch} 并建立上游跟踪 origin/${branch}`, needsUpstream: false };
+    }
+    const countText = await runChecked(run, ["rev-list", "--count", `${upstream}..HEAD`], root);
+    const commits = Number.parseInt(countText.trim(), 10) || 0;
+    await runChecked(run, ["push"], root, 120_000);
+    return { ok: true, error: null, message: formatPushSummary(upstream, commits), needsUpstream: false };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}

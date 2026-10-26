@@ -290,3 +290,16 @@ export const gitPullRpc = defineRpc({
     message: z.string().nullable(),
   }),
 });
+
+export const gitPushRpc = defineRpc({
+  name: "git.push",
+  input: repoInput.extend({
+    /** Push -u origin <branch> after the user confirms an upstream-less branch. */
+    setUpstream: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+    /** True when the push was refused only because the branch has no upstream. */
+    needsUpstream: z.boolean().default(false),
+  }),
+});

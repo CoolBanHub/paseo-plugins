@@ -11,6 +11,7 @@ import { useRpc, useWorkspace, type PluginWorkspacePanelProps } from "@getpaseo/
 import { BranchPane } from "./BranchPane";
 import { CommitList } from "./CommitList";
 import { CommitDetails } from "./CommitDetails";
+import { ConfirmDialog } from "./dialogs";
 import { isDateKey, localDateKey } from "./format";
 import {
   AuthorDropdown,
@@ -28,6 +29,7 @@ import {
   gitFetchRpc,
   gitLogRpc,
   gitPullRpc,
+  gitPushRpc,
   gitStatusRpc,
   gitTagCreateRpc,
   gitTagDeleteRpc,
@@ -61,6 +63,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   const checkoutRpc = useRpc(gitCheckoutRpc);
   const fetchRpc = useRpc(gitFetchRpc);
   const pullRpc = useRpc(gitPullRpc);
+  const pushRpc = useRpc(gitPushRpc);
   const tagsRpc = useRpc(gitTagsRpc);
   const tagCreateRpc = useRpc(gitTagCreateRpc);
   const tagDeleteRpc = useRpc(gitTagDeleteRpc);
@@ -88,6 +91,8 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   const [detailLoading, setDetailLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [showBranchesModal, setShowBranchesModal] = useState(false);
+  /** Branch name while asking whether to push -u origin after an upstream-less push. */
+  const [pushSetupBranch, setPushSetupBranch] = useState<string | null>(null);
   const repoPathRef = useRef<string | null>(null);
 
   const refresh = useCallback(
@@ -255,6 +260,31 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       setBusy(null);
     }
   }, [afterMutation, pullRpc, toast]);
+
+  const onPush = useCallback(
+    async (setUpstream: boolean) => {
+      const repoPath = repoPathRef.current;
+      if (!repoPath) return;
+      setBusy("push");
+      try {
+        const result = await pushRpc({ repoPath, setUpstream });
+        if (result.ok) {
+          setPushSetupBranch(null);
+          toast.show(result.message ?? "推送完成", { variant: "success" });
+          afterMutation();
+        } else if (result.needsUpstream) {
+          setPushSetupBranch(status?.currentBranch ?? "");
+        } else {
+          toast.error(result.error ?? "推送失败");
+        }
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [afterMutation, pushRpc, status, toast],
+  );
 
   /** Shared toast/refresh plumbing for the write actions (branch/tag/worktree). */
   const runAction = useCallback(
@@ -430,6 +460,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       onCheckout={onCheckout}
       onFetch={onFetch}
       onPull={onPull}
+      onPush={onPush}
       onRefresh={() => void refresh()}
       onCreateBranch={onCreateBranch}
       onDeleteBranch={onDeleteBranch}
@@ -591,6 +622,20 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
           </View>
         )}
       </View>
+
+      <ConfirmDialog
+        theme={theme}
+        open={pushSetupBranch !== null}
+        onOpenChange={(open) => {
+          if (!open) setPushSetupBranch(null);
+        }}
+        title="建立上游并推送"
+        message={`分支 ${pushSetupBranch || ""} 没有上游分支，是否推送到 origin 并建立跟踪？`}
+        detail={`git push -u origin ${pushSetupBranch || ""}`}
+        mono
+        confirmLabel="推送"
+        onConfirm={() => void onPush(true)}
+      />
     </View>
   );
 }

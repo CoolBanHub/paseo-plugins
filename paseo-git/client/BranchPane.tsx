@@ -28,6 +28,7 @@ export function BranchPane({
   onCheckout,
   onFetch,
   onPull,
+  onPush,
   onRefresh,
   onCreateBranch,
   onDeleteBranch,
@@ -49,6 +50,7 @@ export function BranchPane({
   onCheckout: (ref: string) => void;
   onFetch: () => void;
   onPull: () => void;
+  onPush: (setUpstream: boolean) => void;
   onRefresh: () => void;
   onCreateBranch: (name: string, startPoint: string, checkout: boolean) => void;
   onDeleteBranch: (name: string, force: boolean) => void;
@@ -108,6 +110,13 @@ export function BranchPane({
               theme={theme}
               disabled={busy !== null}
               onPress={onPull}
+            />
+            <IconButton
+              icon="Upload"
+              label="推送当前分支"
+              theme={theme}
+              disabled={busy !== null}
+              onPress={() => onPush(false)}
             />
             <IconButton
               icon="RotateCw"

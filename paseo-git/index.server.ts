@@ -9,6 +9,7 @@ import {
   gitLog,
   gitPaths,
   gitPull,
+  gitPush,
   gitStatus,
   gitTagCreate,
   gitTagDelete,
@@ -32,6 +33,7 @@ import {
   gitLogRpc,
   gitPathsRpc,
   gitPullRpc,
+  gitPushRpc,
   gitStatusRpc,
   gitTagCreateRpc,
   gitTagDeleteRpc,
@@ -86,6 +88,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(gitWorktreePruneRpc, ({ repoPath }) => gitWorktreePrune(run, repoPath));
   server.handle(gitFetchRpc, ({ repoPath }) => gitFetch(run, repoPath));
   server.handle(gitPullRpc, ({ repoPath }) => gitPull(run, repoPath));
+  server.handle(gitPushRpc, ({ repoPath, setUpstream }) => gitPush(run, repoPath, setUpstream));
   return () => {
     unsubscribe();
   };

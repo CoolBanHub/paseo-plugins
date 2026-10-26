@@ -34,14 +34,16 @@ pane below — like the JetBrains Git Log view.
   合并提交按 first-parent 展示其带来的变更。
 - **状态头** — 仓库名、当前分支、领先/落后上游、工作区改动计数；
   获取（`fetch --prune`）、拉取（`pull --ff-only`，发散时拒绝并报 git 原文）、
-  手动刷新；面板打开期间每 45 秒静默刷新。拉取成功后只提示一行摘要
-  （快进的提交数与新旧哈希、改动文件数、增删行），不再把 git 的整屏
+  推送（当前分支推向上游；无上游时弹确认走 `push -u origin <分支>`，
+  分离头指针拒绝推送）、手动刷新；面板打开期间每 45 秒静默刷新。
+  拉取成功后只提示一行摘要（快进的提交数与新旧哈希、改动文件数、增删行），
+  推送同理（推送的提交数与目标上游），不再把 git 的整屏
   diffstat 倒进 toast。
 - **网络代理** — 设置页（Paseo 设置 > Git 代理）可填写代理地址
-  （`http://127.0.0.1:7897` 或 `socks5://…`，留空直连），拉取 GitHub 等
+  （`http://127.0.0.1:7897` 或 `socks5://…`，留空直连），拉取/推送 GitHub 等
   远端时由守护进程注入 `HTTP(S)_PROXY`/`ALL_PROXY`；可选让
   `git@` SSH 远端也经 `nc` 走代理（`GIT_SSH_COMMAND`）。保存后下一次
-  获取/拉取即生效，无需重启。适合本机没有透明代理环境的使用者各自填写。
+  获取/拉取/推送即生效，无需重启。适合本机没有透明代理环境的使用者各自填写。
 - 非 Git 工作区显示友好空态；git 报错以 toast 展示原文。
 
 ## How it works
@@ -72,8 +74,8 @@ pane below — like the JetBrains Git Log view.
 
 ## Limits
 
-- 查看 + 检出 + 分支/标签/Worktree 管理 + fetch/pull only — no push, stage,
-  commit or rebase UI yet.
+- 查看 + 检出 + 分支/标签/Worktree 管理 + fetch/pull/push（仅当前分支、
+  无 force-push）— no stage, commit or rebase UI yet.
 - Merge diffs use `--first-parent`, not combined diffs.
 - Search only covers loaded pages (first 300 by default).
 - Remote branch ahead/behind is not shown (only local branches vs HEAD).

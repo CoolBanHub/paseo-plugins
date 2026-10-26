@@ -12,6 +12,7 @@ import {
   gitLog,
   gitPaths,
   gitPull,
+  gitPush,
   gitStatus,
   gitCheckout,
   gitTagCreate,
@@ -636,6 +637,79 @@ test("gitPull 快进后返回简短摘要而不是原始 diffstat", async () => 
     const again = await gitPull(testRun, clone);
     assert.equal(again.ok, true, again.error ?? "");
     assert.match(again.message ?? "", /已是最新/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("gitPush 推送领先提交并汇报数量，重复推送提示已是最新", async () => {
+  const base = await mkdtemp(join(tmpdir(), "paseo-git-push-"));
+  try {
+    // bare origin: pushing to a checked-out branch of a non-bare repo is refused
+    const seed = join(base, "seed");
+    await initRepo(seed);
+    await writeFile(join(seed, "a.txt"), "one\n", "utf8");
+    await commitAll(seed, "c1");
+    const origin = join(base, "origin");
+    await git(base, "clone", "-q", "--bare", seed, origin);
+
+    const clone = join(base, "clone");
+    await git(base, "clone", "-q", origin, clone);
+
+    await writeFile(join(clone, "b.txt"), "new\n", "utf8");
+    await commitAll(clone, "本地提交");
+    await writeFile(join(clone, "c.txt"), "more\n", "utf8");
+    const head = await commitAll(clone, "再提交一个");
+
+    const result = await gitPush(testRun, clone, false);
+    assert.equal(result.ok, true, result.error ?? "");
+    assert.equal(result.needsUpstream, false);
+    assert.match(result.message ?? "", /已推送 2 个提交到 origin\/main/);
+
+    const remotes = await git(clone, "ls-remote", "--heads", "origin");
+    assert.ok(remotes.includes(head), "远端收到推送的提交");
+
+    const again = await gitPush(testRun, clone, false);
+    assert.equal(again.ok, true, again.error ?? "");
+    assert.match(again.message ?? "", /已是最新/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("gitPush 无上游分支时拒绝并提示，setUpstream 后推送到 origin 并建立跟踪", async () => {
+  const base = await mkdtemp(join(tmpdir(), "paseo-git-push-setup-"));
+  try {
+    const seed = join(base, "seed");
+    await initRepo(seed);
+    await writeFile(join(seed, "a.txt"), "one\n", "utf8");
+    await commitAll(seed, "c1");
+    const origin = join(base, "origin");
+    await git(base, "clone", "-q", "--bare", seed, origin);
+
+    const clone = join(base, "clone");
+    await git(base, "clone", "-q", origin, clone);
+
+    await git(clone, "checkout", "-q", "-b", "feature/x");
+    await writeFile(join(clone, "b.txt"), "feature\n", "utf8");
+    await commitAll(clone, "feature 提交");
+
+    const refused = await gitPush(testRun, clone, false);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.needsUpstream, true);
+    assert.match(refused.error ?? "", /feature\/x 没有上游分支/);
+
+    const remotesBefore = await git(clone, "ls-remote", "--heads", "origin");
+    assert.ok(!remotesBefore.includes("feature/x"), "确认前不应推送");
+
+    const setup = await gitPush(testRun, clone, true);
+    assert.equal(setup.ok, true, setup.error ?? "");
+    assert.match(setup.message ?? "", /已推送 feature\/x 并建立上游跟踪 origin\/feature\/x/);
+
+    const remotesAfter = await git(clone, "ls-remote", "--heads", "origin");
+    assert.ok(remotesAfter.includes("refs/heads/feature/x"), "远端出现 feature/x");
+    const status = await gitStatus(testRun, clone);
+    assert.equal(status.upstream, "origin/feature/x", "push -u 建立了跟踪关系");
   } finally {
     await rm(base, { recursive: true, force: true });
   }
