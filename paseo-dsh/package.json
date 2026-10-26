@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "description": "dsh (DeepSeek Harness) provider for Paseo via the dsh ACP interface",
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
@@ -17,8 +20,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.9.0",
-    "yaml": "^2.9.1",
-    "zod": "^4.4.3"
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.12.0",

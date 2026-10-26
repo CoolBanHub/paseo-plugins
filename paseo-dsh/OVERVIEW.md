@@ -60,7 +60,7 @@ dsh's launcher refuses Electron runtime fingerprints.
 
 ## Requirements
 
-- Node 22.15+ available to the Paseo daemon (the current dsh session store uses
+- Node >=22.15.0 available to the Paseo daemon (the current dsh session store uses
   Node's built-in Zstandard support).
 - dsh installed via npx cache (run `npx @deepseek-ai/dsh web` once) or
   globally, or `DSH_BIN` pointing at its bin script.
@@ -72,7 +72,7 @@ dsh's launcher refuses Electron runtime fingerprints.
   the same way. The Web profile's current model definitions, including
   reasoning-effort options, are overlaid automatically at discovery and
   session startup. Credentials resolve from `~/.dsh/.credentials.yaml`.
-- Paseo >= 0.11.4.
+- Paseo >= 0.12.0.
 
 ## Project modes
 
