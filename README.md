@@ -25,6 +25,8 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 
 ## 开发
 
+开发与 CI 使用根目录 `.node-version` 固定的 Node 版本。GitHub Actions 在 push、PR 和手动触发时分别检查五个插件：`npm ci` → `npm run typecheck` → `npm test`。
+
 每个插件是独立的 npm 包，在各自目录内安装依赖并开发：
 
 ```bash
@@ -33,6 +35,8 @@ npm install
 npm test          # 回归测试（git 插件使用临时目录内的真实 git 仓库作为 fixture）
 npm run typecheck # TypeScript 检查
 ```
+
+类型检查包含 `.ts`、`.tsx` 和 `.mts`，也覆盖 dsh 的手动诊断脚本；ZCode 现有 `.cjs` 测试继续通过 `npm test` 执行，尚未纳入静态类型检查。CI 使用 mock、临时文件和本机回环服务，不执行需要真实账号的诊断脚本，也不代表完成了真实 Paseo 客户端验收。
 
 修改插件后，在 Paseo 中执行 `paseo plugin reload <插件ID>` 重新加载：
 

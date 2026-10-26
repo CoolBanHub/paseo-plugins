@@ -1,0 +1,44 @@
+name: 质量检查
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugins:
+    name: 检查 ${{ matrix.plugin }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin:
+          - paseo-claude-models
+          - paseo-dsh
+          - paseo-git
+          - paseo-lark-notify
+          - paseo-zcode
+    defaults:
+      run:
+        working-directory: ${{ matrix.plugin }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: ${{ matrix.plugin }}/package-lock.json
+      - name: 安装锁定依赖
+        run: npm ci --no-audit --no-fund
+      - name: 类型检查
+        run: npm run typecheck
+      - name: 回归测试
+        run: npm test
