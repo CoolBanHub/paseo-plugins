@@ -41,7 +41,9 @@
   npm run typecheck
   ```
 
-- 本仓库没有根级 package.json：三个插件是独立 npm 包，依赖安装、测试、构建都在各自目录内进行。
+- 本仓库没有根级 package.json：各插件是独立 npm 包，依赖安装、测试、构建都在各自目录内进行。开发与 CI 的 Node 版本由根目录 `.node-version` 固定。
+- 修改插件清单、依赖或环境要求时，在根目录运行 `node scripts/check-metadata.mjs`；环境表变化后运行 `node scripts/check-metadata.mjs --write` 更新 README。校验器改动还需通过 `node --test scripts/*.test.mjs`。
+- 行为改动的验收说明需记录自动检查结果、真实客户端操作及结果、尚未验证项。截图放入 `artifacts/acceptance/日期-主题/`，该目录不提交。
 
 ## 文档同步
 

@@ -1,4 +1,4 @@
-# paseo-plugin
+# paseo-plugins
 
 Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.com/getpaseo) 的原生 provider，或为 Paseo 工作区补充新的面板——智能体与 Claude Code、Codex 等并列出现，可以发起会话、发送 prompt、查看时间线（推理、工具调用、回复）、应答权限确认，并在 Paseo 内切换模型与模式。
 
@@ -6,7 +6,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 
 | 目录 | 插件 ID | 说明 | 额外依赖 |
 | --- | --- | --- | --- |
-| [`paseo-dsh/`](paseo-dsh/) | `dsh` | 通过 dsh 的 ACP 接口（`dsh --profile acp`）把 DeepSeek 编码智能体 [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 接入 Paseo：独立切换 Agent 模式（标准 / PTC / 极简 / 创造）与权限预设，PTC 模式下每个子工具调用都展开为独立时间线行 | Node 18+、dsh（npx 缓存 / 全局 / `DSH_BIN`）、DeepSeek 账号 |
+| [`paseo-dsh/`](paseo-dsh/) | `dsh` | 通过 dsh 的 ACP 接口（`dsh --profile acp`）把 DeepSeek 编码智能体 [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 接入 Paseo：独立切换 Agent 模式（标准 / PTC / 极简 / 创造）与权限预设，PTC 模式下每个子工具调用都展开为独立时间线行 | dsh（npx 缓存 / 全局 / `DSH_BIN`）、DeepSeek 账号、Node 版本见环境要求 |
 | [`paseo-git/`](paseo-git/) | `git-manager` | IDEA 风格的 Git 面板：左侧分支 / 标签 / Worktree 树，右侧提交图谱（车道着色、合并斜线、徽章）与提交详情，筛选条（分支 / 作者 / 日期 / 路径 / 文本），fetch / pull，以及可配置的网络代理设置 | `git` 在 PATH 上 |
 | [`paseo-zcode/`](paseo-zcode/) | `zcode` | 通过本地 `zcode app-server --stdio` 协议把 ZCode（GLM）接入 Paseo，会话与桌面端共享；附带智谱 Coding Plan 配额的用量展示 | macOS + ZCode 桌面端（`zcode login`） |
 | [`paseo-lark-notify/`](paseo-lark-notify/) | `lark-notify` | 把「需要你确认」与「会话结束」通过 `lark-cli` 以机器人身份私聊发到飞书，覆盖 Paseo 内所有 provider | `lark-cli`（已登录，机器人可私聊） |
@@ -16,8 +16,19 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 
 ## 环境要求
 
-- [Paseo](https://github.com/getpaseo) 桌面端：`dsh` 插件要求 ≥ 0.12.0（插件协议版本与守护进程保持一致），`git-manager`、`zcode`、`lark-notify` 与 `claude-models` 要求 ≥ 0.11.4。
-- 各插件自身的依赖见上表与对应 `OVERVIEW.md`。
+下表从各插件的 `paseo-plugin.json` 和 `package.json` 生成，CI 会检查是否过期。Paseo 要求表示声明的宿主兼容范围；开发 SDK 版本不代表已在所有宿主版本上完成实测。额外 Node 要求用于 dsh 子进程，其他插件使用 Paseo 宿主运行时。
+
+<!-- plugin-requirements:start -->
+| 目录 | 插件 ID | 显示名称 | Paseo 要求 | 开发 SDK | 额外 Node 要求 |
+| --- | --- | --- | --- | --- | --- |
+| [paseo-claude-models/](paseo-claude-models/) | `claude-models` | Claude 自定义模型 | `>=0.11.4` | `0.12.0` | — |
+| [paseo-dsh/](paseo-dsh/) | `dsh` | dsh (DeepSeek) | `>=0.12.0` | `0.12.0` | `>=22.15.0` |
+| [paseo-git/](paseo-git/) | `git-manager` | Git 管理 | `>=0.11.4` | `0.11.4` | — |
+| [paseo-lark-notify/](paseo-lark-notify/) | `lark-notify` | 飞书通知 | `>=0.11.4` | `0.12.0` | — |
+| [paseo-zcode/](paseo-zcode/) | `zcode` | ZCode（GLM） | `>=0.11.4` | `0.11.4` | — |
+<!-- plugin-requirements:end -->
+
+各插件自身的其他依赖与限制见上表及对应 `OVERVIEW.md`。
 
 ## 安装
 
@@ -25,7 +36,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 
 ## 开发
 
-开发与 CI 使用根目录 `.node-version` 固定的 Node 版本。GitHub Actions 在 push、PR 和手动触发时分别检查五个插件：`npm ci` → `npm run typecheck` → `npm test`。
+开发与 CI 使用根目录 `.node-version` 固定的 Node 版本。GitHub Actions 在 push、PR 和手动触发时，先校验元数据，再自动发现所有插件并分别检查：`npm ci` → `npm run typecheck` → `npm test`。
 
 每个插件是独立的 npm 包，在各自目录内安装依赖并开发：
 
@@ -38,6 +49,10 @@ npm run typecheck # TypeScript 检查
 
 类型检查包含 `.ts`、`.tsx` 和 `.mts`，也覆盖 dsh 的手动诊断脚本；ZCode 现有 `.cjs` 测试继续通过 `npm test` 执行，尚未纳入静态类型检查。CI 使用 mock、临时文件和本机回环服务，不执行需要真实账号的诊断脚本，也不代表完成了真实 Paseo 客户端验收。
 
+在根目录运行 `node scripts/check-metadata.mjs` 可检查插件 ID、显示名称、版本与锁文件声明、打包入口以及 OVERVIEW 环境要求；修改元数据后运行 `node scripts/check-metadata.mjs --write` 更新上面的环境表。校验器的回归测试通过 `node --test scripts/*.test.mjs` 执行。
+
+行为改动的提交或 PR 说明应记录自动检查结果、真实客户端操作和结果，并明确列出尚未验证项；需要截图时可放入已忽略的 `artifacts/acceptance/日期-主题/` 目录。要让 CI 阻止不合格的远端合并，还需在 GitHub 分支规则中将对应检查设为必需。
+
 修改插件后，在 Paseo 中执行 `paseo plugin reload <插件ID>` 重新加载：
 
 - `dsh` / `git-manager` / `lark-notify`：直接 reload 即可；
@@ -49,7 +64,7 @@ npm run typecheck # TypeScript 检查
 ## 仓库结构
 
 ```
-paseo-plugin/
+paseo-plugins/
 ├── paseo-claude-models/ # 自定义模型注入插件（claude-models）
 ├── paseo-dsh/    # dsh (DeepSeek) provider 插件
 ├── paseo-git/    # Git 管理面板插件（git-manager）

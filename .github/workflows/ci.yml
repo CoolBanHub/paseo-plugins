@@ -13,19 +13,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  metadata:
+    name: 元数据检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      plugins: ${{ steps.inventory.outputs.plugins }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: 校验器回归测试
+        run: node --test scripts/*.test.mjs
+      - name: 校验元数据并生成插件矩阵
+        id: inventory
+        run: node scripts/check-metadata.mjs --matrix >> "$GITHUB_OUTPUT"
+
   plugins:
     name: 检查 ${{ matrix.plugin }}
+    needs: metadata
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        plugin:
-          - paseo-claude-models
-          - paseo-dsh
-          - paseo-git
-          - paseo-lark-notify
-          - paseo-zcode
+        plugin: ${{ fromJSON(needs.metadata.outputs.plugins) }}
     defaults:
       run:
         working-directory: ${{ matrix.plugin }}
