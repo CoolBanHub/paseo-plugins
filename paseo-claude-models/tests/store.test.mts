@@ -49,7 +49,7 @@ test("save persists config and key, views never expose the key", async () => {
   assert.ok(view);
   assert.equal(view.keyConfigured, true);
   assert.equal(view.keyHint, "••••1234");
-  assert.equal(view.models.length, 3);
+  assert.equal(view.models.length, glmPreset.models.length);
   // The key file itself is 0600 and inside the registry directory.
   assert.equal(readFileSync(join(registry.root, "keys", "glm.secret"), "utf8"), "sk-test-key-1234\n");
   assert.equal(registry.apiKey("glm"), "sk-test-key-1234");
@@ -122,4 +122,34 @@ test("remove deletes config and key", async () => {
   assert.equal(await registry.remove("deepseek"), false);
   assert.deepEqual(registry.list(), []);
   assert.equal(registry.apiKey("deepseek"), null);
+});
+
+test("env and alias overrides persist and are validated", async () => {
+  const registry = registryIn();
+  const base = {
+    label: "GLM", baseUrl: "https://open.bigmodel.cn/api/anthropic", protocol: "anthropic" as const,
+    authHeader: "bearer" as const, enabled: true,
+    models: [{ id: "glm-5.3[1m]", label: "GLM-5.3 1M" }, { id: "glm-5.3", label: "GLM-5.3" }],
+    apiKey: "sk-glm-key-000001",
+  };
+  const saved = await registry.save({
+    ...base,
+    env: { Z_AI_API_KEY: "${API_KEY}", Z_AI_BASE_URL: "https://open.bigmodel.cn/api/coding/paas/v4/" },
+    aliasOverrides: { opus: "glm-5.3[1m]", haiku: "glm-5.3" },
+  });
+  assert.deepEqual(saved.env, { Z_AI_API_KEY: "${API_KEY}", Z_AI_BASE_URL: "https://open.bigmodel.cn/api/coding/paas/v4/" });
+  assert.deepEqual(saved.aliasOverrides, { opus: "glm-5.3[1m]", haiku: "glm-5.3" });
+  const [view] = registry.views();
+  assert.equal(view!.env.Z_AI_API_KEY, "${API_KEY}");
+  assert.equal(view!.aliasOverrides.opus, "glm-5.3[1m]");
+
+  // The bridge-owned endpoint vars are refused; a bad alias is refused too.
+  await assert.rejects(
+    () => registry.save({ ...base, env: { ANTHROPIC_BASE_URL: "https://elsewhere.example.com" } }),
+    /接管/,
+  );
+  await assert.rejects(
+    () => registry.save({ ...base, aliasOverrides: { sonnet: "glm-9.9" } }),
+    /不在列表里/,
+  );
 });

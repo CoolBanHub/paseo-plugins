@@ -3,7 +3,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { deleteProviderRpc, listProvidersRpc, saveProviderRpc } from "./shared/contracts.ts";
 import type { ProviderInput, ProviderView } from "./shared/contracts.ts";
 import { createBridge } from "./server/bridge.ts";
-import { claudeSessionEnv, MODEL_SELECTED_ENV, sessionModels, takeSelectedMarker } from "./server/session.ts";
+import { claudeSessionEnv, MODEL_SELECTED_ENV, resolveProviderEnv, sessionModels, takeSelectedMarker } from "./server/session.ts";
 import { syncClaudeModels, type ProviderApi } from "./server/sync.ts";
 import { createModelRegistry } from "./server/store.ts";
 
@@ -101,11 +101,14 @@ export default function contribute(server: PluginServerContext) {
     if (!provider) throw new Error("自定义模型不可用：Provider 未启用或 Key 缺失");
     try {
       const route = await bridge.openRoute(request.agentId, model);
+      const apiKey = registry.apiKey(provider.id) ?? "";
       return { ...plain, env: claudeSessionEnv({
         address: route.address,
         capability: route.capability,
         models: sessionModels(provider.models),
         preferred: model,
+        providerEnv: resolveProviderEnv(provider.env, apiKey),
+        aliases: provider.aliasOverrides,
       }, plain.env) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

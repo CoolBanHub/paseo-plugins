@@ -128,6 +128,20 @@ test("anthropic protocol passes through with the key and stripped model id", asy
   }
 });
 
+test("the [1m] window switch never reaches the vendor", async () => {
+  const world = await fixture([{ label: "GLM", protocol: "anthropic", models: ["glm-5.3[1m]", "glm-5.3-flash"] }]);
+  try {
+    const { address, capability } = await world.bridgeUrl("cm:glm-5.3[1m]");
+    const response = await post(`${address}/v1/messages`, {
+      model: "cm:glm-5.3[1m]", stream: false, max_tokens: 16, messages: [],
+    }, { authorization: `Bearer ${capability}` });
+    assert.equal(response.status, 200);
+    assert.equal(world.upstream.captured[0]!.body.model, "glm-5.3");
+  } finally {
+    await world.cleanup();
+  }
+});
+
 test("a wrong capability is rejected", async () => {
   const world = await fixture([{ label: "GLM", protocol: "anthropic", models: ["glm-4.6"] }]);
   try {

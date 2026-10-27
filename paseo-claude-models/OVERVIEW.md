@@ -8,7 +8,9 @@
 - **模型注入**：通过 `paseo.config.patch` 写入 Claude provider 的 `additionalModels`。菜单 ID 带 `cm:` 前缀（如 `cm:glm-4.6`），description 带「自定义模型 · 」标记用于幂等同步；用户自己在设置里加的条目永远保留。
 - **请求路由**：`agent.create` 标记选中的模型，`agent.session_open` 钩子把会话 env 的 `ANTHROPIC_BASE_URL` 指向插件内置的 127.0.0.1 代理桥，并注入每会话随机的 capability 作为 `ANTHROPIC_AUTH_TOKEN`（桥只存其 SHA-256）。桥按每个请求 body 里的 `model` 字段找到所属 Provider，带用户自己的 Key 直连厂商。
 - **协议**：Anthropic 兼容端点（DeepSeek/GLM/Kimi/百炼等）原样直通；OpenAI Chat 兼容端点经 Anthropic↔Chat 协议转换（转换器与 SSE 工具移植自 cc-switch / paseo-team-work 的同源实现，MIT 许可）。
-- **会话环境**：同时设置 `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`、`CLAUDE_CODE_SUBAGENT_MODEL`（强/快模型按 `-pro/-max` 与 `-air/-flash/-mini` 等后缀识别）、按真实上下文窗口设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，并清空继承的 `ANTHROPIC_*` / `AWS_*` / `DEEPSEEK_*` 等凭据，避免串线。
+- **会话环境**：同时设置 `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`、`CLAUDE_CODE_SUBAGENT_MODEL`（强/快模型按 `-pro/-max` 与 `-air/-flash/-mini` 等后缀识别，可在设置里显式指定）、按真实上下文窗口设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，并清空继承的 `ANTHROPIC_*` / `AWS_*` / `DEEPSEEK_*` / `Z_AI_*` 等凭据，避免串线。
+- **1M 长上下文**：模型 ID 末尾加 `[1m]`（如 `glm-5.3[1m]`）即 Claude Code 的 1M 窗口开关——菜单里是独立条目，转发时桥自动剥掉该标识，厂商看到的仍是原始 ID；配合该条目的上下文窗口（如 1000000）设置自动压缩阈值。
+- **会话环境变量**：每个 Provider 可配置注入会话的额外变量（如智谱的 `Z_AI_API_KEY` / `Z_AI_BASE_URL`，供官方 Claude Code 插件使用），值中 `${API_KEY}` 占位符在会话打开时替换为已保存的 Key——Key 明文永远不进 providers.json。`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 由插件接管，不可配置。
 - **reload 连续性**：桥的端口与路由哈希持久化在 `bridge-state.json`；插件重载后重新绑定同一端口并恢复路由，已开的自定义模型会话继续工作（仅在途请求会失败一次）。
 
 ## 前置条件
@@ -24,7 +26,8 @@
 
 ## 行为细节
 
-- 预设端点：DeepSeek `https://api.deepseek.com/anthropic`、GLM `https://open.bigmodel.cn/api/anthropic`、Kimi `https://api.moonshot.ai/anthropic`、通义千问 DashScope Claude Code 代理；预设只是表单初始值，端点 / 鉴权 / 模型列表全部可改（厂商改模型 ID 很频繁，模型列表以用户填写为准）。
+- **别名映射的默认策略**：Opus / Sonnet / FABLE 跟随会话所选模型（未命中时取厂商旗舰，按 `-pro/-max/ultra` 或首个识别），Haiku 与子代理模型取快速模型（按 `-flash/-fast/-mini/-lite/-air` 等后缀，同系优先非 `[1m]` 变体——后台任务用不上 1M 窗口）；每个 Provider 可在设置页显式指定三者。
+- 预设端点：DeepSeek `https://api.deepseek.com/anthropic`、GLM `https://open.bigmodel.cn/api/anthropic`（预置 `Z_AI_API_KEY` / `Z_AI_BASE_URL` 会话变量与 `[1m]` 模型变体）、Kimi `https://api.moonshot.ai/anthropic`、通义千问 DashScope Claude Code 代理；预设只是表单初始值，端点 / 鉴权 / 模型列表 / 环境变量全部可改（厂商改模型 ID 很频繁，模型列表以用户填写为准）。
 - 同一模型 ID 被多个 Provider 列出时，先配置的 Provider 提供该菜单项并承接路由。
 - `count_tokens`：Anthropic 协议透传，厂商返回 404/405 或 Chat 协议时按本地估算回答。
 - 上游错误按 Anthropic 错误形状回给 Claude Code，状态码保留；上下文超限映射为 `invalid_request_error` + "prompt is too long" 以触发自动压缩。

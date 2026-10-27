@@ -28,7 +28,7 @@ function fakePaseo(initial: ConfigState) {
 }
 
 const model = (id: string, label: string, provider: string): MenuModel => ({
-  id, label, description: ownModelDescription(provider), provider: { id: provider, label: provider, baseUrl: "https://x", protocol: "anthropic", authHeader: "bearer", enabled: true, models: [], updatedAt: "" },
+  id, label, description: ownModelDescription(provider), provider: { id: provider, label: provider, baseUrl: "https://x", protocol: "anthropic", authHeader: "bearer", enabled: true, models: [], env: {}, aliasOverrides: {}, updatedAt: "" },
 });
 
 test("places our models next to the person's own entries", async () => {

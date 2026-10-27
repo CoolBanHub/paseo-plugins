@@ -23,6 +23,8 @@ export type ProviderPreset = {
   protocol: ProviderProtocol;
   authHeader: AuthHeader;
   models: PresetModel[];
+  /** Session env entries every session on this provider receives. */
+  env?: Record<string, string>;
   /** Where an API key comes from. */
   keyHint: string;
 };
@@ -49,11 +51,20 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     protocol: "anthropic",
     authHeader: "bearer",
     models: [
+      // "[1m]" is Claude Code's 1M-window switch; the vendor id keeps it off.
+      { id: "glm-5.3[1m]", label: "GLM-5.3 1M", description: "旗舰 · 超长上下文", contextWindow: 1_000_000 },
       { id: "glm-5.3", label: "GLM-5.3", description: "旗舰编程模型" },
-      { id: "glm-4.6", label: "GLM-4.6", description: "上一代旗舰", contextWindow: 204800 },
-      { id: "glm-4.5-air", label: "GLM-4.5-Air", description: "轻量高速", contextWindow: 204800 },
+      { id: "glm-5.3-flash[1m]", label: "GLM-5.3 Flash 1M", description: "高速 · 超长上下文", contextWindow: 1_000_000 },
+      { id: "glm-5.3-flash", label: "GLM-5.3 Flash", description: "速度优先" },
+      { id: "glm-4.6", label: "GLM-4.6", description: "上一代旗舰", contextWindow: 204_800 },
+      { id: "glm-4.5-air", label: "GLM-4.5-Air", description: "轻量高速", contextWindow: 204_800 },
     ],
-    keyHint: "open.bigmodel.cn 创建 API Key",
+    // Z.ai's own Claude Code plugins (usage query, bug report) read these.
+    env: {
+      Z_AI_API_KEY: "${API_KEY}",
+      Z_AI_BASE_URL: "https://open.bigmodel.cn/api/coding/paas/v4/",
+    },
+    keyHint: "open.bigmodel.cn 创建 API Key（Coding Plan 用同一 Key）",
   },
   {
     id: "kimi",

@@ -2,13 +2,14 @@ import { readFileSync } from "node:fs";
 import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ProviderInput, ProviderView } from "../shared/contracts.ts";
+import { RESERVED_ENV_KEYS, envKeyPattern, type ProviderInput, type ProviderView } from "../shared/contracts.ts";
 import { menuModelId, ownModelDescription } from "../shared/model-id.ts";
 
 /**
  * Provider configuration and API keys, kept under the plugin's data
  * directory. Keys live in their own 0600 files and never enter Paseo config
- * or the renderer; providers.json is 0600 inside a 0700 directory.
+ * or the renderer; providers.json is 0600 inside a 0700 directory. Env
+ * values never hold the key itself — they use the "${API_KEY}" placeholder.
  */
 
 export type StoredModel = {
@@ -18,6 +19,8 @@ export type StoredModel = {
   contextWindow?: number;
 };
 
+export type StoredAliases = { opus?: string; sonnet?: string; haiku?: string };
+
 export type StoredProvider = {
   id: string;
   label: string;
@@ -26,6 +29,8 @@ export type StoredProvider = {
   authHeader: "bearer" | "x-api-key";
   enabled: boolean;
   models: StoredModel[];
+  env: Record<string, string>;
+  aliasOverrides: StoredAliases;
   updatedAt: string;
 };
 
@@ -76,6 +81,32 @@ export function dataDirectory(explicit?: string): string {
 
 type PersistedFile = { version: 1; providers: StoredProvider[] };
 
+function parseEnv(value: unknown): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return env;
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!envKeyPattern.test(key) || typeof entry !== "string" || entry.length > 2_000) continue;
+    if (RESERVED_ENV_KEYS.includes(key)) continue;
+    env[key] = entry;
+  }
+  return env;
+}
+
+function parseAliases(value: unknown): StoredAliases {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const pick = (key: "opus" | "sonnet" | "haiku"): string | undefined =>
+    typeof record[key] === "string" && (record[key] as string).length <= 128 ? record[key] as string : undefined;
+  const aliases: StoredAliases = {};
+  const opus = pick("opus");
+  const sonnet = pick("sonnet");
+  const haiku = pick("haiku");
+  if (opus) aliases.opus = opus;
+  if (sonnet) aliases.sonnet = sonnet;
+  if (haiku) aliases.haiku = haiku;
+  return aliases;
+}
+
 function parseProvidersFile(value: unknown): StoredProvider[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
   const providers = (value as Record<string, unknown>).providers;
@@ -100,7 +131,10 @@ function parseProvidersFile(value: unknown): StoredProvider[] {
       });
     }
     if (!models.length) continue;
-    parsed.push({ id: record.id, label: record.label, baseUrl: record.baseUrl, protocol: record.protocol, authHeader: record.authHeader, enabled: record.enabled, models, updatedAt: record.updatedAt });
+    parsed.push({
+      id: record.id, label: record.label, baseUrl: record.baseUrl, protocol: record.protocol, authHeader: record.authHeader,
+      enabled: record.enabled, models, env: parseEnv(record.env), aliasOverrides: parseAliases(record.aliasOverrides), updatedAt: record.updatedAt,
+    });
   }
   return parsed;
 }
@@ -188,10 +222,22 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
       const baseUrl = normalizeBaseUrl(input.baseUrl);
       const models = input.models.map((model) => ({
         id: model.id,
-        label: model.label.trim() || model.id,
+        label: (model.label ?? "").trim() || model.id,
         ...(model.description ? { description: model.description } : {}),
         ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
       }));
+      const modelIds = new Set(models.map((model) => model.id));
+      for (const [key, value] of Object.entries(input.env ?? {})) {
+        if (RESERVED_ENV_KEYS.includes(key)) throw new Error(`环境变量 ${key} 由插件接管，不能在 Provider 里配置`);
+        if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error(`环境变量 ${key} 的值含非法字符`);
+      }
+      const aliasOverrides: StoredAliases = {};
+      for (const alias of ["opus", "sonnet", "haiku"] as const) {
+        const chosen = input.aliasOverrides?.[alias];
+        if (!chosen) continue;
+        if (!modelIds.has(chosen)) throw new Error(`别名 ${alias} 指向的模型不在列表里：${chosen}`);
+        aliasOverrides[alias] = chosen;
+      }
       return enqueue(async () => {
         const providers = readProviders();
         const id = uniqueId(providers, input.id, input.label);
@@ -203,7 +249,7 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
         }
         const stored: StoredProvider = {
           id, label: input.label, baseUrl, protocol: input.protocol, authHeader: input.authHeader,
-          enabled: input.enabled, models, updatedAt: now(),
+          enabled: input.enabled ?? true, models, env: input.env ?? {}, aliasOverrides, updatedAt: now(),
         };
         const index = providers.findIndex((provider) => provider.id === id);
         if (index >= 0) providers[index] = stored;
@@ -271,6 +317,8 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
         authHeader: provider.authHeader,
         enabled: provider.enabled,
         models: provider.models,
+        env: provider.env,
+        aliasOverrides: provider.aliasOverrides,
         keyConfigured: key !== null,
         keyHint: key ? `••••${key.slice(-4)}` : null,
         updatedAt: provider.updatedAt,

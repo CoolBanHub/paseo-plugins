@@ -132,6 +132,8 @@ function ProviderCard({
 }
 
 type ModelDraft = { id: string; label: string; contextWindow: string };
+type EnvDraft = { key: string; value: string };
+type AliasDraft = { opus: string; sonnet: string; haiku: string };
 
 type FormState = {
   presetId: string;
@@ -141,6 +143,8 @@ type FormState = {
   authHeader: AuthHeader;
   apiKey: string;
   models: ModelDraft[];
+  env: EnvDraft[];
+  aliases: AliasDraft;
 };
 
 const presetForm = (presetId: string): FormState => {
@@ -158,6 +162,8 @@ const presetForm = (presetId: string): FormState => {
       label: model.label,
       contextWindow: model.contextWindow ? String(model.contextWindow) : "",
     })),
+    env: Object.entries(preset.env ?? {}).map(([key, value]) => ({ key, value })),
+    aliases: { opus: "", sonnet: "", haiku: "" },
   };
 };
 
@@ -173,6 +179,12 @@ const formFromView = (provider: ProviderView): FormState => ({
     label: model.label,
     contextWindow: model.contextWindow ? String(model.contextWindow) : "",
   })),
+  env: Object.entries(provider.env ?? {}).map(([key, value]) => ({ key, value })),
+  aliases: {
+    opus: provider.aliasOverrides?.opus ?? "",
+    sonnet: provider.aliasOverrides?.sonnet ?? "",
+    haiku: provider.aliasOverrides?.haiku ?? "",
+  },
 });
 
 export function ProviderSettingsScreen({ theme }: PluginSurfaceProps) {
@@ -211,6 +223,8 @@ export function ProviderSettingsScreen({ theme }: PluginSurfaceProps) {
         authHeader: provider.authHeader,
         enabled,
         models: provider.models,
+        env: provider.env,
+        aliasOverrides: provider.aliasOverrides,
       });
       if (result.ok) {
         setProviders(result.providers);
@@ -330,6 +344,27 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
       toast.error("至少配置一个模型");
       return;
     }
+    const env: Record<string, string> = {};
+    for (const entry of form.env) {
+      const key = entry.key.trim();
+      if (!key) continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
+        toast.error(`环境变量名不合法：${key}`);
+        return;
+      }
+      env[key] = entry.value;
+    }
+    const aliasModelIds = new Set(models.map((model) => model.id));
+    const aliasOverrides: Record<string, string> = {};
+    for (const [alias, chosen] of Object.entries(form.aliases)) {
+      const target = chosen.trim();
+      if (!target) continue;
+      if (!aliasModelIds.has(target)) {
+        toast.error(`别名 ${alias} 指向的模型不在列表里：${target}`);
+        return;
+      }
+      aliasOverrides[alias] = target;
+    }
     setSaving(true);
     try {
       const result = await saveRpc({
@@ -340,6 +375,8 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
         authHeader: form.authHeader,
         enabled: true,
         models,
+        env,
+        aliasOverrides,
         ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
       });
       if (result.ok) {
@@ -430,13 +467,16 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
         />
       </SettingsSection>
 
-      <SettingsSection title="模型列表" info="模型 ID 必须与厂商一致；显示名只用于选择器">
+      <SettingsSection
+        title="模型列表"
+        info="模型 ID 必须与厂商一致；要 1M 长上下文在 ID 末尾加 [1m]（如 glm-5.3[1m]）并填写对应窗口，转发时会自动剥掉该标识"
+      >
         {form.models.map((model, index) => (
           <SettingsSection key={`model-${formVersion}-${index}`} title={`模型 ${index + 1}`}>
             <SettingsInput
               key={key(`m${index}-id`)}
               label="模型 ID"
-              placeholder="glm-4.6"
+              placeholder="glm-5.3 或 glm-5.3[1m]"
               initialValue={model.id}
               onChangeText={(text) => setModel(index, { id: text })}
             />
@@ -469,6 +509,65 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
           label="添加模型"
           actionLabel="添加"
           onPress={() => setForm((current) => ({ ...current, models: [...current.models, { id: "", label: "", contextWindow: "" }] }))}
+        />
+      </SettingsSection>
+
+      <SettingsSection
+        title="别名映射（可选）"
+        info="Claude Code 内部的 Opus / Sonnet / Haiku 别名用哪个模型；留「自动」时：Opus / Sonnet 跟随会话所选模型（缺省取旗舰），Haiku 与子代理取快速模型"
+      >
+        {(["opus", "sonnet", "haiku"] as const).map((alias) => (
+          <SettingsSelect
+            key={alias}
+            label={alias === "opus" ? "Opus（深度任务）" : alias === "sonnet" ? "Sonnet（主力）" : "Haiku（后台 / 子代理）"}
+            value={form.aliases[alias]}
+            options={[
+              { label: "自动", value: "" },
+              ...form.models.filter((model) => model.id.trim()).map((model) => ({ label: model.id.trim(), value: model.id.trim() })),
+            ]}
+            onValueChange={(value) => setForm((current) => ({ ...current, aliases: { ...current.aliases, [alias]: value } }))}
+          />
+        ))}
+      </SettingsSection>
+
+      <SettingsSection
+        title="会话环境变量（可选）"
+        info="注入到该 Provider 会话的额外变量；值里可用 ${API_KEY} 引用已保存的 Key（推荐），如 Z_AI_API_KEY"
+      >
+        {form.env.map((entry, index) => (
+          <SettingsSection key={`env-${formVersion}-${index}`} title={`变量 ${index + 1}`}>
+            <SettingsInput
+              key={key(`e${index}-key`)}
+              label="变量名"
+              placeholder="Z_AI_API_KEY"
+              initialValue={entry.key}
+              onChangeText={(text) => setForm((current) => ({
+                ...current,
+                env: current.env.map((item, position) => (position === index ? { ...item, key: text } : item)),
+              }))}
+            />
+            <SettingsInput
+              key={key(`e${index}-value`)}
+              label="值"
+              placeholder="${API_KEY}"
+              initialValue={entry.value}
+              onChangeText={(text) => setForm((current) => ({
+                ...current,
+                env: current.env.map((item, position) => (position === index ? { ...item, value: text } : item)),
+              }))}
+              hint="ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 由插件接管，不可配置"
+            />
+            <SettingsAction
+              label="移除这个变量"
+              actionLabel="移除"
+              onPress={() => setForm((current) => ({ ...current, env: current.env.filter((_, position) => position !== index) }))}
+            />
+          </SettingsSection>
+        ))}
+        <SettingsAction
+          label="添加环境变量"
+          actionLabel="添加"
+          onPress={() => setForm((current) => ({ ...current, env: [...current.env, { key: "", value: "" }] }))}
         />
       </SettingsSection>
 
