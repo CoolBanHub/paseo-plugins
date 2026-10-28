@@ -26,6 +26,7 @@
 
 ## 行为细节
 
+- **模型自动发现**：Provider 表单「从端点获取模型列表」用表单里（或已保存）的 Key 请求 `GET <baseUrl>/v1/models`（OpenAI / Anthropic 兼容端点同构），勾选后批量加入；显示名与上下文窗口自动套用预设知识（含 `[1m]` 变体建议），网关自带的 `context_length` / `context_window` 等字段也会采纳；端点不提供列表（404）时手动添加。
 - **别名映射的默认策略**：Opus / Sonnet / FABLE 跟随会话所选模型（未命中时取厂商旗舰，按 `-pro/-max/ultra` 或首个识别），Haiku 与子代理模型取快速模型（按 `-flash/-fast/-mini/-lite/-air` 等后缀，同系优先非 `[1m]` 变体——后台任务用不上 1M 窗口）；每个 Provider 可在设置页显式指定三者。
 - 预设端点：DeepSeek `https://api.deepseek.com/anthropic`、GLM `https://open.bigmodel.cn/api/anthropic`（预置 `Z_AI_API_KEY` / `Z_AI_BASE_URL` 会话变量与 `[1m]` 模型变体）、Kimi `https://api.moonshot.ai/anthropic`、通义千问 DashScope Claude Code 代理；预设只是表单初始值，端点 / 鉴权 / 模型列表 / 环境变量全部可改（厂商改模型 ID 很频繁，模型列表以用户填写为准）。
 - 同一模型 ID 被多个 Provider 列出时，先配置的 Provider 提供该菜单项并承接路由。
