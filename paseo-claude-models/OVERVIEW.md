@@ -35,7 +35,7 @@
 - 上游错误按 Anthropic 错误形状回给 Claude Code，状态码保留；上下文超限映射为 `invalid_request_error` + "prompt is too long" 以触发自动压缩。
 - 桥只接受 `Host: 127.0.0.1:<port>`、无 `Origin`、Bearer capability 匹配的请求；`anthropic-beta` 头按白名单（prompt-caching / interleaved-thinking）过滤后转发。
 - 禁用或删除 Provider 后菜单条目立即移除；仍开着的相关会话，下一条请求会收到明确错误。
-- 插件被禁用 / 卸载时，自动从 Claude 的模型选择器移除自己的条目。
+- **菜单条目跨重启常驻**：条目存在守护进程配置里，插件重载 / Paseo 重启不再清空（此前每次插件停止都清一次，重启后若未打开设置页就一直空着）。打开设置页或任意 Claude 会话活动会触发一次补同步自愈。插件被长期禁用时条目会残留但无副作用——没有插件的会话钩子，选中它会在开新会话时明确报错；彻底卸载插件请先在设置里删除各 Provider。
 
 ## 开发与验证
 

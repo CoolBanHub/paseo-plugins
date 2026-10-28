@@ -29,8 +29,9 @@ export default function contribute(server: PluginServerContext) {
   const registry = createModelRegistry();
   const bridge = createBridge({ registry });
   let lastPaseo: ProviderApi | undefined;
-  // Menu entries persist in daemon config; one sync per plugin instance
-  // catches edits made outside it (plus every save re-syncs).
+  // Menu entries live in daemon config and stay there across plugin reloads
+  // and daemon restarts; one sync per plugin instance heals any drift (plus
+  // every save re-syncs).
   let initialSyncDone = false;
 
   const syncMenu = async (): Promise<void> => {
@@ -38,7 +39,8 @@ export default function contribute(server: PluginServerContext) {
     await syncClaudeModels(lastPaseo, registry.menuModels())
       .catch((error) => console.warn("[claude-models] 模型菜单同步失败", error));
   };
-  const ensureSynced = async (): Promise<void> => {
+  const ensureSynced = async (paseo: ProviderApi): Promise<void> => {
+    lastPaseo = paseo;
     if (initialSyncDone) return;
     initialSyncDone = true;
     await syncMenu();
@@ -47,13 +49,12 @@ export default function contribute(server: PluginServerContext) {
   const views = (providers: ProviderView[]) => ({ ok: true, error: null, providers });
 
   server.handle(listProvidersRpc, async (_input, context) => {
-    lastPaseo = context.paseo;
-    await ensureSynced();
+    await ensureSynced(context.paseo);
     return views(registry.views());
   });
 
   server.handle(saveProviderRpc, async (input: ProviderInput, context) => {
-    lastPaseo = context.paseo;
+    await ensureSynced(context.paseo);
     try {
       await registry.save(input);
       await syncMenu();
@@ -64,7 +65,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.handle(deleteProviderRpc, async (input, context) => {
-    lastPaseo = context.paseo;
+    await ensureSynced(context.paseo);
     try {
       await registry.remove(input.id);
       await syncMenu();
@@ -128,8 +129,8 @@ export default function contribute(server: PluginServerContext) {
 
   const removeSessionOpen = server.before("agent.session_open", async ({ request }, context) => {
     if (request.provider !== "claude") return;
-    lastPaseo = context.paseo;
-    void ensureSynced();
+    // Any Claude session activity is a chance to heal the menu.
+    void ensureSynced(context.paseo);
     const { env, selected } = takeSelectedMarker(request.env);
     const plain = { ...request, env };
     // History replays need no bridge and no key.
@@ -162,15 +163,21 @@ export default function contribute(server: PluginServerContext) {
 
   const removeClosed = server.on("agent.closed", (event) => bridge.release(event.agent.id));
   const removeArchived = server.on("agent.archived", (event) => bridge.release(event.agent.id));
+  // Any agent activity is a chance to heal the menu after a restart.
+  const removeTurnStarted = server.on("agent.turn_started", (event, context) => {
+    if (event.agent.provider === "claude") void ensureSynced(context.paseo);
+  });
 
   return async () => {
     removeCreate();
     removeSessionOpen();
     removeClosed();
     removeArchived();
-    // Leave the picker clean when the plugin goes away; the bridge's saved
-    // routes stay on disk so a reload puts live sessions back.
-    if (lastPaseo) await syncClaudeModels(lastPaseo, []).catch(() => undefined);
+    removeTurnStarted();
+    // The menu entries stay in daemon config: wiping them on every plugin
+    // stop (reload, daemon restart) left the picker empty until something
+    // re-synced. Removing a provider re-syncs immediately; a disabled plugin
+    // leaves inert entries behind (a session on one fails loudly).
     await bridge.close();
   };
 }
