@@ -1,9 +1,10 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
-import { deleteProviderRpc, fetchModelsRpc, listProvidersRpc, saveProviderRpc } from "./shared/contracts.ts";
+import { deleteProviderRpc, fetchModelsRpc, listProvidersRpc, saveProviderRpc, testModelRpc } from "./shared/contracts.ts";
 import type { ProviderInput, ProviderView } from "./shared/contracts.ts";
 import { createBridge } from "./server/bridge.ts";
 import { fetchVendorModels } from "./server/fetch-models.ts";
+import { testVendorModel } from "./server/test-model.ts";
 import { claudeSessionEnv, MODEL_SELECTED_ENV, resolveProviderEnv, sessionModels, takeSelectedMarker } from "./server/session.ts";
 import { syncClaudeModels, type ProviderApi } from "./server/sync.ts";
 import { createModelRegistry, normalizeApiKey } from "./server/store.ts";
@@ -89,6 +90,28 @@ export default function contribute(server: PluginServerContext) {
       return result.ok ? { ok: true, error: null, models: result.models } : { ok: false, error: result.error, models: [] };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error), models: [] };
+    }
+  });
+
+  // One minimal live request against a model, to verify the whole path.
+  server.handle(testModelRpc, async (input) => {
+    try {
+      const key = input.apiKey?.trim()
+        ? normalizeApiKey(input.apiKey)
+        : input.providerId ? registry.apiKey(input.providerId) : null;
+      if (!key) return { ok: false, error: "请先填写 API Key" };
+      const result = await testVendorModel({
+        baseUrl: input.baseUrl,
+        protocol: input.protocol,
+        authHeader: input.authHeader,
+        key,
+        model: input.model,
+      });
+      return result.ok
+        ? { ok: true, error: null, latencyMs: result.latencyMs, reply: result.reply }
+        : { ok: false, error: result.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
 

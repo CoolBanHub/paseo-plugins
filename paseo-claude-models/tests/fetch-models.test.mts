@@ -9,14 +9,14 @@ const jsonResponse = (status: number, body: unknown) => new Response(JSON.string
 
 test("fetched ids gain the presets' knowledge and 1M variants", () => {
   const models = expandFetchedModels([
-    "glm-4.6", "glm-5.3", "deepseek-chat", "some-unknown-model", "", "../etc/passwd", 42, "glm-4.6",
+    "glm-4.6", "glm-5.3", "deepseek-v4-pro", "some-unknown-model", "", "../etc/passwd", 42, "glm-4.6",
   ]);
   assert.deepEqual(models, [
     // Preset match fills label and window; GLM's preset knows a 1M variant.
     { id: "glm-4.6", label: "GLM-4.6", contextWindow: 204800 },
     { id: "glm-5.3", label: "GLM-5.3" },
     { id: "glm-5.3[1m]", label: "GLM-5.3 1M", contextWindow: 1000000 },
-    { id: "deepseek-chat", label: "DeepSeek Chat", contextWindow: 131072 },
+    { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", contextWindow: 1000000 },
     { id: "some-unknown-model" },
   ]);
 });

@@ -115,3 +115,22 @@ export const fetchModelsRpc = defineRpc({
     models: z.array(fetchedModelSchema),
   }),
 });
+
+/** One minimal live request against a model, to verify the whole path. */
+export const testModelRpc = defineRpc({
+  name: "claude-models.models.test",
+  input: z.object({
+    providerId: z.string().max(64).optional(),
+    baseUrl: z.string().trim().min(1, "请填写 API 地址"),
+    protocol: protocolSchema,
+    authHeader: authHeaderSchema,
+    apiKey: z.string().max(512).optional(),
+    model: z.string().trim().min(1, "请先填写模型 ID"),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+    latencyMs: z.number().int().nonnegative().optional(),
+    reply: z.string().optional(),
+  }),
+});

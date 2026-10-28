@@ -38,8 +38,8 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     protocol: "anthropic",
     authHeader: "bearer",
     models: [
-      { id: "deepseek-chat", label: "DeepSeek Chat", description: "V 系列通用模型", contextWindow: 131072 },
-      { id: "deepseek-reasoner", label: "DeepSeek Reasoner", description: "R 系列推理模型", contextWindow: 131072 },
+      { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", description: "V4 Pro 旗舰（支持思考）", contextWindow: 1_000_000 },
+      { id: "deepseek-flash", label: "DeepSeek Flash", description: "V4.1 Flash 高速版", contextWindow: 1_000_000 },
     ],
     keyHint: "platform.deepseek.com 创建 API Key",
   },

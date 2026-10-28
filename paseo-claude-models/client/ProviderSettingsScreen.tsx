@@ -13,6 +13,7 @@ import {
   fetchModelsRpc,
   listProvidersRpc,
   saveProviderRpc,
+  testModelRpc,
   type FetchedModel,
   type ProviderView,
 } from "../shared/contracts";
@@ -508,6 +509,13 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
         key={editingModel === "new" ? "new" : `edit-${formVersion}-${editingModel}`}
         initial={editingModel === "new" ? null : form.models[editingModel] ?? null}
         theme={theme}
+        connection={{
+          baseUrl: form.baseUrl,
+          protocol: form.protocol,
+          authHeader: form.authHeader,
+          apiKey: form.apiKey.trim(),
+          ...(initial ? { providerId: initial.id } : {}),
+        }}
         onSave={(draft) => saveModel(editingModel, draft)}
         onDelete={editingModel === "new" ? undefined : () => deleteModel(editingModel)}
         onCancel={() => setEditingModel(null)}
@@ -777,17 +785,56 @@ function ModelCard({ model, theme, onEdit, onDelete }: { model: ModelDraft; them
 }
 
 /** One model's editor: opened from the provider form's model list. */
-function ModelForm({ initial, theme, onSave, onDelete, onCancel }: {
+function ModelForm({ initial, theme, connection, onSave, onDelete, onCancel }: {
   initial: ModelDraft | null;
   theme: Theme;
+  /** The provider form's live connection fields, for the live test. */
+  connection: { baseUrl: string; protocol: ProviderProtocol; authHeader: AuthHeader; apiKey: string; providerId?: string };
   onSave(draft: ModelDraft): void;
   onDelete?(): void;
   onCancel(): void;
 }) {
   const toast = useToast();
+  const testRpc = useRpc(testModelRpc);
   const [id, setId] = useState(initial?.id ?? "");
   const [label, setLabel] = useState(initial?.label ?? "");
   const [contextWindow, setContextWindow] = useState(initial?.contextWindow ?? "");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  /** One minimal live request: key, endpoint and model id all verified. */
+  const runTest = useCallback(async () => {
+    const trimmedId = id.trim();
+    if (!trimmedId) {
+      toast.error("请先填写模型 ID");
+      return;
+    }
+    if (testing) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await testRpc({
+        ...(connection.providerId ? { providerId: connection.providerId } : {}),
+        baseUrl: connection.baseUrl.trim(),
+        protocol: connection.protocol,
+        authHeader: connection.authHeader,
+        ...(connection.apiKey ? { apiKey: connection.apiKey } : {}),
+        model: trimmedId,
+      });
+      if (result.ok) {
+        setTestResult({
+          ok: true,
+          text: `连通正常 · ${result.latencyMs ?? "?"} ms${result.reply ? ` · 回复「${result.reply}」` : ""}`,
+        });
+      } else {
+        setTestResult({ ok: false, text: result.error ?? "未知错误" });
+      }
+    } catch (err) {
+      setTestResult({ ok: false, text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setTesting(false);
+    }
+  }, [connection, id, testRpc, testing, toast]);
 
   const save = useCallback(() => {
     const trimmedId = id.trim();
@@ -834,6 +881,28 @@ function ModelForm({ initial, theme, onSave, onDelete, onCancel }: {
         onChangeText={setContextWindow}
         hint="留空按 Claude Code 默认的 200k 处理自动压缩"
       />
+      <SettingsAction
+        label="测试连通性"
+        hint="向端点发一条最小请求，验证 Key、地址与模型 ID；测试新模型可先不保存"
+        actionLabel={testing ? "测试中…" : "测试"}
+        onPress={() => { void runTest(); }}
+        disabled={testing}
+      />
+      {testResult ? (
+        <View style={{
+          borderColor: testResult.ok ? theme.colors.statusSuccess : theme.colors.statusDanger,
+          borderWidth: 1,
+          borderRadius: 10,
+          padding: 10,
+        }}>
+          <Text style={{
+            color: testResult.ok ? theme.colors.statusSuccess : theme.colors.statusDanger,
+            fontSize: 12,
+          }}>
+            {testResult.ok ? "✓ " : "✗ "}{testResult.text}
+          </Text>
+        </View>
+      ) : null}
       <SettingsAction
         label={initial ? "保存修改" : "添加这个模型"}
         actionLabel="保存"
