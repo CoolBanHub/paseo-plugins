@@ -10,8 +10,10 @@ import {
 } from "@getpaseo/plugin/client/ui";
 import {
   deleteProviderRpc,
+  fetchModelsRpc,
   listProvidersRpc,
   saveProviderRpc,
+  type FetchedModel,
   type ProviderView,
 } from "../shared/contracts";
 import { modelIdPattern } from "../shared/model-id";
@@ -302,6 +304,7 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
   const toast = useToast();
   const saveRpc = useRpc(saveProviderRpc);
   const deleteRpc = useRpc(deleteProviderRpc);
+  const modelsRpc = useRpc(fetchModelsRpc);
   const [deleting, setDeleting] = useState(false);
 
   const [form, setForm] = useState<FormState>(() => (initial ? formFromView(initial) : presetForm("deepseek")));
@@ -310,6 +313,9 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
   const [saving, setSaving] = useState(false);
   /** null: the provider form; "new" or a model index: that model's editor. */
   const [editingModel, setEditingModel] = useState<number | "new" | null>(null);
+  /** Non-null while picking models from the vendor's /v1/models. */
+  const [picking, setPicking] = useState<{ models: FetchedModel[]; selected: Set<string> } | null>(null);
+  const [fetching, setFetching] = useState(false);
 
   const applyForm = useCallback((next: FormState) => {
     setForm(next);
@@ -317,6 +323,48 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
   }, []);
 
   const key = (field: string) => `${field}-${formVersion}`;
+
+  /** Discovers the vendor's models; the typed key wins over the stored one. */
+  const discover = useCallback(async () => {
+    if (fetching) return;
+    setFetching(true);
+    try {
+      const result = await modelsRpc({
+        ...(initial ? { providerId: initial.id } : {}),
+        baseUrl: form.baseUrl.trim(),
+        authHeader: form.authHeader,
+        ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
+      });
+      if (result.ok) {
+        if (!result.models.length) {
+          toast.error("端点未返回模型");
+          return;
+        }
+        setPicking({ models: result.models, selected: new Set() });
+      } else {
+        toast.error(`获取失败：${result.error ?? "未知错误"}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFetching(false);
+    }
+  }, [fetching, form.apiKey, form.authHeader, form.baseUrl, initial, modelsRpc, toast]);
+
+  const addPicked = useCallback((picked: readonly FetchedModel[]) => {
+    setForm((current) => {
+      const existing = new Set(current.models.map((model) => model.id.trim()));
+      const additions = picked
+        .filter((model) => !existing.has(model.id))
+        .map((model) => ({
+          id: model.id,
+          label: model.label ?? "",
+          contextWindow: model.contextWindow ? String(model.contextWindow) : "",
+        }));
+      return { ...current, models: [...current.models, ...additions] };
+    });
+    setPicking(null);
+  }, []);
 
   const saveModel = useCallback((index: number | "new", draft: ModelDraft) => {
     setForm((current) => ({
@@ -431,6 +479,27 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
     }
   }, [deleteRpc, deleting, initial, onDone, saving, toast]);
 
+  if (picking) {
+    const selectedModels = picking.models.filter((model) => picking.selected.has(model.id));
+    const togglePick = (id: string) => setPicking((current) => {
+      if (!current) return current;
+      const selected = new Set(current.selected);
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      return { ...current, selected };
+    });
+    return (
+      <ModelPicker
+        models={picking.models}
+        selected={picking.selected}
+        theme={theme}
+        onToggle={togglePick}
+        onConfirm={() => addPicked(selectedModels)}
+        onCancel={() => setPicking(null)}
+      />
+    );
+  }
+
   if (editingModel !== null) {
     return (
       <ModelForm
@@ -503,8 +572,15 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
 
       <SettingsSection
         title="模型列表"
-        info="模型 ID 必须与厂商一致；点卡片编辑，[1m] 结尾为 1M 窗口标识（转发时自动剥掉）"
+        info="可从端点自动获取（显示名 / 窗口自动套用）；点卡片编辑，[1m] 结尾为 1M 窗口标识"
       >
+        <SettingsAction
+          label="从端点获取模型列表"
+          hint="用已填写的 API Key 请求 /v1/models，勾选后批量加入"
+          actionLabel={fetching ? "获取中…" : "获取"}
+          onPress={() => { void discover(); }}
+          disabled={fetching}
+        />
         <View style={{ gap: 8, marginTop: 4 }}>
           {form.models.map((model, index) => (
             <ModelCard
@@ -762,6 +838,80 @@ function ModelForm({ initial, theme, onSave, onDelete, onCancel }: {
           </Text>
         </HoverPressable>
       ) : null}
+    </SettingsSection>
+  );
+}
+
+/** Checkable list of the vendor's discovered models, added on confirm. */
+function ModelPicker({ models, selected, theme, onToggle, onConfirm, onCancel }: {
+  models: readonly FetchedModel[];
+  selected: ReadonlySet<string>;
+  theme: Theme;
+  onToggle(id: string): void;
+  onConfirm(): void;
+  onCancel(): void;
+}) {
+  return (
+    <SettingsSection
+      title="选择要添加的模型"
+      info="来自端点的模型列表；显示名与上下文窗口已按预设知识自动填好，[1m] 条目为 1M 窗口变体"
+    >
+      <View style={{ gap: 8, marginTop: 4 }}>
+        {models.map((model) => {
+          const picked = selected.has(model.id);
+          return (
+            <HoverPressable
+              key={model.id}
+              accessibilityRole="button"
+              accessibilityLabel={`${picked ? "取消选择" : "选择"} ${model.id}`}
+              onPress={() => onToggle(model.id)}
+              style={({ hovered, pressed }) => ({
+                backgroundColor: pressed || hovered ? theme.colors.surface1 : theme.colors.surface0,
+                borderColor: picked ? theme.colors.accent : hovered ? theme.colors.accent : theme.colors.border,
+                borderWidth: 1,
+                borderRadius: 10,
+                padding: 10,
+              })}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <View style={{
+                  width: 18, height: 18, borderRadius: 5,
+                  borderWidth: 1,
+                  borderColor: picked ? theme.colors.accent : theme.colors.border,
+                  backgroundColor: picked ? theme.colors.accent : "transparent",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}>
+                  {picked ? <Text style={{ color: theme.colors.accentForeground, fontSize: 12, lineHeight: 14, fontWeight: "700" }}>✓</Text> : null}
+                </View>
+                <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 12, fontFamily: MONO_FONT, flexShrink: 1 }}>
+                  {model.id}
+                </Text>
+                <View style={{ flex: 1 }} />
+                {model.contextWindow ? (
+                  <View style={{ backgroundColor: theme.colors.surface2, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 }}>
+                    <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: MONO_FONT }}>
+                      {formatWindow(model.contextWindow)}
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+            </HoverPressable>
+          );
+        })}
+      </View>
+      <SettingsAction
+        label={`添加所选（${selected.size}）`}
+        hint="已存在的模型 ID 会跳过"
+        actionLabel="添加"
+        onPress={onConfirm}
+        disabled={selected.size === 0}
+      />
+      <SettingsAction
+        label="放弃选择"
+        actionLabel="取消"
+        onPress={onCancel}
+      />
     </SettingsSection>
   );
 }

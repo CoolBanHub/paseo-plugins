@@ -68,6 +68,14 @@ export const providerViewSchema = z.object({
 });
 export type ProviderView = z.output<typeof providerViewSchema>;
 
+/** One model discovered on the vendor's /v1/models, with what we know of it. */
+export const fetchedModelSchema = z.object({
+  id: z.string(),
+  label: z.string().optional(),
+  contextWindow: z.number().int().optional(),
+});
+export type FetchedModel = z.output<typeof fetchedModelSchema>;
+
 const providersResult = z.object({
   ok: z.boolean(),
   error: z.string().nullable(),
@@ -90,4 +98,20 @@ export const deleteProviderRpc = defineRpc({
   name: "claude-models.providers.delete",
   input: z.object({ id: z.string() }),
   output: providersResult,
+});
+
+/** Discovers the vendor's models; the key comes from the form or the store. */
+export const fetchModelsRpc = defineRpc({
+  name: "claude-models.models.fetch",
+  input: z.object({
+    providerId: z.string().max(64).optional(),
+    baseUrl: z.string().trim().min(1, "请填写 API 地址"),
+    authHeader: authHeaderSchema,
+    apiKey: z.string().max(512).optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+    models: z.array(fetchedModelSchema),
+  }),
 });

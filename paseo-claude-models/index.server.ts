@@ -1,11 +1,12 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
-import { deleteProviderRpc, listProvidersRpc, saveProviderRpc } from "./shared/contracts.ts";
+import { deleteProviderRpc, fetchModelsRpc, listProvidersRpc, saveProviderRpc } from "./shared/contracts.ts";
 import type { ProviderInput, ProviderView } from "./shared/contracts.ts";
 import { createBridge } from "./server/bridge.ts";
+import { fetchVendorModels } from "./server/fetch-models.ts";
 import { claudeSessionEnv, MODEL_SELECTED_ENV, resolveProviderEnv, sessionModels, takeSelectedMarker } from "./server/session.ts";
 import { syncClaudeModels, type ProviderApi } from "./server/sync.ts";
-import { createModelRegistry } from "./server/store.ts";
+import { createModelRegistry, normalizeApiKey } from "./server/store.ts";
 
 /**
  * Assembly: providers are configured through RPC from the settings screen,
@@ -69,6 +70,25 @@ export default function contribute(server: PluginServerContext) {
       return views(registry.views());
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error), providers: registry.views() };
+    }
+  });
+
+  // Model discovery for the settings screen: the key typed in the form wins,
+  // else the provider's stored key.
+  server.handle(fetchModelsRpc, async (input) => {
+    try {
+      const key = input.apiKey?.trim()
+        ? normalizeApiKey(input.apiKey)
+        : input.providerId ? registry.apiKey(input.providerId) : null;
+      if (!key) return { ok: false, error: "请先填写 API Key", models: [] };
+      const result = await fetchVendorModels({
+        baseUrl: input.baseUrl,
+        authHeader: input.authHeader,
+        key,
+      });
+      return result.ok ? { ok: true, error: null, models: result.models } : { ok: false, error: result.error, models: [] };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error), models: [] };
     }
   });
 
