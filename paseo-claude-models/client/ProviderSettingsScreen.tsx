@@ -14,6 +14,7 @@ import {
   saveProviderRpc,
   type ProviderView,
 } from "../shared/contracts";
+import { modelIdPattern } from "../shared/model-id";
 import { PROVIDER_PRESETS, type AuthHeader, type ProviderProtocol } from "../shared/presets";
 
 /**
@@ -307,6 +308,8 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
   // Inputs are uncontrolled; bumping this remounts them with fresh values.
   const [formVersion, setFormVersion] = useState(0);
   const [saving, setSaving] = useState(false);
+  /** null: the provider form; "new" or a model index: that model's editor. */
+  const [editingModel, setEditingModel] = useState<number | "new" | null>(null);
 
   const applyForm = useCallback((next: FormState) => {
     setForm(next);
@@ -315,11 +318,29 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
 
   const key = (field: string) => `${field}-${formVersion}`;
 
-  const setModel = useCallback((index: number, patch: Partial<ModelDraft>) => {
+  const saveModel = useCallback((index: number | "new", draft: ModelDraft) => {
     setForm((current) => ({
       ...current,
-      models: current.models.map((model, position) => (position === index ? { ...model, ...patch } : model)),
+      models: index === "new"
+        ? [...current.models, draft]
+        : current.models.map((model, position) => (position === index ? draft : model)),
     }));
+    setEditingModel(null);
+  }, []);
+
+  /** Removing a model also clears aliases that pointed at it. */
+  const deleteModel = useCallback((index: number) => {
+    setForm((current) => {
+      const removed = current.models[index];
+      const aliases = { ...current.aliases };
+      if (removed) {
+        for (const alias of ["opus", "sonnet", "haiku"] as const) {
+          if (current.aliases[alias] === removed.id) aliases[alias] = "";
+        }
+      }
+      return { ...current, models: current.models.filter((_, position) => position !== index), aliases };
+    });
+    setEditingModel(null);
   }, []);
 
   const save = useCallback(async () => {
@@ -410,6 +431,19 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
     }
   }, [deleteRpc, deleting, initial, onDone, saving, toast]);
 
+  if (editingModel !== null) {
+    return (
+      <ModelForm
+        key={editingModel === "new" ? "new" : `edit-${formVersion}-${editingModel}`}
+        initial={editingModel === "new" ? null : form.models[editingModel] ?? null}
+        theme={theme}
+        onSave={(draft) => saveModel(editingModel, draft)}
+        onDelete={editingModel === "new" ? undefined : () => deleteModel(editingModel)}
+        onCancel={() => setEditingModel(null)}
+      />
+    );
+  }
+
   return (
     <SettingsSection
       title={initial ? `编辑 ${initial.label}` : "新建 Provider"}
@@ -469,47 +503,35 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
 
       <SettingsSection
         title="模型列表"
-        info="模型 ID 必须与厂商一致；要 1M 长上下文在 ID 末尾加 [1m]（如 glm-5.3[1m]）并填写对应窗口，转发时会自动剥掉该标识"
+        info="模型 ID 必须与厂商一致；点卡片编辑，[1m] 结尾为 1M 窗口标识（转发时自动剥掉）"
       >
-        {form.models.map((model, index) => (
-          <SettingsSection key={`model-${formVersion}-${index}`} title={`模型 ${index + 1}`}>
-            <SettingsInput
-              key={key(`m${index}-id`)}
-              label="模型 ID"
-              placeholder="glm-5.3 或 glm-5.3[1m]"
-              initialValue={model.id}
-              onChangeText={(text) => setModel(index, { id: text })}
+        <View style={{ gap: 8, marginTop: 4 }}>
+          {form.models.map((model, index) => (
+            <ModelCard
+              key={`model-${formVersion}-${index}`}
+              model={model}
+              theme={theme}
+              onEdit={() => setEditingModel(index)}
             />
-            <SettingsInput
-              key={key(`m${index}-label`)}
-              label="显示名"
-              placeholder="GLM-4.6"
-              initialValue={model.label}
-              onChangeText={(text) => setModel(index, { label: text })}
-            />
-            <SettingsInput
-              key={key(`m${index}-window`)}
-              label="上下文窗口（可选）"
-              placeholder="200000"
-              initialValue={model.contextWindow}
-              onChangeText={(text) => setModel(index, { contextWindow: text })}
-              hint="留空按 Claude Code 默认的 200k 处理自动压缩"
-            />
-            <SettingsAction
-              label="移除这个模型"
-              actionLabel="移除"
-              onPress={() => setForm((current) => ({
-                ...current,
-                models: current.models.filter((_, position) => position !== index),
-              }))}
-            />
-          </SettingsSection>
-        ))}
-        <SettingsAction
-          label="添加模型"
-          actionLabel="添加"
-          onPress={() => setForm((current) => ({ ...current, models: [...current.models, { id: "", label: "", contextWindow: "" }] }))}
-        />
+          ))}
+          <HoverPressable
+            accessibilityRole="button"
+            accessibilityLabel="添加模型"
+            onPress={() => setEditingModel("new")}
+            style={({ hovered }) => ({
+              borderColor: hovered ? theme.colors.accent : theme.colors.border,
+              borderWidth: 1,
+              borderStyle: "dashed",
+              borderRadius: 10,
+              padding: 10,
+              alignItems: "center",
+            })}
+          >
+            <Text style={{ color: theme.colors.accent, fontSize: 12, fontWeight: "600" }}>
+              {form.models.length === 0 ? "＋ 添加第一个模型" : "＋ 添加模型"}
+            </Text>
+          </HoverPressable>
+        </View>
       </SettingsSection>
 
       <SettingsSection
@@ -606,6 +628,140 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
           </HoverPressable>
         ) : null}
       </SettingsSection>
+    </SettingsSection>
+  );
+}
+
+/** "1000000" → "1M 窗口", "204800" → "200k 窗口"; raw when nothing divides. */
+function formatWindow(window: number): string {
+  if (window % 1_000_000 === 0) return `${window / 1_000_000}M 窗口`;
+  if (window % 1024 === 0) return `${window / 1024}k 窗口`;
+  if (window % 1_000 === 0) return `${window / 1_000}k 窗口`;
+  return `${window} 窗口`;
+}
+
+function ModelCard({ model, theme, onEdit }: { model: ModelDraft; theme: Theme; onEdit(): void }) {
+  const id = model.id.trim();
+  const label = model.label.trim() || id || "未命名模型";
+  const window = Number.parseInt(model.contextWindow.trim(), 10);
+  return (
+    <HoverPressable
+      accessibilityRole="button"
+      accessibilityLabel={`编辑模型 ${label}`}
+      onPress={onEdit}
+      style={({ hovered, pressed }) => ({
+        backgroundColor: pressed || hovered ? theme.colors.surface1 : theme.colors.surface0,
+        borderColor: hovered ? theme.colors.accent : theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 10,
+        padding: 10,
+      })}
+    >
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600", flexShrink: 1 }}>
+          {label}
+        </Text>
+        <View style={{ flex: 1 }} />
+        <View style={{ backgroundColor: theme.colors.surface2, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 }}>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: MONO_FONT }}>
+            {Number.isFinite(window) && window >= 4096 ? formatWindow(window) : "默认 200k"}
+          </Text>
+        </View>
+      </View>
+      <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: MONO_FONT, marginTop: 6 }}>
+        {id || "（未填写 ID）"}
+      </Text>
+    </HoverPressable>
+  );
+}
+
+/** One model's editor: opened from the provider form's model list. */
+function ModelForm({ initial, theme, onSave, onDelete, onCancel }: {
+  initial: ModelDraft | null;
+  theme: Theme;
+  onSave(draft: ModelDraft): void;
+  onDelete?(): void;
+  onCancel(): void;
+}) {
+  const toast = useToast();
+  const [id, setId] = useState(initial?.id ?? "");
+  const [label, setLabel] = useState(initial?.label ?? "");
+  const [contextWindow, setContextWindow] = useState(initial?.contextWindow ?? "");
+
+  const save = useCallback(() => {
+    const trimmedId = id.trim();
+    if (!trimmedId) {
+      toast.error("请填写模型 ID");
+      return;
+    }
+    if (!modelIdPattern.test(trimmedId)) {
+      toast.error("模型 ID 含非法字符（1M 窗口标识只能用小写 [1m] 结尾）");
+      return;
+    }
+    const trimmedWindow = contextWindow.trim();
+    const window = Number.parseInt(trimmedWindow, 10);
+    if (trimmedWindow && (!Number.isFinite(window) || window < 4096)) {
+      toast.error("上下文窗口需为不小于 4096 的数字");
+      return;
+    }
+    onSave({ id: trimmedId, label: label.trim(), contextWindow: trimmedWindow });
+  }, [contextWindow, id, label, onSave, toast]);
+
+  return (
+    <SettingsSection
+      title={initial ? `编辑模型 ${initial.label.trim() || initial.id.trim()}` : "添加模型"}
+      info="模型 ID 必须与厂商一致；保存后回到 Provider 表单"
+    >
+      <SettingsInput
+        label="模型 ID"
+        placeholder="glm-5.3 或 glm-5.3[1m]"
+        initialValue={id}
+        onChangeText={setId}
+        hint="要 1M 长上下文在末尾加 [1m]（转发时自动剥掉）"
+      />
+      <SettingsInput
+        label="显示名（可选）"
+        placeholder="GLM-5.3"
+        initialValue={label}
+        onChangeText={setLabel}
+        hint="只用于模型选择器，留空用 ID"
+      />
+      <SettingsInput
+        label="上下文窗口（可选）"
+        placeholder="200000"
+        initialValue={contextWindow}
+        onChangeText={setContextWindow}
+        hint="留空按 Claude Code 默认的 200k 处理自动压缩"
+      />
+      <SettingsAction
+        label={initial ? "保存修改" : "添加这个模型"}
+        actionLabel="保存"
+        onPress={save}
+      />
+      <SettingsAction
+        label="放弃更改"
+        actionLabel="取消"
+        onPress={onCancel}
+      />
+      {initial && onDelete ? (
+        <HoverPressable
+          accessibilityRole="button"
+          accessibilityLabel={`删除模型 ${initial.id.trim()}`}
+          onPress={onDelete}
+          style={({ hovered }) => ({
+            borderColor: hovered ? theme.colors.statusDanger : theme.colors.border,
+            borderWidth: 1,
+            borderRadius: 10,
+            padding: 10,
+            alignItems: "center",
+            marginTop: 4,
+          })}
+        >
+          <Text style={{ color: theme.colors.statusDanger, fontSize: 12, fontWeight: "600" }}>
+            删除 {initial.label.trim() || initial.id.trim()}
+          </Text>
+        </HoverPressable>
+      ) : null}
     </SettingsSection>
   );
 }
