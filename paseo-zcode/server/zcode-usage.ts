@@ -138,25 +138,34 @@ function buildReport(payload: QuotaResponse, planPrefix: string): UsageReport {
 type QuotaFetch = { kind: "payload"; payload: QuotaResponse } | { kind: "report"; report: UsageReport };
 
 async function fetchQuota(authorization: string): Promise<QuotaFetch> {
-  const response = await fetch(QUOTA_URL, {
-    headers: { Authorization: authorization, "x-request-id": crypto.randomUUID() },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (response.status === 401 || response.status === 403) {
-    return {
-      kind: "report",
-      report: {
-        status: "unavailable",
-        problem: { kind: "rejected", status: response.status, refreshedBy: "检查 API key 或重新登录 ZCode" },
-      },
-    };
+  // AbortSignal.timeout's global type resolves against react-native's bundled
+  // DOM lib in the plugin-wide tsc program; an AbortController timer keeps
+  // the same timeout without that clash.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(QUOTA_URL, {
+      headers: { Authorization: authorization, "x-request-id": crypto.randomUUID() },
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      return {
+        kind: "report",
+        report: {
+          status: "unavailable",
+          problem: { kind: "rejected", status: response.status, refreshedBy: "检查 API key 或重新登录 ZCode" },
+        },
+      };
+    }
+    if (!response.ok) return { kind: "report", report: { status: "error", error: `quota endpoint returned ${response.status}` } };
+    const payload = (await response.json()) as QuotaResponse;
+    if (payload.code !== 200 || !payload.data?.limits) {
+      return { kind: "report", report: { status: "error", error: payload.msg || "quota endpoint returned no limits" } };
+    }
+    return { kind: "payload", payload };
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) return { kind: "report", report: { status: "error", error: `quota endpoint returned ${response.status}` } };
-  const payload = (await response.json()) as QuotaResponse;
-  if (payload.code !== 200 || !payload.data?.limits) {
-    return { kind: "report", report: { status: "error", error: payload.msg || "quota endpoint returned no limits" } };
-  }
-  return { kind: "payload", payload };
 }
 
 interface ApiKeyPlanProvider {
@@ -213,33 +222,65 @@ function readBigModelAccountToken(): string | undefined {
   }
 }
 
-export function createZcodeUsageSource(): UsageSourceRegistration {
+/** One coding-plan account discoverable on this machine. */
+export interface DiscoveredUsageAccount {
+  key: string;
+  label: string;
+  kind: "account" | "apikey";
+  input: { kind: "account" | "apikey"; providerId: string };
+}
+
+/** BigModel login plus every personal provider backed by a coding-plan key. */
+export function discoverUsageAccounts(): DiscoveredUsageAccount[] {
+  const accounts: DiscoveredUsageAccount[] = [];
+  const bigmodel = readAccountProviders().find((p) => p.family === "bigmodel");
+  if (bigmodel && readBigModelAccountToken()) {
+    accounts.push({
+      key: hashAccountKey(bigmodel.providerId),
+      label: "智谱 BigModel 账号套餐",
+      kind: "account",
+      input: { kind: "account", providerId: bigmodel.providerId },
+    });
+  }
+  for (const p of readApiKeyPlanProviders()) {
+    if (!p.providerId) continue;
+    accounts.push({
+      key: hashAccountKey(`${p.providerId}:${p.providerName}`),
+      label: `${p.providerName}（智谱 API key 套餐）`,
+      kind: "apikey",
+      input: { kind: "apikey", providerId: p.providerId },
+    });
+  }
+  return accounts;
+}
+
+/** Accounts the usage view shows: everything except the hidden keys. */
+export function reportedUsageAccounts(
+  accounts: readonly DiscoveredUsageAccount[],
+  hidden: readonly string[],
+): DiscoveredUsageAccount[] {
+  const hiddenKeys = new Set(hidden);
+  return accounts.filter((account) => !hiddenKeys.has(account.key));
+}
+
+export type ZcodeUsageSourceOptions = {
+  /** Read per discover() call, so the settings screen takes effect without a reload. */
+  hiddenAccounts?: () => readonly string[];
+};
+
+export function createZcodeUsageSource(options: ZcodeUsageSourceOptions = {}): UsageSourceRegistration {
+  const hiddenAccounts = options.hiddenAccounts ?? (() => []);
   return {
     id: "zcode-coding-plan",
     label: "ZCode Coding Plan",
     input: z.object({ kind: z.enum(["account", "apikey"]), providerId: z.string() }),
-    discover: async () => {
-      const accounts = [];
-      const bigmodel = readAccountProviders().find((p) => p.family === "bigmodel");
-      if (bigmodel && readBigModelAccountToken()) {
-        accounts.push({
-          key: hashAccountKey(bigmodel.providerId),
-          label: "智谱 BigModel 账号套餐",
-          harness: "ZCode",
-          input: { kind: "account" as const, providerId: bigmodel.providerId },
-        });
-      }
-      for (const p of readApiKeyPlanProviders()) {
-        if (!p.providerId) continue;
-        accounts.push({
-          key: hashAccountKey(`${p.providerId}:${p.providerName}`),
-          label: `${p.providerName}（智谱 API key 套餐）`,
-          harness: "ZCode",
-          input: { kind: "apikey" as const, providerId: p.providerId },
-        });
-      }
-      return accounts;
-    },
+    discover: async () =>
+      reportedUsageAccounts(discoverUsageAccounts(), hiddenAccounts()).map((account) => ({
+        key: account.key,
+        label: account.label,
+        harness: "ZCode",
+        input: account.input,
+      })),
     fetch: async (rawInput) => {
       const input = rawInput as { kind: "account" | "apikey"; providerId: string };
       if (input?.kind === "apikey") {

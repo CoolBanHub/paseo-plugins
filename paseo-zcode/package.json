@@ -9,7 +9,9 @@
     "index.client.tsx",
     "index.server.ts",
     "zcode.svg",
-    "server/"
+    "client/",
+    "server/",
+    "shared/"
   ],
   "scripts": {
     "reload:check": "node scripts/reload-zcode.cjs --check",

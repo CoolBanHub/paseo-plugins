@@ -23,6 +23,18 @@ account per plan:
 Both query BigModel's official quota endpoint with the credentials stored by
 the ZCode desktop app, so the numbers match what the desktop shows.
 
+### Choosing which plans show up
+
+Paseo's usage bars are pinned per window (5h / week) and one pin covers every
+account of a source, so multiple plans on one machine each add a bar with no
+in-app way to show only some of them. The plugin's `ZCode 用量显示` settings
+screen (Paseo Settings → Plugins → ZCode) lists every coding-plan account it
+discovers with a per-account switch; switched-off accounts are not reported,
+so their bars disappear on the next usage query (`paseo usage --refresh`
+forces one). The choice is stored as hidden account keys under
+`~/.paseo/plugin-data/zcode/usage-accounts.json`; accounts discovered later
+start visible, and no reload is needed after switching.
+
 ## How it works
 
 The plugin spawns `zcode app-server --stdio` from the installed ZCode desktop
