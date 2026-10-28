@@ -41,8 +41,8 @@ function HoverPressable({
 }: {
   onPress?: () => void;
   style?: (state: { hovered: boolean; pressed: boolean }) => StyleProp<ViewStyle>;
-  children?: ReactNode;
-} & Omit<React.ComponentProps<typeof Pressable>, "onPress" | "style">) {
+  children?: ReactNode | ((state: { hovered: boolean; pressed: boolean }) => ReactNode);
+} & Omit<React.ComponentProps<typeof Pressable>, "onPress" | "style" | "children">) {
   const [hovered, setHovered] = useState(false);
   return (
     <Pressable
@@ -52,7 +52,9 @@ function HoverPressable({
       onHoverOut={() => setHovered(false)}
       style={style === undefined ? undefined : ({ pressed }) => style({ hovered, pressed })}
     >
-      {children}
+      {typeof children === "function"
+        ? (state: { pressed: boolean }) => children({ hovered, pressed: state.pressed })
+        : children}
     </Pressable>
   );
 }
@@ -588,6 +590,7 @@ function ProviderForm({ initial, theme, onDone }: { initial: ProviderView | null
               model={model}
               theme={theme}
               onEdit={() => setEditingModel(index)}
+              onDelete={() => deleteModel(index)}
             />
           ))}
           <HoverPressable
@@ -716,7 +719,7 @@ function formatWindow(window: number): string {
   return `${window} 窗口`;
 }
 
-function ModelCard({ model, theme, onEdit }: { model: ModelDraft; theme: Theme; onEdit(): void }) {
+function ModelCard({ model, theme, onEdit, onDelete }: { model: ModelDraft; theme: Theme; onEdit(): void; onDelete?(): void }) {
   const id = model.id.trim();
   const label = model.label.trim() || id || "未命名模型";
   const window = Number.parseInt(model.contextWindow.trim(), 10);
@@ -743,6 +746,28 @@ function ModelCard({ model, theme, onEdit }: { model: ModelDraft; theme: Theme; 
             {Number.isFinite(window) && window >= 4096 ? formatWindow(window) : "默认 200k"}
           </Text>
         </View>
+        {onDelete ? (
+          // A nested pressable is its own responder, so ✕ never opens the editor.
+          <HoverPressable
+            accessibilityRole="button"
+            accessibilityLabel={`删除模型 ${label}`}
+            onPress={onDelete}
+            style={({ hovered }) => ({
+              width: 24,
+              height: 24,
+              borderRadius: 6,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: hovered ? theme.colors.surface2 : "transparent",
+            })}
+          >
+            {({ hovered }) => (
+              <Text style={{ color: hovered ? theme.colors.statusDanger : theme.colors.foregroundMuted, fontSize: 13, lineHeight: 15 }}>
+                ✕
+              </Text>
+            )}
+          </HoverPressable>
+        ) : null}
       </View>
       <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: MONO_FONT, marginTop: 6 }}>
         {id || "（未填写 ID）"}
