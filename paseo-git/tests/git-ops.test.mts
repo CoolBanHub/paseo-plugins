@@ -62,7 +62,7 @@ test("gitStatus 在非 git 目录返回友好错误", async () => {
   assert.match(status.error ?? "", /not a git repository/);
 });
 
-test("gitBranches 列出本地/远程分支并计算与 HEAD 的领先落后", async () => {
+test("gitBranches 列出本地/远程分支并报告与上游的领先落后", async () => {
   await withFixtureRepo(async (repo) => {
     const branches = await gitBranches(testRun, repo.root);
     assert.equal(branches.ok, true);
@@ -73,16 +73,16 @@ test("gitBranches 列出本地/远程分支并计算与 HEAD 的领先落后", a
     assert.ok(main && feature && side, "三个本地分支都在");
 
     assert.equal(main?.isCurrent, true);
-    assert.equal(main?.ahead, 0);
+    assert.equal(main?.upstream, "origin/main");
+    assert.equal(main?.ahead, 3, "main 领先 origin/main 三个提交（c3、merge、rename）");
     assert.equal(main?.behind, 0);
 
-    // feature 已合并：相对 HEAD 无领先，落后 main 上的 merge 与 rename。
-    assert.equal(feature?.ahead, 0);
-    assert.equal(feature?.behind, 2);
-
-    // side 自 merge 后切出：领先 c5，落后 c6。
-    assert.equal(side?.ahead, 1);
-    assert.equal(side?.behind, 1);
+    // 无上游的分支 ahead/behind 均为 null。
+    assert.equal(feature?.upstream, null);
+    assert.equal(feature?.ahead, null);
+    assert.equal(feature?.behind, null);
+    assert.equal(side?.ahead, null);
+    assert.equal(side?.behind, null);
 
     const originMain = branches.remotes.find((branch) => branch.shortName === "origin/main");
     assert.ok(originMain, "远程分支 origin/main 在列表中");

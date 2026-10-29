@@ -4,7 +4,7 @@
  * daemon wires in the SDK process helper.
  */
 
-import { realpath } from "node:fs/promises";
+import { access, readFile, realpath, unlink } from "node:fs/promises";
 import {
   basename as pathBasename,
   dirname as pathDirname,
@@ -15,14 +15,22 @@ import type {
   ActionResult,
   BranchEntry,
   BranchesResult,
+  ChangeEntry,
+  ChangesResult,
   CommitDetail,
   CommitFile,
   CommitSummary,
+  DiffResult,
   GitRun,
   LocalBranchEntry,
   LogResult,
   PathsResult,
   RawError,
+  RecentMessagesResult,
+  SequenceKind,
+  SequenceState,
+  StashEntry,
+  StashListResult,
   StatusResult,
   TagEntry,
   TagsResult,
@@ -34,14 +42,22 @@ export type {
   ActionResult,
   BranchEntry,
   BranchesResult,
+  ChangeEntry,
+  ChangesResult,
   CommitDetail,
   CommitFile,
   CommitSummary,
+  DiffResult,
   GitRun,
   LocalBranchEntry,
   LogResult,
   PathsResult,
   RawError,
+  RecentMessagesResult,
+  SequenceKind,
+  SequenceState,
+  StashEntry,
+  StashListResult,
   StatusResult,
   TagEntry,
   TagsResult,
@@ -62,6 +78,8 @@ const REF_FORMAT = [
   "%(committerdate:iso8601-strict)",
   "%(if)%(HEAD)%(then)1%(else)0%(end)",
   "%(subject)",
+  "%(upstream:short)",
+  "%(upstream:track,nobracket)",
 ].join(US);
 const TAG_FORMAT = [
   "%(refname)",
@@ -183,16 +201,29 @@ export async function gitStatus(run: GitRun, cwd: string): Promise<StatusResult>
 // branches
 // ---------------------------------------------------------------------------
 
+/** Parse "ahead 2", "behind 3", "ahead 1, behind 2" from %(upstream:track,nobracket). */
+export function parseTrackCounts(track: string): { ahead: number | null; behind: number | null } {
+  if (track.trim().length === 0) return { ahead: 0, behind: 0 };
+  const ahead = /ahead (\d+)/.exec(track);
+  const behind = /behind (\d+)/.exec(track);
+  if (!ahead && !behind) return { ahead: null, behind: null }; // gone/diverged w/o counts
+  return {
+    ahead: ahead ? Number.parseInt(ahead[1] ?? "0", 10) : 0,
+    behind: behind ? Number.parseInt(behind[1] ?? "0", 10) : 0,
+  };
+}
+
 export function parseForEachRef(body: string): { locals: LocalBranchEntry[]; remotes: BranchEntry[] } {
   const locals: LocalBranchEntry[] = [];
   const remotes: BranchEntry[] = [];
   for (const record of body.split("\n")) {
     if (record.trim().length === 0) continue;
     const fields = record.split(US);
-    if (fields.length < 6) continue;
-    const [name, shortName, hash, date, headMark, subject] = fields;
+    if (fields.length < 8) continue;
+    const [name, shortName, hash, date, headMark, subject, upstream, track] = fields;
     if (!name || !hash) continue;
     if (name.startsWith("refs/heads/")) {
+      const counts = parseTrackCounts(track ?? "");
       locals.push({
         name,
         shortName: shortName ?? name.slice("refs/heads/".length),
@@ -200,10 +231,13 @@ export function parseForEachRef(body: string): { locals: LocalBranchEntry[]; rem
         subject: subject ?? "",
         date: date ?? "",
         isCurrent: headMark === "1",
-        ahead: null,
-        behind: null,
+        upstream: upstream && upstream.length > 0 ? upstream : null,
+        ahead: upstream && upstream.length > 0 ? counts.ahead : null,
+        behind: upstream && upstream.length > 0 ? counts.behind : null,
       });
     } else if (name.startsWith("refs/remotes/")) {
+      // Skip the symbolic origin/HEAD pointer; it duplicates a real branch.
+      if (name.endsWith("/HEAD")) continue;
       remotes.push({
         name,
         shortName: shortName ?? name.slice("refs/remotes/".length),
@@ -234,31 +268,9 @@ export async function gitBranches(run: GitRun, cwd: string): Promise<BranchesRes
   } catch (err) {
     return failed(err instanceof Error ? err.message : String(err));
   }
-  const { locals, remotes } = parseForEachRef(body);
-
-  // Ahead/behind of each local branch against HEAD (0/0 for the current
-  // branch), capped and parallelised; one fast rev-list per branch.
-  for (const branch of locals) {
-    if (branch.isCurrent) {
-      branch.ahead = 0;
-      branch.behind = 0;
-    }
-  }
-  const targets = locals.filter((branch) => !branch.isCurrent).slice(0, 64);
-  await Promise.all(
-    targets.map(async (branch) => {
-      try {
-        const out = await runChecked(run, ["rev-list", "--left-right", "--count", `${branch.name}...HEAD`], root);
-        const [ahead, behind] = out.trim().split(/\s+/).map((value) => Number.parseInt(value, 10));
-        branch.ahead = Number.isFinite(ahead) ? ahead : null;
-        branch.behind = Number.isFinite(behind) ? behind : null;
-      } catch {
-        // leave null when the count is unavailable
-      }
-    }),
-  );
-
-  return { ok: true, error: null, locals, remotes };
+  // Ahead/behind come straight from for-each-ref's upstream:track field — one
+  // command total instead of a rev-list per branch.
+  return { ok: true, error: null, ...parseForEachRef(body) };
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +983,7 @@ export function formatPushSummary(upstream: string, commits: number): string {
  * run `push -u origin <branch>` (branch name comes from the repo itself,
  * never the client).
  */
-export async function gitPush(run: GitRun, cwd: string, setUpstream: boolean): Promise<PushResult> {
+export async function gitPush(run: GitRun, cwd: string, setUpstream: boolean, force = false): Promise<PushResult> {
   const failed = (error: string): PushResult => ({ ok: false, error, message: null, needsUpstream: false });
   let root: string;
   try {
@@ -992,13 +1004,673 @@ export async function gitPush(run: GitRun, cwd: string, setUpstream: boolean): P
       if (!setUpstream) {
         return { ok: false, error: `分支 ${branch} 没有上游分支`, message: null, needsUpstream: true };
       }
-      await runChecked(run, ["push", "-u", "origin", branch], root, 120_000);
+      await runChecked(run, ["push", "-u", "origin", ...(force ? ["--force-with-lease"] : []), branch], root, 120_000);
       return { ok: true, error: null, message: `已推送 ${branch} 并建立上游跟踪 origin/${branch}`, needsUpstream: false };
     }
     const countText = await runChecked(run, ["rev-list", "--count", `${upstream}..HEAD`], root);
     const commits = Number.parseInt(countText.trim(), 10) || 0;
-    await runChecked(run, ["push"], root, 120_000);
-    return { ok: true, error: null, message: formatPushSummary(upstream, commits), needsUpstream: false };
+    const pushArgs = ["push"];
+    if (force) pushArgs.push("--force-with-lease");
+    await runChecked(run, pushArgs, root, 120_000);
+    return {
+      ok: true,
+      error: null,
+      message: force && commits >= 0
+        ? `已强制推送到 ${upstream}`
+        : formatPushSummary(upstream, commits),
+      needsUpstream: false,
+    };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// working-tree changes, staging, commit
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse `git status --porcelain=v1 -z -uall`. NUL replaces the newline; only
+ * rename entries carry a second NUL field with the old path ("XY new\0old\0"),
+ * everything else is "XY path" with a plain space separator.
+ */
+export function parseChangesBody(body: string): ChangeEntry[] {
+  const tokens = body.split("\0");
+  const entries: ChangeEntry[] = [];
+  let index = 0;
+  while (index < tokens.length) {
+    const record = tokens[index] ?? "";
+    if (record.length < 3) {
+      index += 1;
+      continue;
+    }
+    const x = record[0] ?? " ";
+    const y = record[1] ?? " ";
+    let path = record.slice(3);
+    let oldPath: string | null = null;
+    if (x === "R" || x === "C") {
+      oldPath = tokens[index + 1] ?? "";
+      index += 2;
+    } else {
+      index += 1;
+    }
+    if (path.length === 0) continue;
+
+    if (x === "?" && y === "?") {
+      entries.push({ path, oldPath, status: "?", staged: false, untracked: true, conflict: false });
+      continue;
+    }
+    const conflict = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(`${x}${y}`);
+    if (conflict) {
+      entries.push({ path, oldPath, status: `${x}${y}`, staged: false, untracked: false, conflict: true });
+      continue;
+    }
+    if (x !== " ") {
+      entries.push({ path, oldPath, status: x, staged: true, untracked: false, conflict: false });
+    }
+    if (y !== " " && y !== "?") {
+      entries.push({ path, oldPath, status: y, staged: false, untracked: false, conflict: false });
+    }
+  }
+  return entries;
+}
+
+export async function gitChanges(run: GitRun, cwd: string): Promise<ChangesResult> {
+  const failed = (error: string): ChangesResult => ({ ok: false, error, entries: [] });
+  let root: string;
+  try {
+    root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+  try {
+    const body = await runChecked(run, ["status", "--porcelain=v1", "-z", "-uall"], root);
+    return { ok: true, error: null, entries: parseChangesBody(body) };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function validPaths(paths: readonly string[]): boolean {
+  return paths.every((path) => path.length > 0 && !path.startsWith("/") && !path.includes("..") && !path.includes("\0"));
+}
+
+export async function gitStage(
+  run: GitRun,
+  cwd: string,
+  paths: readonly string[],
+  all: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!all && paths.length === 0) return failed("没有要暂存的文件");
+  if (!validPaths(paths)) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    // -A picks up deletions and untracked files alike within the pathspecs.
+    const args = all && paths.length === 0 ? ["add", "-A"] : ["add", "-A", "--", ...paths];
+    await runChecked(run, args, rootInfo.root, 30_000);
+    return { ok: true, error: null, message: all && paths.length === 0 ? "已暂存全部改动" : "已暂存所选文件" };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitUnstage(
+  run: GitRun,
+  cwd: string,
+  paths: readonly string[],
+  all: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!all && paths.length === 0) return failed("没有要取消暂存的文件");
+  if (!validPaths(paths)) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const args = all && paths.length === 0 ? ["reset", "-q"] : ["reset", "-q", "HEAD", "--", ...paths];
+    await runChecked(run, args, rootInfo.root, 30_000);
+    return { ok: true, error: null, message: all && paths.length === 0 ? "已取消全部暂存" : "已取消暂存所选文件" };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export interface CommitCreateResult extends ActionResult {
+  /** Short hash of the created commit, when available. */
+  shortHash: string | null;
+}
+
+/**
+ * Commit with the IDEA semantics: the checked files are the commit scope,
+ * committed from their working-tree state while the rest of the index stays
+ * untouched. `git commit --only` is exactly this; untracked paths just need
+ * to enter the index first (--only refuses unknown pathspecs).
+ */
+export async function gitCommitCreate(
+  run: GitRun,
+  cwd: string,
+  message: string,
+  paths: readonly string[],
+  amend: boolean,
+): Promise<CommitCreateResult> {
+  const failed = (error: string): CommitCreateResult => ({ ok: false, error, message: null, shortHash: null });
+  const note = message.trim();
+  if (note.length === 0) return failed("提交信息不能为空");
+  if (!validPaths(paths)) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const root = rootInfo.root;
+  const commitArgs = ["commit", "--only", ...(amend ? ["--amend"] : []), "-m", note.slice(0, 20000)];
+
+  try {
+    if (paths.length === 0) {
+      // No scope given: commit the index as-is.
+      await runChecked(run, ["commit", ...(amend ? ["--amend"] : []), "-m", note.slice(0, 20000)], root, 60_000);
+    } else {
+      try {
+        await runChecked(run, ["add", "--", ...paths], root, 30_000);
+      } catch {
+        // already-tracked paths are fine; --only still knows them via HEAD
+      }
+      await runChecked(run, [...commitArgs, "--", ...paths], root, 60_000);
+    }
+    let shortHash: string | null = null;
+    try {
+      shortHash = (await runChecked(run, ["rev-parse", "--short", "HEAD"], root)).trim();
+    } catch {
+      // hash is cosmetic
+    }
+    return { ok: true, error: null, message: amend ? "已修正上一提交" : "已创建提交", shortHash };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitRecentMessages(run: GitRun, cwd: string): Promise<RecentMessagesResult> {
+  const failed = (error: string): RecentMessagesResult => ({ ok: false, error, messages: [] });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const body = await runChecked(run, ["log", "-20", "--format=%s"], rootInfo.root);
+    const messages = body.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+    return { ok: true, error: null, messages };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitDiff(
+  run: GitRun,
+  cwd: string,
+  mode: "worktree" | "staged" | "head" | "commit" | "stash",
+  ref: string,
+  path: string,
+  maxLines: number,
+): Promise<DiffResult> {
+  const failed = (error: string): DiffResult => ({ ok: false, error, text: "", truncated: false, binary: false });
+  if (!validPaths([path])) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  let args: readonly string[];
+  if (mode === "worktree") {
+    args = ["diff", "--no-color", "-M", "--", path];
+  } else if (mode === "staged") {
+    args = ["diff", "--no-color", "-M", "--cached", "--", path];
+  } else if (mode === "head") {
+    args = ["diff", "--no-color", "-M", "HEAD", "--", path];
+  } else if (mode === "commit") {
+    if (!/^[0-9a-fA-F]{4,40}$/.test(ref)) return failed("无效的提交哈希");
+    // --format= keeps the patch, drops the commit header; --first-parent
+    // mirrors what the commit detail list shows for merge commits.
+    args = ["show", "--no-color", "-M", "--first-parent", "--format=", ref, "--", path];
+  } else {
+    if (!/^\d{1,4}$/.test(ref)) return failed("无效的贮藏索引");
+    const label = `stash@{${ref}}`;
+    args = ["diff", "--no-color", "-M", `${label}^`, label, "--", path];
+  }
+  try {
+    const body = await runChecked(run, args, rootInfo.root);
+    const binary = body.includes("Binary files") && body.includes("differ");
+    const lines = body.split("\n");
+    const truncated = lines.length > maxLines;
+    const text = truncated ? lines.slice(0, maxLines).join("\n") : body;
+    return { ok: true, error: null, text, truncated, binary };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Restore one file to HEAD, IDEA-style rollback. Files that do not exist in
+ * HEAD (staged additions, untracked files) are unstaged and removed from the
+ * working tree — the client confirms before calling.
+ */
+export async function gitRollbackFile(run: GitRun, cwd: string, path: string): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!validPaths([path])) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const root = rootInfo.root;
+  try {
+    let inHead = true;
+    try {
+      await runChecked(run, ["cat-file", "-e", `HEAD:${path}`], root);
+    } catch {
+      inHead = false;
+    }
+    if (inHead) {
+      await runChecked(run, ["checkout", "HEAD", "--", path], root, 15_000);
+      return { ok: true, error: null, message: `已还原 ${path}` };
+    }
+    try {
+      await runChecked(run, ["reset", "-q", "HEAD", "--", path], root);
+    } catch {
+      // not staged at all (plain untracked file) — nothing to unstage
+    }
+    try {
+      await unlink(pathJoin(root, path));
+    } catch {
+      // already gone
+    }
+    return { ok: true, error: null, message: `已删除 ${path}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// stash
+// ---------------------------------------------------------------------------
+
+const STASH_FORMAT = ["%gd", "%s", "%aI"].join(US);
+
+export function parseStashListBody(body: string): { label: string; subject: string; date: string; index: number }[] {
+  const entries: { label: string; subject: string; date: string; index: number }[] = [];
+  for (const record of body.split("\n")) {
+    if (record.trim().length === 0) continue;
+    const [label, subject, date] = record.split(US);
+    if (!label) continue;
+    const match = /stash@\{(\d+)\}$/.exec(label);
+    entries.push({
+      label,
+      subject: subject ?? "",
+      date: date ?? "",
+      index: match ? Number.parseInt(match[1] ?? "0", 10) : 0,
+    });
+  }
+  return entries;
+}
+
+export async function gitStashList(run: GitRun, cwd: string): Promise<StashListResult> {
+  const failed = (error: string): StashListResult => ({ ok: false, error, stashes: [] });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const body = await runChecked(run, ["stash", "list", `--format=${STASH_FORMAT}`], rootInfo.root);
+    const base = parseStashListBody(body);
+    const stashes: StashEntry[] = [];
+    for (const entry of base) {
+      let files: StashEntry["files"] = [];
+      try {
+        const showBody = await runChecked(
+          run,
+          ["stash", "show", "--name-status", "-z", entry.label],
+          rootInfo.root,
+        );
+        const tokens = showBody.length === 0 ? [] : showBody.split("\0").filter((token) => token.length > 0);
+        files = parseNameStatusTokens(tokens).map((item) => ({ path: item.path, status: item.status }));
+      } catch {
+        // untracked-only stashes have no tracked diff; leave files empty
+      }
+      stashes.push({ ...entry, files });
+    }
+    return { ok: true, error: null, stashes };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export interface StashPushResult extends ActionResult {
+  /** True when the working tree was clean and nothing got stashed. */
+  empty: boolean;
+}
+
+/** Stash everything, or only the checked paths (including their untracked files). */
+export async function gitStashPush(
+  run: GitRun,
+  cwd: string,
+  message: string,
+  paths: readonly string[],
+): Promise<StashPushResult> {
+  const failed = (error: string): StashPushResult => ({ ok: false, error, message: null, empty: false });
+  if (!validPaths(paths)) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    const args = ["stash", "push", "-u"];
+    const note = message.trim();
+    if (note.length > 0) args.push("-m", note.slice(0, 500));
+    if (paths.length > 0) {
+      args.push("--", ...paths);
+    }
+    const body = await runChecked(run, args, rootInfo.root, 60_000);
+    if (/No local changes to save/.test(body)) {
+      return { ok: true, error: null, message: "没有可贮藏的改动", empty: true };
+    }
+    return { ok: true, error: null, message: paths.length > 0 ? "已贮藏所选文件" : "已贮藏全部改动", empty: false };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitStashApply(
+  run: GitRun,
+  cwd: string,
+  index: number,
+  drop: boolean,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  const label = `stash@{${index}}`;
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["stash", drop ? "pop" : "apply", label], rootInfo.root, 60_000);
+    return {
+      ok: true,
+      error: null,
+      message: drop ? `已恢复并删除 ${label}` : `已恢复 ${label}（保留贮藏）`,
+    };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitStashDrop(run: GitRun, cwd: string, index: number): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  const label = `stash@{${index}}`;
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["stash", "drop", label], rootInfo.root, 30_000);
+    return { ok: true, error: null, message: `已删除 ${label}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// merge / rebase / cherry-pick
+// ---------------------------------------------------------------------------
+
+/** rev-parse --git-dir is relative to the cwd it ran in; absolutise it. */
+async function gitDirOf(run: GitRun, root: string): Promise<string> {
+  const dir = (await runChecked(run, ["rev-parse", "--git-dir"], root)).trim();
+  return pathIsAbsolute(dir) ? dir : pathJoin(root, dir);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readTextSafe(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function parseMergeBranch(msg: string | null): string | null {
+  if (msg === null) return null;
+  const match = /^Merge (?:remote-tracking )?(?:branch|tag) '([^']+)'/m.exec(msg);
+  return match ? (match[1] ?? null) : null;
+}
+
+function parseIntSafe(value: string | null): number | null {
+  if (value === null) return null;
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Which long-running sequence (if any) is in progress, read from .git files. */
+export async function gitSequenceState(run: GitRun, cwd: string): Promise<SequenceState> {
+  const failed = (error: string): SequenceState => ({
+    ok: false, error, kind: "none", branch: null, step: null, total: null, conflicts: [],
+  });
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const root = rootInfo.root;
+  try {
+    const gitDir = await gitDirOf(run, root);
+    let conflictPaths: string[] = [];
+    try {
+      const body = await runChecked(run, ["diff", "--name-only", "--diff-filter=U"], root);
+      conflictPaths = body.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+    } catch {
+      // unborn HEAD etc.
+    }
+
+    if (await pathExists(pathJoin(gitDir, "CHERRY_PICK_HEAD"))) {
+      return { ok: true, error: null, kind: "cherryPick", branch: null, step: null, total: null, conflicts: conflictPaths };
+    }
+    if (await pathExists(pathJoin(gitDir, "rebase-merge"))) {
+      const headName = await readTextSafe(pathJoin(gitDir, "rebase-merge", "head-name"));
+      const branch = headName !== null ? headName.replace(/^refs\/heads\//, "").trim() : null;
+      const step = parseIntSafe(await readTextSafe(pathJoin(gitDir, "rebase-merge", "msgnum")));
+      const total = parseIntSafe(await readTextSafe(pathJoin(gitDir, "rebase-merge", "end")));
+      return { ok: true, error: null, kind: "rebase", branch: branch || null, step, total, conflicts: conflictPaths };
+    }
+    if (await pathExists(pathJoin(gitDir, "rebase-apply"))) {
+      const step = parseIntSafe(await readTextSafe(pathJoin(gitDir, "rebase-apply", "next")));
+      const total = parseIntSafe(await readTextSafe(pathJoin(gitDir, "rebase-apply", "last")));
+      return { ok: true, error: null, kind: "rebase", branch: null, step, total, conflicts: conflictPaths };
+    }
+    if (await pathExists(pathJoin(gitDir, "MERGE_HEAD"))) {
+      const msg = await readTextSafe(pathJoin(gitDir, "MERGE_MSG"));
+      return { ok: true, error: null, kind: "merge", branch: parseMergeBranch(msg), step: null, total: null, conflicts: conflictPaths };
+    }
+    return { ok: true, error: null, kind: "none", branch: null, step: null, total: null, conflicts: conflictPaths };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function sequenceInProgress(run: GitRun, root: string, kind: "merge" | "rebase" | "cherryPick"): Promise<boolean> {
+  const gitDir = await gitDirOf(run, root);
+  if (kind === "merge") return pathExists(pathJoin(gitDir, "MERGE_HEAD"));
+  if (kind === "cherryPick") return pathExists(pathJoin(gitDir, "CHERRY_PICK_HEAD"));
+  return (await pathExists(pathJoin(gitDir, "rebase-merge"))) || (await pathExists(pathJoin(gitDir, "rebase-apply")));
+}
+
+export interface MergeActionResult extends ActionResult {
+  /** True when the operation paused on conflicts (a banner takes over the UI). */
+  conflicts: boolean;
+}
+
+/** Run merge/rebase/cherry-pick; a conflict pause is a success-shaped outcome. */
+async function runSequencer(
+  run: GitRun,
+  root: string,
+  kind: "merge" | "rebase" | "cherryPick",
+  args: readonly string[],
+  doneMessage: string,
+  conflictMessage: string,
+): Promise<MergeActionResult> {
+  try {
+    await runChecked(run, args, root, 120_000);
+    return { ok: true, error: null, message: doneMessage, conflicts: false };
+  } catch (err) {
+    if (await sequenceInProgress(run, root, kind)) {
+      return { ok: true, error: null, message: conflictMessage, conflicts: true };
+    }
+    return { ok: false, error: err instanceof Error ? err.message : String(err), message: null, conflicts: false };
+  }
+}
+
+export async function gitMerge(
+  run: GitRun,
+  cwd: string,
+  ref: string,
+  noFf: boolean,
+): Promise<MergeActionResult> {
+  const failed = (error: string): MergeActionResult => ({ ok: false, error, message: null, conflicts: false });
+  if (!isValidRefName(ref)) return failed("无效的分支名");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const args = ["merge", ...(noFf ? ["--no-ff"] : []), ref];
+  return runSequencer(run, rootInfo.root, "merge", args, `已合并 ${ref}`, `合并 ${ref} 遇到冲突，请解决后继续`);
+}
+
+export async function gitRebase(run: GitRun, cwd: string, ref: string): Promise<MergeActionResult> {
+  const failed = (error: string): MergeActionResult => ({ ok: false, error, message: null, conflicts: false });
+  if (!isValidRefName(ref)) return failed("无效的分支名");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  return runSequencer(
+    run,
+    rootInfo.root,
+    "rebase",
+    ["rebase", ref],
+    `已将当前分支变基到 ${ref}`,
+    `变基到 ${ref} 遇到冲突，请解决后继续`,
+  );
+}
+
+export async function gitCherryPick(
+  run: GitRun,
+  cwd: string,
+  hashes: readonly string[],
+): Promise<MergeActionResult> {
+  const failed = (error: string): MergeActionResult => ({ ok: false, error, message: null, conflicts: false });
+  const clean = hashes.map((hash) => hash.trim()).filter((hash) => /^[0-9a-fA-F]{4,40}$/.test(hash));
+  if (clean.length === 0) return failed("无效的提交哈希");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  return runSequencer(
+    run,
+    rootInfo.root,
+    "cherryPick",
+    ["cherry-pick", ...clean],
+    `已拣选 ${clean.length} 个提交`,
+    "拣选遇到冲突，请解决后继续",
+  );
+}
+
+export async function gitSequenceAction(
+  run: GitRun,
+  cwd: string,
+  sequence: "merge" | "rebase" | "cherryPick",
+  action: "continue" | "skip" | "abort",
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (sequence === "merge" && action === "skip") return failed("合并没有可跳过的步骤");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  const root = rootInfo.root;
+  try {
+    if (action === "abort") {
+      const verb = sequence === "merge" ? "merge" : sequence === "rebase" ? "rebase" : "cherry-pick";
+      await runChecked(run, [verb, "--abort"], root, 60_000);
+      const label = sequence === "merge" ? "合并" : sequence === "rebase" ? "变基" : "拣选";
+      return { ok: true, error: null, message: `已中止${label}` };
+    }
+    if (action === "skip") {
+      const verb = sequence === "rebase" ? "rebase" : "cherry-pick";
+      await runChecked(run, [verb, "--skip"], root, 60_000);
+      return { ok: true, error: null, message: "已跳过该步骤" };
+    }
+    // continue: resolved conflicts must be staged first (git refuses otherwise)
+    if (sequence !== "merge") {
+      try {
+        await runChecked(run, ["add", "-u"], root, 30_000);
+      } catch {
+        // nothing to stage; the sequencer itself will complain if it disagrees
+      }
+    }
+    const verb = sequence === "merge" ? "merge" : sequence === "rebase" ? "rebase" : "cherry-pick";
+    await runChecked(run, [verb, "--continue"], root, 60_000);
+    const label = sequence === "merge" ? "合并" : sequence === "rebase" ? "变基" : "拣选";
+    return { ok: true, error: null, message: `${label}已继续` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Resolve one unmerged path by taking our or their side, then stage it. */
+export async function gitConflictResolve(
+  run: GitRun,
+  cwd: string,
+  path: string,
+  take: "ours" | "theirs",
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!validPaths([path])) return failed("无效的文件路径");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["checkout", take === "ours" ? "--ours" : "--theirs", "--", path], rootInfo.root, 15_000);
+    await runChecked(run, ["add", "--", path], rootInfo.root, 15_000);
+    return { ok: true, error: null, message: `已采用${take === "ours" ? "本方" : "对方"}版本：${path}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// history actions
+// ---------------------------------------------------------------------------
+
+export async function gitReset(
+  run: GitRun,
+  cwd: string,
+  hash: string,
+  mode: "soft" | "mixed" | "hard",
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!/^[0-9a-fA-F]{4,40}$/.test(hash)) return failed("无效的提交哈希");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["reset", `--${mode}`, hash], rootInfo.root, 30_000);
+    const labels = { soft: "软重置（保留暂存与工作区）", mixed: "重置（保留工作区改动）", hard: "硬重置（丢弃全部改动）" } as const;
+    return { ok: true, error: null, message: `已重置到 ${hash.slice(0, 8)}：${labels[mode]}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitRevert(run: GitRun, cwd: string, hash: string): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!/^[0-9a-fA-F]{4,40}$/.test(hash)) return failed("无效的提交哈希");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["revert", "--no-edit", hash], rootInfo.root, 60_000);
+    return { ok: true, error: null, message: `已还原提交 ${hash.slice(0, 8)}` };
+  } catch (err) {
+    return failed(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export async function gitBranchRename(
+  run: GitRun,
+  cwd: string,
+  name: string,
+  newName: string,
+): Promise<ActionResult> {
+  const failed = (error: string): ActionResult => ({ ok: false, error, message: null });
+  if (!isValidRefName(name) || !isValidRefName(newName)) return failed("无效的分支名");
+  const rootInfo = await gitRoot(run, cwd);
+  if ("error" in rootInfo) return failed(rootInfo.error);
+  try {
+    await runChecked(run, ["branch", "-m", name, newName], rootInfo.root, 15_000);
+    return { ok: true, error: null, message: `已重命名 ${name} → ${newName}` };
   } catch (err) {
     return failed(err instanceof Error ? err.message : String(err));
   }

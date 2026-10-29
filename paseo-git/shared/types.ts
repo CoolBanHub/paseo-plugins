@@ -34,6 +34,9 @@ export interface BranchEntry {
 
 export interface LocalBranchEntry extends BranchEntry {
   isCurrent: boolean;
+  /** Upstream tracking ref short name (e.g. "origin/main"); null when unset. */
+  upstream: string | null;
+  /** Commits the branch has/lacks against its upstream (null without one). */
   ahead: number | null;
   behind: number | null;
 }
@@ -124,4 +127,62 @@ export interface PathsResult extends RawError {
   dir: string;
   dirs: string[];
   files: string[];
+}
+
+/** One working-tree change row; a path staged AND modified twice yields two rows. */
+export interface ChangeEntry {
+  path: string;
+  oldPath: string | null;
+  /** Status letter: A/M/D/R/C/T for changes, U-family collapsed to "U". */
+  status: string;
+  staged: boolean;
+  untracked: boolean;
+  conflict: boolean;
+}
+
+export interface ChangesResult extends RawError {
+  entries: ChangeEntry[];
+}
+
+export interface DiffResult extends RawError {
+  /** Unified diff text, already trimmed to maxLines. */
+  text: string;
+  truncated: boolean;
+  binary: boolean;
+}
+
+export interface StashFile {
+  path: string;
+  status: string;
+}
+
+export interface StashEntry {
+  /** Position in `git stash list` order (0 = newest). */
+  index: number;
+  /** Ref selector, e.g. "stash@{0}". */
+  label: string;
+  subject: string;
+  date: string;
+  files: StashFile[];
+}
+
+export interface StashListResult extends RawError {
+  stashes: StashEntry[];
+}
+
+export type SequenceKind = "none" | "merge" | "rebase" | "cherryPick";
+
+/** Ongoing merge/rebase/cherry-pick state read from .git bookkeeping files. */
+export interface SequenceState extends RawError {
+  kind: SequenceKind;
+  /** Merge: the ref being merged; rebase: the branch being rebased. */
+  branch: string | null;
+  step: number | null;
+  total: number | null;
+  /** Unmerged paths while a sequence is in progress. */
+  conflicts: string[];
+}
+
+export interface RecentMessagesResult extends RawError {
+  messages: string[];
 }

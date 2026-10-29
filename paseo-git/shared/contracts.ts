@@ -23,9 +23,10 @@ const localBranch = z.object({
   subject: z.string(),
   date: isoDate,
   isCurrent: z.boolean(),
-  /** Commits the branch has that HEAD does not (null when equal to current branch). */
+  /** Upstream tracking ref short name; null when unset. */
+  upstream: z.string().nullable(),
+  /** Commits the branch has/lacks against its upstream (null without one). */
   ahead: z.number().int().nullable(),
-  /** Commits HEAD has that the branch does not. */
   behind: z.number().int().nullable(),
 });
 
@@ -296,10 +297,277 @@ export const gitPushRpc = defineRpc({
   input: repoInput.extend({
     /** Push -u origin <branch> after the user confirms an upstream-less branch. */
     setUpstream: z.boolean().default(false),
+    /** --force-with-lease after the user confirms. */
+    force: z.boolean().default(false),
   }),
   output: gitError.extend({
     message: z.string().nullable(),
     /** True when the push was refused only because the branch has no upstream. */
     needsUpstream: z.boolean().default(false),
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// working-tree changes, staging and commits
+// ---------------------------------------------------------------------------
+
+const repoPathInput = z.string().regex(/^([^\0]){1,2000}$/);
+
+export const gitChangesRpc = defineRpc({
+  name: "git.changes",
+  input: repoInput,
+  output: gitError.extend({
+    entries: z.array(
+      z.object({
+        path: z.string(),
+        oldPath: z.string().nullable(),
+        status: z.string(),
+        staged: z.boolean(),
+        untracked: z.boolean(),
+        conflict: z.boolean(),
+      }),
+    ),
+  }),
+});
+
+export const gitStageRpc = defineRpc({
+  name: "git.stage",
+  input: repoInput.extend({
+    /** Empty with all=false is a no-op the client should avoid. */
+    paths: z.array(repoPathInput).max(500).default([]),
+    /** Stage everything (git add -A), including untracked files. */
+    all: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitUnstageRpc = defineRpc({
+  name: "git.unstage",
+  input: repoInput.extend({
+    paths: z.array(repoPathInput).max(500).default([]),
+    /** Reset the whole index against HEAD. */
+    all: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitCommitCreateRpc = defineRpc({
+  name: "git.commit.create",
+  input: repoInput.extend({
+    message: z.string().min(1).max(20000),
+    /** Checked files only (IDEA-style commit scope); empty commits the index as-is. */
+    paths: z.array(repoPathInput).max(500).default([]),
+    amend: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitRecentMessagesRpc = defineRpc({
+  name: "git.recent.messages",
+  input: repoInput,
+  output: gitError.extend({
+    messages: z.array(z.string()).default([]),
+  }),
+});
+
+export const gitDiffRpc = defineRpc({
+  name: "git.diff",
+  input: repoInput.extend({
+    /** worktree: index↔worktree · staged: HEAD↔index · head: HEAD↔worktree · commit/stash need ref. */
+    mode: z.enum(["worktree", "staged", "head", "commit", "stash"]),
+    /** Commit hash for mode=commit; stash index for mode=stash. */
+    ref: z.string().default(""),
+    path: repoPathInput,
+    maxLines: z.number().int().min(50).max(20000).default(2000),
+  }),
+  output: gitError.extend({
+    text: z.string().default(""),
+    truncated: z.boolean().default(false),
+    binary: z.boolean().default(false),
+  }),
+});
+
+export const gitRollbackFileRpc = defineRpc({
+  name: "git.rollback.file",
+  input: repoInput.extend({
+    path: repoPathInput,
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// stash
+// ---------------------------------------------------------------------------
+
+export const gitStashListRpc = defineRpc({
+  name: "git.stash.list",
+  input: repoInput,
+  output: gitError.extend({
+    stashes: z.array(
+      z.object({
+        index: z.number().int(),
+        label: z.string(),
+        subject: z.string(),
+        date: z.string(),
+        files: z.array(z.object({ path: z.string(), status: z.string() })),
+      }),
+    ),
+  }),
+});
+
+export const gitStashPushRpc = defineRpc({
+  name: "git.stash.push",
+  input: repoInput.extend({
+    message: z.string().max(500).default(""),
+    /** Stash only these paths (staged+unstaged+untracked); empty stashes everything. */
+    paths: z.array(repoPathInput).max(500).default([]),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+    /** True when there was nothing to stash. */
+    empty: z.boolean().default(false),
+  }),
+});
+
+export const gitStashApplyRpc = defineRpc({
+  name: "git.stash.apply",
+  input: repoInput.extend({
+    index: z.number().int().min(0).max(1000),
+    /** Also drop the stash entry after applying (pop). */
+    drop: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitStashDropRpc = defineRpc({
+  name: "git.stash.drop",
+  input: repoInput.extend({
+    index: z.number().int().min(0).max(1000),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// merge / rebase / cherry-pick state machine
+// ---------------------------------------------------------------------------
+
+export const gitSequenceStateRpc = defineRpc({
+  name: "git.sequence.state",
+  input: repoInput,
+  output: gitError.extend({
+    kind: z.enum(["none", "merge", "rebase", "cherryPick"]).default("none"),
+    branch: z.string().nullable(),
+    step: z.number().int().nullable(),
+    total: z.number().int().nullable(),
+    conflicts: z.array(z.string()).default([]),
+  }),
+});
+
+export const gitMergeRpc = defineRpc({
+  name: "git.merge",
+  input: repoInput.extend({
+    ref: refName,
+    /** --no-ff: always create a merge commit. */
+    noFf: z.boolean().default(false),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+    /** True when the merge paused on conflicts instead of failing outright. */
+    conflicts: z.boolean().default(false),
+  }),
+});
+
+export const gitRebaseRpc = defineRpc({
+  name: "git.rebase",
+  input: repoInput.extend({
+    /** Rebase the current branch onto this ref. */
+    ref: refName,
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+    conflicts: z.boolean().default(false),
+  }),
+});
+
+export const gitCherryPickRpc = defineRpc({
+  name: "git.cherry-pick",
+  input: repoInput.extend({
+    hashes: z.array(z.string().regex(/^[0-9a-fA-F]{4,40}$/)).min(1).max(100),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+    conflicts: z.boolean().default(false),
+  }),
+});
+
+export const gitSequenceActionRpc = defineRpc({
+  name: "git.sequence.action",
+  input: repoInput.extend({
+    sequence: z.enum(["merge", "rebase", "cherryPick"]),
+    action: z.enum(["continue", "skip", "abort"]),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitConflictResolveRpc = defineRpc({
+  name: "git.conflict.resolve",
+  input: repoInput.extend({
+    path: repoPathInput,
+    take: z.enum(["ours", "theirs"]),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// history rewriting actions
+// ---------------------------------------------------------------------------
+
+const commitHash = z.string().regex(/^[0-9a-fA-F]{4,40}$/);
+
+export const gitResetRpc = defineRpc({
+  name: "git.reset",
+  input: repoInput.extend({
+    hash: commitHash,
+    mode: z.enum(["soft", "mixed", "hard"]),
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitRevertRpc = defineRpc({
+  name: "git.revert",
+  input: repoInput.extend({
+    hash: commitHash,
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
+  }),
+});
+
+export const gitBranchRenameRpc = defineRpc({
+  name: "git.branch.rename",
+  input: repoInput.extend({
+    name: refName,
+    newName: refName,
+  }),
+  output: gitError.extend({
+    message: z.string().nullable(),
   }),
 });
