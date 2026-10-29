@@ -66,6 +66,8 @@ const AUTO_REFRESH_MS = 45_000;
 const NARROW_WIDTH = 640;
 /** Below this the commit list also drops the author column. */
 const MEDIUM_WIDTH = 860;
+/** Below this the working-tree tab stacks files above the message area. */
+const STACK_WIDTH = 760;
 
 export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelProps) {
   const directory = useWorkspace(workspaceId, (workspace) => workspace.directory);
@@ -646,7 +648,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
             <CommitPanel
               theme={theme}
               repoPath={directory}
-              compact={layout.compact}
+              compact={layout.compact || (panelWidth > 0 && panelWidth < STACK_WIDTH)}
               refreshKey={commitRefreshKey}
               onMutated={() => void refresh({ quiet: true })}
               onCommitAndPush={() => void onPush(false)}

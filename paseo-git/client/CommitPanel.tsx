@@ -352,14 +352,16 @@ export function CommitPanel({
     <View style={{ flex: 1, flexDirection: compact ? "column" : "row", backgroundColor: theme.colors.surface0, minWidth: 0 }}>
       {/* File list */}
       <View style={{ flex: compact ? 1 : 2, minWidth: 0, borderRightWidth: compact ? 0 : 1, borderRightColor: theme.colors.border, borderBottomWidth: compact ? 1 : 0, borderBottomColor: theme.colors.border }}>
-        {/* Sub-tab + toolbar */}
+        {/* Sub-tab + toolbar — wraps instead of overflowing on narrow panels */}
         <View
           style={{
             flexDirection: "row",
+            flexWrap: "wrap",
             alignItems: "center",
-            gap: 4,
+            columnGap: 4,
+            rowGap: 2,
             paddingHorizontal: 6,
-            height: 30,
+            paddingVertical: 3,
             borderBottomWidth: 1,
             borderBottomColor: theme.colors.border,
           }}
@@ -495,8 +497,19 @@ export function CommitPanel({
         )}
       </View>
 
-      {/* Message area */}
-      <View style={{ flex: compact ? 0 : 1, minWidth: compact ? undefined : 260, maxWidth: compact ? undefined : 340, padding: 8, gap: 8, justifyContent: "flex-start" }}>
+      {/* Message area: side column when wide, compact footer when stacked. */}
+      <View
+        style={{
+          flex: compact ? 0 : 1,
+          flexShrink: compact ? 0 : undefined,
+          minWidth: compact ? undefined : 260,
+          maxWidth: compact ? undefined : 340,
+          padding: 8,
+          gap: compact ? 6 : 8,
+          justifyContent: "flex-start",
+          backgroundColor: compact ? theme.colors.surface1 : "transparent",
+        }}
+      >
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <HoverPressable
             accessibilityRole="button"
@@ -571,7 +584,8 @@ export function CommitPanel({
             borderColor: theme.colors.border,
             paddingHorizontal: 8,
             paddingVertical: 6,
-            minHeight: 96,
+            minHeight: compact ? 56 : 96,
+            maxHeight: compact ? 120 : undefined,
             textAlignVertical: "top",
             flex: compact ? 0 : undefined,
           }}

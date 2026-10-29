@@ -145,10 +145,21 @@ export function DiffView({
                 overflow: "hidden",
               }}
             >
+              {/* Vertical scroll outside, horizontal scroll inside: long code
+                  lines keep their natural width and can be swiped, instead of
+                  being cut off at the dialog edge. */}
               <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 8 }}>
-                {lines.map((line, index) => (
-                  <DiffRow key={index} line={line} theme={theme} />
-                ))}
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={{ minWidth: "100%", alignItems: "flex-start" }}
+                >
+                  <View>
+                    {lines.map((line, index) => (
+                      <DiffRow key={index} line={line} theme={theme} />
+                    ))}
+                  </View>
+                </ScrollView>
                 {result.truncated ? (
                   <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingVertical: 8, textAlign: "center" }}>
                     差异过长，已截断显示
@@ -169,6 +180,7 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
       <Text
         numberOfLines={1}
         style={{
+          alignSelf: "stretch",
           color: theme.colors.foregroundMuted,
           fontSize: 10,
           fontFamily: MONO_FONT,
@@ -192,7 +204,7 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
   const tint =
     line.kind === "add" ? "#7fb069" : line.kind === "del" ? "#d1675a" : theme.colors.foreground;
   return (
-    <View style={{ flexDirection: "row", backgroundColor: background }}>
+    <View style={{ flexDirection: "row", alignSelf: "flex-start", backgroundColor: background }}>
       <Text style={{ width: 44, textAlign: "right", paddingRight: 6, color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT, opacity: 0.7 }}>
         {oldNo}
       </Text>
@@ -201,7 +213,7 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
       </Text>
       <Text
         numberOfLines={1}
-        style={{ color: tint, fontSize: 10.5, fontFamily: MONO_FONT, flex: 1, paddingRight: 8 }}
+        style={{ color: tint, fontSize: 10.5, fontFamily: MONO_FONT, flexShrink: 0, paddingRight: 8 }}
       >
         {line.kind === "add" ? "+ " : line.kind === "del" ? "- " : "  "}
         {line.text}
