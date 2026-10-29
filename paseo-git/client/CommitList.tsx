@@ -349,6 +349,7 @@ export function CommitList({
   onLoadMore,
   totalCount,
   actions,
+  widthMode = "full",
 }: {
   theme: PanelTheme;
   commits: CommitSummary[];
@@ -360,12 +361,20 @@ export function CommitList({
   onLoadMore: () => void;
   totalCount: number;
   actions: CommitActions;
+  /** Narrow panels drop the author (medium) and time (narrow) columns to keep
+   *  the message readable; explicit column toggles only apply when full. */
+  widthMode?: "full" | "medium" | "narrow";
 }) {
   const graph = useMemo(() => computeGraph(commits), [commits]);
   const width = graphWidth(graph.laneCount);
   const [colWidths, setColWidths] = useState<ColumnWidths>({ time: 82, hash: 54, author: 96 });
-  const [showColumns, setShowColumns] = useState({ time: true, hash: true, author: true });
+  const [columnToggles, setColumnToggles] = useState({ time: true, hash: true, author: true });
   const [columnsMenu, setColumnsMenu] = useState(false);
+  const showColumns = {
+    time: widthMode === "full" ? columnToggles.time : widthMode === "medium",
+    hash: columnToggles.hash,
+    author: widthMode === "full" ? columnToggles.author : false,
+  };
 
   if (loading && commits.length === 0) {
     return (
@@ -389,9 +398,9 @@ export function CommitList({
 
   const knownHashes = new Set(commits.map((commit) => commit.hash));
   const columnItems: MenuItem[] = [
-    { key: "time", label: "提交时间", icon: "Clock", onPress: () => setShowColumns((s) => ({ ...s, time: !s.time })) },
-    { key: "hash", label: "提交哈希", icon: "Hash", onPress: () => setShowColumns((s) => ({ ...s, hash: !s.hash })) },
-    { key: "author", label: "作者", icon: "User", onPress: () => setShowColumns((s) => ({ ...s, author: !s.author })) },
+    { key: "time", label: "时间", icon: "Clock", disabled: widthMode !== "full", onPress: () => setColumnToggles((s) => ({ ...s, time: !s.time })) },
+    { key: "hash", label: "哈希", icon: "Hash", onPress: () => setColumnToggles((s) => ({ ...s, hash: !s.hash })) },
+    { key: "author", label: "作者", icon: "User", disabled: widthMode !== "full", onPress: () => setColumnToggles((s) => ({ ...s, author: !s.author })) },
   ];
 
   return (
@@ -411,7 +420,7 @@ export function CommitList({
         <View style={{ width }} />
         {showColumns.time ? (
           <View style={{ flexDirection: "row", alignItems: "center" }}>
-            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9, width: colWidths.time }}>提交时间</Text>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9, width: colWidths.time }}>时间</Text>
             <ColumnResizeHandle
               theme={theme}
               width={colWidths.time}
@@ -422,7 +431,7 @@ export function CommitList({
         ) : null}
         {showColumns.hash ? (
           <View style={{ flexDirection: "row", alignItems: "center" }}>
-            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9, width: colWidths.hash }}>提交</Text>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9, width: colWidths.hash }}>哈希</Text>
             <ColumnResizeHandle
               theme={theme}
               width={colWidths.hash}

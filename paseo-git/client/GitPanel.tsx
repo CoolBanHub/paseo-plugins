@@ -62,6 +62,10 @@ import type {
 
 const PAGE_SIZE = 300;
 const AUTO_REFRESH_MS = 45_000;
+/** Below this the branch pane folds into a modal and filters scroll horizontally. */
+const NARROW_WIDTH = 640;
+/** Below this the commit list also drops the author column. */
+const MEDIUM_WIDTH = 860;
 
 export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelProps) {
   const directory = useWorkspace(workspaceId, (workspace) => workspace.directory);
@@ -93,6 +97,10 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   const revertRpc = useRpc(gitRevertRpc);
 
   const [mainTab, setMainTab] = useState<"log" | "changes">("log");
+  const [panelWidth, setPanelWidth] = useState(0);
+  const [panelHeight, setPanelHeight] = useState(0);
+  /** Commit-details share of the panel height, drag-resizable on its top edge. */
+  const [detailPct, setDetailPct] = useState(42);
   const [status, setStatus] = useState<StatusResult | null>(null);
   const [branches, setBranches] = useState<BranchesResult | null>(null);
   const [tags, setTags] = useState<TagsResult | null>(null);
@@ -547,6 +555,10 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   const loading = status === null && directory !== null;
   const dirtyCount = status?.ok ? status.staged + status.unstaged + status.untracked : 0;
   const sequenceActive = sequence?.ok === true && sequence.kind !== "none" ? sequence : null;
+  const narrow = panelWidth > 0 && panelWidth < NARROW_WIDTH;
+  const widthMode: "full" | "medium" | "narrow" =
+    panelWidth === 0 || panelWidth >= MEDIUM_WIDTH ? "full" : panelWidth >= NARROW_WIDTH ? "medium" : "narrow";
+  const branchesInModal = layout.compact || narrow;
 
   const branchPane = directory ? (
     <BranchPane
@@ -579,7 +591,14 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
   ) : null;
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.surface0, minWidth: 0 }}>
+    <View
+      style={{ flex: 1, backgroundColor: theme.colors.surface0, minWidth: 0 }}
+      onLayout={(event) => {
+        const { width, height } = event.nativeEvent.layout;
+        setPanelWidth(width);
+        setPanelHeight(height);
+      }}
+    >
       {/* Top tabs: log / working tree */}
       <View
         style={{
@@ -612,7 +631,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
       </View>
 
       <View style={{ flex: 1, flexDirection: "row", minWidth: 0 }}>
-        {layout.compact ? (
+        {branchesInModal ? (
           <Modal open={showBranchesModal} onOpenChange={setShowBranchesModal} title="分支" icon={<Icon name="GitBranch" size={16} color={theme.colors.accent} />}>
             <Modal.Content scrollable={false} style={{ flex: 1 }}>
               {branchPane}
@@ -636,104 +655,117 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
             <EmptyState theme={theme} directory={directory ?? ""} />
           ) : (
             <>
-              {/* Toolbar — filters sit inline, like IDEA's Git Log filter bar */}
+              {/* Toolbar — filters sit inline, like IDEA's Git Log filter bar.
+                  Narrow panels keep them on one horizontally scrollable row
+                  instead of wrapping into a second line. */}
               <View
                 style={{
                   flexDirection: "row",
-                  flexWrap: "wrap",
                   alignItems: "center",
-                  columnGap: 6,
-                  rowGap: 4,
                   paddingHorizontal: 8,
                   paddingVertical: 5,
                   borderBottomWidth: 1,
                   borderBottomColor: theme.colors.border,
                 }}
               >
-                {layout.compact ? (
-                  <HoverPressable
-                    accessibilityRole="button"
-                    accessibilityLabel="查看分支"
-                    onPress={() => setShowBranchesModal(true)}
-                    style={({ hovered }) => ({
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={{ flex: 1, minWidth: 0 }}
+                  contentContainerStyle={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    columnGap: 6,
+                    flexGrow: 1,
+                  }}
+                >
+                  {branchesInModal ? (
+                    <HoverPressable
+                      accessibilityRole="button"
+                      accessibilityLabel="查看分支"
+                      onPress={() => setShowBranchesModal(true)}
+                      style={({ hovered }) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 4,
+                        paddingHorizontal: 8,
+                        paddingVertical: 4,
+                        borderRadius: 6,
+                        borderWidth: 1,
+                        borderColor: theme.colors.border,
+                        backgroundColor: hovered ? theme.colors.surface1 : "transparent",
+                      })}
+                    >
+                      <Icon name="GitBranch" size={12} color={theme.colors.accent} />
+                      <Text style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }} numberOfLines={1}>
+                        {status?.currentBranch ?? (status?.detached ? "分离头指针" : "…")}
+                      </Text>
+                    </HoverPressable>
+                  ) : null}
+
+                  <BranchScopeDropdown
+                    theme={theme}
+                    branches={branches}
+                    tags={tags}
+                    status={status}
+                    scope={scope}
+                    onChange={(ref) => setScope(ref)}
+                  />
+
+                  <AuthorDropdown
+                    theme={theme}
+                    authors={authors}
+                    value={authorFilter}
+                    onChange={(value) => setAuthorFilter(value === authorFilter ? "" : value)}
+                  />
+
+                  <DateRangeDropdown theme={theme} from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+
+                  <PathDropdown theme={theme} repoPath={directory} value={pathFilter} onChange={setPathFilter} />
+
+                  <View
+                    style={{
                       flexDirection: "row",
                       alignItems: "center",
                       gap: 4,
-                      paddingHorizontal: 8,
-                      paddingVertical: 4,
-                      borderRadius: 6,
                       borderWidth: 1,
                       borderColor: theme.colors.border,
-                      backgroundColor: hovered ? theme.colors.surface1 : "transparent",
-                    })}
-                  >
-                    <Icon name="GitBranch" size={12} color={theme.colors.accent} />
-                    <Text style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }} numberOfLines={1}>
-                      {status?.currentBranch ?? (status?.detached ? "分离头指针" : "…")}
-                    </Text>
-                  </HoverPressable>
-                ) : null}
-
-                <BranchScopeDropdown
-                  theme={theme}
-                  branches={branches}
-                  tags={tags}
-                  status={status}
-                  scope={scope}
-                  onChange={(ref) => setScope(ref)}
-                />
-
-                <AuthorDropdown
-                  theme={theme}
-                  authors={authors}
-                  value={authorFilter}
-                  onChange={(value) => setAuthorFilter(value === authorFilter ? "" : value)}
-                />
-
-                <DateRangeDropdown theme={theme} from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
-
-                <PathDropdown theme={theme} repoPath={directory} value={pathFilter} onChange={setPathFilter} />
-
-                <View
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 4,
-                    borderWidth: 1,
-                    borderColor: theme.colors.border,
-                    borderRadius: 6,
-                    paddingHorizontal: 6,
-                    paddingVertical: 4,
-                    backgroundColor: theme.colors.surface1,
-                    flex: 1,
-                    minWidth: 130,
-                    maxWidth: 230,
-                  }}
-                >
-                  <Icon name="Search" size={11} color={theme.colors.foregroundMuted} />
-                  <TextInput
-                    value={search}
-                    onChangeText={setSearch}
-                    placeholder="搜索提交 / 作者 / 哈希…"
-                    placeholderTextColor={theme.colors.foregroundMuted}
-                    style={{
-                      color: theme.colors.foreground,
-                      fontSize: 11,
-                      paddingVertical: 1,
-                      flex: 1,
-                      minWidth: 0,
+                      borderRadius: 6,
+                      paddingHorizontal: 6,
+                      paddingVertical: 4,
+                      backgroundColor: theme.colors.surface1,
+                      minWidth: 130,
+                      maxWidth: 230,
                     }}
-                  />
-                </View>
+                  >
+                    <Icon name="Search" size={11} color={theme.colors.foregroundMuted} />
+                    <TextInput
+                      value={search}
+                      onChangeText={setSearch}
+                      placeholder="搜索提交 / 作者 / 哈希…"
+                      placeholderTextColor={theme.colors.foregroundMuted}
+                      style={{
+                        color: theme.colors.foreground,
+                        fontSize: 11,
+                        paddingVertical: 1,
+                        width: narrow ? 110 : undefined,
+                        minWidth: 0,
+                      }}
+                    />
+                  </View>
+                </ScrollView>
 
-                <View style={{ marginLeft: "auto", minWidth: 20, alignItems: "center" }}>
+                <View style={{ minWidth: 20, alignItems: "center", marginLeft: 4 }}>
                   {busy !== null ? <ActivityIndicator size="small" color={theme.colors.foregroundMuted} /> : null}
                 </View>
               </View>
 
               {/* Main area */}
               <View style={{ flex: 1, flexDirection: "column", minWidth: 0 }}>
-                <ScrollView style={{ flex: 1 }} contentContainerStyle={{ minWidth: 560 }}>
+                <ScrollView
+                  style={{ flex: 1 }}
+                  contentContainerStyle={narrow ? undefined : { minWidth: 560 }}
+                >
                   <CommitList
                     theme={theme}
                     commits={visibleCommits}
@@ -745,6 +777,7 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
                     onLoadMore={onLoadMore}
                     totalCount={log?.ok ? log.commits.length : 0}
                     actions={commitActions}
+                    widthMode={widthMode}
                   />
                 </ScrollView>
                 {selectedHash ? (
@@ -754,6 +787,9 @@ export function GitPanel({ theme, workspaceId, layout }: PluginWorkspacePanelPro
                     loading={detailLoading}
                     onClose={() => setSelectedHash(null)}
                     repoPath={directory}
+                    heightPct={detailPct}
+                    panelHeight={panelHeight}
+                    onHeightPct={setDetailPct}
                   />
                 ) : null}
               </View>

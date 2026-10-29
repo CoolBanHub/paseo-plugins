@@ -1,11 +1,11 @@
-import { useMemo, useState } from "react";
-import { ActivityIndicator, Text, View } from "react-native";
+import { useMemo, useRef, useState } from "react";
+import { ActivityIndicator, PanResponder, Text, View } from "react-native";
 import { Icon, copyText, ScrollView } from "@getpaseo/plugin/client/react-native";
-import { statusColorOf } from "./colors";
+import { mixWithBackground, statusColorOf } from "./colors";
 import { DiffView, type DiffRequest } from "./DiffView";
 import { formatFullTime, formatRelativeTime } from "./format";
 import { buildDirTree, type TreeDir } from "./filetree";
-import { HoverPressable, MetaRow, MONO_FONT, StatText, type PanelTheme } from "./parts";
+import { HoverPressable, MONO_FONT, StatText, type PanelTheme } from "./parts";
 import type { CommitDetail, CommitFile } from "../shared/types";
 
 function ScrollViewFlex({ children }: { children: React.ReactNode }) {
@@ -18,26 +18,70 @@ export function CommitDetails({
   loading,
   onClose,
   repoPath,
+  heightPct = 42,
+  panelHeight = 0,
+  onHeightPct,
 }: {
   theme: PanelTheme;
   detail: CommitDetail | null;
   loading: boolean;
   onClose: () => void;
   repoPath: string | null;
+  /** Share of the panel height; drag the top edge to change it. */
+  heightPct?: number;
+  panelHeight?: number;
+  onHeightPct?: (pct: number) => void;
 }) {
   const [diffRequest, setDiffRequest] = useState<DiffRequest | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
 
+  // Drag handle on the top edge: dragging up grows the details pane.
+  const pctRef = useRef(heightPct);
+  pctRef.current = heightPct;
+  const dragStartRef = useRef({ pct: heightPct, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const [pan] = useState(() =>
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (_event, gesture) => {
+        dragStartRef.current = { pct: pctRef.current, y: gesture.y0 };
+        setDragging(true);
+      },
+      onPanResponderMove: (_event, gesture) => {
+        if (!onHeightPct || panelHeight <= 0) return;
+        // Moving up (negative dy) increases the pane share.
+        const startPx = (dragStartRef.current.pct / 100) * panelHeight;
+        const pct = ((startPx - (dragStartRef.current.y + gesture.dy)) / panelHeight) * 100;
+        onHeightPct(Math.max(22, Math.min(72, pct)));
+      },
+      onPanResponderRelease: () => setDragging(false),
+      onPanResponderTerminate: () => setDragging(false),
+    }),
+  );
+
   return (
     <View
       style={{
-        height: "42%",
-        minHeight: 140,
+        height: `${heightPct}%`,
+        minHeight: 130,
         borderTopWidth: 1,
         borderTopColor: theme.colors.border,
         backgroundColor: theme.colors.surface0,
       }}
     >
+      {onHeightPct ? (
+        <View {...pan.panHandlers} style={{ height: 7, justifyContent: "center", alignItems: "center" }}>
+          <View
+            style={{
+              width: 36,
+              height: 3,
+              borderRadius: 2,
+              backgroundColor: dragging ? theme.colors.accent : theme.colors.border,
+            }}
+          />
+        </View>
+      ) : null}
       <View
         style={{
           flexDirection: "row",
@@ -203,34 +247,62 @@ function DetailBody({
   return (
     <ScrollViewFlex>
       <View style={{ padding: 10, gap: 8 }}>
+        {/* Compact identity block: hash + parents on one line, author and
+            dates on the next; saves three rows versus the label/value list. */}
         <View style={{ gap: 4 }}>
-          <MetaRow label="哈希" theme={theme}>
-            <Text selectable style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <View
+              style={{
+                borderRadius: 4,
+                backgroundColor: mixWithBackground(theme.colors.accent, theme.colors.surface0, 0.82),
+                paddingHorizontal: 5,
+                paddingVertical: 1,
+              }}
+            >
+              <Text style={{ color: theme.colors.accent, fontSize: 10, fontFamily: MONO_FONT, fontWeight: "700" }}>
+                {detail.shortHash}
+              </Text>
+            </View>
+            <Text
+              selectable
+              numberOfLines={1}
+              style={{ color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT, flexShrink: 1 }}
+            >
               {detail.hash}
             </Text>
-          </MetaRow>
-          <MetaRow label="父提交" theme={theme}>
-            <Text style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }}>
-              {detail.parents.length > 0 ? detail.parents.map((parent) => parent.slice(0, 9)).join("  ") : "（根提交）"}
+            <HoverPressable
+              accessibilityRole="button"
+              accessibilityLabel="复制完整哈希"
+              onPress={() => {
+                void copyText(detail.hash).catch(() => undefined);
+              }}
+              style={({ hovered }) => ({
+                paddingHorizontal: 4,
+                paddingVertical: 1,
+                borderRadius: 4,
+                backgroundColor: hovered ? theme.colors.surface2 : "transparent",
+              })}
+            >
+              <Icon name="Copy" size={11} color={theme.colors.foregroundMuted} />
+            </HoverPressable>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT }}>
+              父 {detail.parents.length > 0 ? detail.parents.map((parent) => parent.slice(0, 8)).join(" ") : "（根提交）"}
             </Text>
-          </MetaRow>
-          <MetaRow label="作者" theme={theme}>
-            <Text style={{ color: theme.colors.foreground, fontSize: 11 }}>
-              {detail.authorName}{" "}
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>&lt;{detail.authorEmail}&gt;</Text>
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 10.5, flexShrink: 1 }}>
+              {detail.authorName}
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}> &lt;{detail.authorEmail}&gt;</Text>
             </Text>
-          </MetaRow>
-          <MetaRow label="作者时间" theme={theme}>
-            <Text style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }}>
-              {formatFullTime(detail.authorDate)}
-              <Text style={{ color: theme.colors.foregroundMuted }}>（{formatRelativeTime(detail.authorDate)}）</Text>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT }}>
+              {formatFullTime(detail.authorDate)}（{formatRelativeTime(detail.authorDate)}）
             </Text>
-          </MetaRow>
-          <MetaRow label="提交时间" theme={theme}>
-            <Text style={{ color: theme.colors.foreground, fontSize: 11, fontFamily: MONO_FONT }}>
-              {formatFullTime(detail.committerDate)}
-            </Text>
-          </MetaRow>
+            {detail.committerDate !== detail.authorDate ? (
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT }}>
+                提交于 {formatFullTime(detail.committerDate)}
+              </Text>
+            ) : null}
+          </View>
         </View>
 
         {detail.body.length > 0 ? (
