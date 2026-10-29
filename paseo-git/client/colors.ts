@@ -1,14 +1,44 @@
-/** Fixed palette shared by the graph lanes and author chips; medium tones that stay readable on light and dark hosts. */
+/**
+ * Palette shared by graph lanes, ref badges and file-status colors. Lane
+ * colors follow the IntelliJ IDEA commit graph; file statuses mirror the
+ * JetBrains VCS colors. All are medium tones readable on light and dark hosts.
+ */
 export const LANE_COLORS = [
-  "#4f8ef7",
-  "#e06c75",
-  "#98c379",
+  "#3a8ee6",
+  "#c75450",
+  "#59a869",
   "#e5c07b",
-  "#c678dd",
+  "#b07cd8",
+  "#2aa198",
+  "#d19a66",
   "#56b6c2",
-  "#ec8ed0",
-  "#7f96c8",
 ] as const;
+
+/** JetBrains-style file status colors (added/modified/deleted/renamed/conflict). */
+export const STATUS_COLORS = {
+  added: "#6a8759",
+  modified: "#6897bb",
+  deleted: "#6c6c6c",
+  renamed: "#b9b462",
+  conflict: "#d1675a",
+} as const;
+
+/** Ref badge colors, IDEA Git Log style: local green, remote purple, tag gold, HEAD red. */
+export const REF_COLORS = {
+  local: "#59a869",
+  remote: "#b07cd8",
+  tag: "#e5c07b",
+  head: "#c75450",
+} as const;
+
+/** Status letter → color kind (A/? → added, M/T → modified, R/C → renamed, U-family → conflict). */
+export function statusColorOf(status: string): string {
+  if (status.startsWith("A") || status.startsWith("?")) return STATUS_COLORS.added;
+  if (status.startsWith("D")) return STATUS_COLORS.deleted;
+  if (status.startsWith("R") || status.startsWith("C")) return STATUS_COLORS.renamed;
+  if (status.startsWith("U") || status.length === 2) return STATUS_COLORS.conflict;
+  return STATUS_COLORS.modified;
+}
 
 export function laneColor(lane: number): string {
   return LANE_COLORS[((lane % LANE_COLORS.length) + LANE_COLORS.length) % LANE_COLORS.length];

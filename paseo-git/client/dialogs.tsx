@@ -226,23 +226,26 @@ export function BranchCreateDialog({
   theme,
   open,
   onOpenChange,
+  defaultStartPoint = "HEAD",
   onCreate,
 }: {
   theme: PanelTheme;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Pre-filled start point (e.g. a commit picked from the log menu). */
+  defaultStartPoint?: string;
   onCreate: (name: string, startPoint: string, checkout: boolean) => void;
 }) {
   const [name, setName] = useState("");
-  const [startPoint, setStartPoint] = useState("HEAD");
+  const [startPoint, setStartPoint] = useState(defaultStartPoint);
   const [checkout, setCheckout] = useState(true);
   useEffect(() => {
     if (open) {
       setName("");
-      setStartPoint("HEAD");
+      setStartPoint(defaultStartPoint);
       setCheckout(true);
     }
-  }, [open]);
+  }, [open, defaultStartPoint]);
 
   const trimmed = name.trim();
   const ready = trimmed.length > 0 && !trimmed.startsWith("-");
@@ -402,6 +405,80 @@ export function TagCreateDialog({
               onPress={() => {
                 onOpenChange(false);
                 onCreate(trimmed, ref.trim() || "HEAD", message.trim());
+              }}
+            />
+          </DialogFooter>
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// text input (rename etc.)
+// ---------------------------------------------------------------------------
+
+export function TextInputDialog({
+  theme,
+  open,
+  onOpenChange,
+  title,
+  icon = "PenLine",
+  label,
+  initial,
+  placeholder,
+  hint,
+  confirmLabel = "确定",
+  onConfirm,
+}: {
+  theme: PanelTheme;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  icon?: string;
+  label: string;
+  initial: string;
+  placeholder?: string;
+  hint?: string;
+  confirmLabel?: string;
+  onConfirm: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initial);
+  useEffect(() => {
+    if (open) setValue(initial);
+  }, [open, initial]);
+
+  const trimmed = value.trim();
+  const ready = trimmed.length > 0 && !trimmed.startsWith("-");
+
+  return (
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      title={title}
+      icon={<Icon name={icon} size={16} color={theme.colors.accent} />}
+    >
+      <Modal.Content scrollable={false}>
+        <View style={{ paddingVertical: 6, gap: 10, width: dialogWidth(380) }}>
+          <Field theme={theme} label={label} hint={hint}>
+            <TextInput
+              value={value}
+              onChangeText={setValue}
+              placeholder={placeholder}
+              placeholderTextColor={theme.colors.foregroundMuted}
+              autoFocus
+              style={inputStyle(theme)}
+            />
+          </Field>
+          <DialogFooter theme={theme}>
+            <DialogButton theme={theme} label="取消" kind="ghost" onPress={() => onOpenChange(false)} />
+            <DialogButton
+              theme={theme}
+              label={confirmLabel}
+              disabled={!ready}
+              onPress={() => {
+                onOpenChange(false);
+                onConfirm(trimmed);
               }}
             />
           </DialogFooter>

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { computeGraph } from "../client/graph.ts";
+import { ROW_H, computeGraph, laneX, rowSegments } from "../client/graph.ts";
 
 test("线性历史只有一条车道", () => {
   const commits = [
@@ -105,4 +105,45 @@ test("first-parent 已在别的车道时并线而不重复", () => {
   assert.equal(c2?.nodeLane, 0);
   assert.deepEqual(c2?.bottomLanes, []);
   assert.equal(graph.laneCount, 2);
+});
+
+test("rowSegments 生成 IDEA 折线：竖线段 + 底部斜线段", () => {
+  const commits = [
+    { hash: "m", parents: ["c2", "f"] },
+    { hash: "f", parents: ["c1"] },
+    { hash: "c2", parents: ["c1"] },
+    { hash: "c1", parents: [] },
+  ];
+  const graph = computeGraph(commits);
+  const [mergeRow] = graph.rows;
+
+  // 合并节点：新车道，0→0 竖线从中心开始；0→1 斜线 = 竖线 stub + 斜线
+  const merge = rowSegments(mergeRow!);
+  const straight = merge.verticals.find((v) => v.lane === 0 && v.top === ROW_H / 2);
+  assert.ok(straight, "首父直连竖线从行中心开始");
+  assert.equal(straight?.height, ROW_H / 2);
+
+  const diagonal = merge.diagonals.find((d) => d.fromLane === 0 && d.toLane === 1);
+  assert.ok(diagonal, "合并边有斜线段");
+  assert.equal(diagonal?.toY, ROW_H, "斜线落到行底");
+  assert.equal(diagonal?.fromY, ROW_H - Math.abs(laneX(1) - laneX(0)), "相邻车道斜线高度 = 车道间距");
+
+  // 斜线前有竖线 stub（从中心到斜线起点）
+  const stub = merge.verticals.find((v) => v.lane === 0 && v.top === ROW_H / 2 && v.height === diagonal!.fromY - ROW_H / 2);
+  assert.ok(stub, "斜线起点前有竖线段");
+});
+
+test("rowSegments 直连边在非新车道从行顶贯穿", () => {
+  const commits = [
+    { hash: "c3", parents: ["c2"] },
+    { hash: "c2", parents: ["c1"] },
+    { hash: "c1", parents: [] },
+  ];
+  const graph = computeGraph(commits);
+  const [, second] = graph.rows;
+  const segments = rowSegments(second!);
+  const through = segments.verticals.find((v) => v.lane === 0 && v.top === 0);
+  assert.ok(through, "非新车道从行顶贯穿");
+  assert.equal(through?.height, ROW_H);
+  assert.equal(segments.diagonals.length, 0, "线性历史没有斜线");
 });
