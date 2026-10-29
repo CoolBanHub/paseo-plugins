@@ -72,3 +72,10 @@ test("a colliding id the person added themselves stays theirs", async () => {
   await syncClaudeModels(api, [model("cm:glm-4.6", "GLM-4.6", "GLM")]);
   assert.deepEqual(state.providers.claude!.additionalModels, [{ id: "cm:glm-4.6", label: "占位", description: "手动加的" }]);
 });
+
+test("the same vendor id scoped to two providers keeps both entries", async () => {
+  const { api, state, patches } = fakePaseo({ providers: {} });
+  await syncClaudeModels(api, [model("cm:a/shared-model", "Shared A", "A"), model("cm:b/shared-model", "Shared B", "B")]);
+  assert.deepEqual(state.providers.claude!.additionalModels!.map((entry) => entry.id), ["cm:a/shared-model", "cm:b/shared-model"]);
+  assert.equal(patches.length, 1);
+});

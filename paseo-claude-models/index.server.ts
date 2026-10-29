@@ -149,7 +149,7 @@ export default function contribute(server: PluginServerContext) {
       return { ...plain, env: claudeSessionEnv({
         address: route.address,
         capability: route.capability,
-        models: sessionModels(provider.models),
+        models: sessionModels(provider),
         preferred: model,
         providerEnv: resolveProviderEnv(provider.env, apiKey),
         aliases: provider.aliasOverrides,

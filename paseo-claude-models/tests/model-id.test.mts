@@ -1,14 +1,25 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isMenuModel, isOwnModelEntry, isWindowVariant, menuModelId, modelIdPattern, ownModelDescription, vendorModelId } from "../shared/model-id.ts";
+import { isMenuModel, isOwnModelEntry, isWindowVariant, menuModelId, modelIdPattern, ownModelDescription, parseMenuModelId, vendorModelId } from "../shared/model-id.ts";
 
 test("menu ids carry the prefix both ways", () => {
-  assert.equal(menuModelId("glm-4.6"), "cm:glm-4.6");
-  assert.equal(vendorModelId("cm:glm-4.6"), "glm-4.6");
+  assert.equal(menuModelId("glm", "glm-4.6"), "cm:glm/glm-4.6");
+  assert.equal(vendorModelId(parseMenuModelId("cm:glm/glm-4.6").remainder), "glm-4.6");
   assert.equal(vendorModelId("claude-sonnet-4"), "claude-sonnet-4");
-  assert.equal(isMenuModel("cm:glm-4.6"), true);
+  assert.equal(isMenuModel("cm:glm/glm-4.6"), true);
   assert.equal(isMenuModel("glm-4.6"), false);
   assert.equal(isMenuModel(undefined), false);
+});
+
+test("scoped ids split at the first slash, gateway ids keep theirs", () => {
+  assert.deepEqual(parseMenuModelId("cm:glm/glm-4.6"), { scope: "glm", remainder: "glm-4.6", whole: "glm/glm-4.6" });
+  assert.deepEqual(parseMenuModelId("cm:gw/openai/gpt-4o"), { scope: "gw", remainder: "openai/gpt-4o", whole: "gw/openai/gpt-4o" });
+  // The "[1m]" switch stays with the vendor id; a scope-less id has no scope.
+  assert.equal(parseMenuModelId("cm:glm/glm-5.3[1m]").remainder, "glm-5.3[1m]");
+  assert.deepEqual(parseMenuModelId("cm:glm-4.6"), { scope: null, remainder: "glm-4.6", whole: "glm-4.6" });
+  // A vendor id alone parses as itself; the round trip reaches the vendor bare.
+  assert.deepEqual(parseMenuModelId("openai/gpt-4o"), { scope: "openai", remainder: "gpt-4o", whole: "openai/gpt-4o" });
+  assert.equal(vendorModelId(parseMenuModelId(menuModelId("gw", "openai/gpt-4o[1m]")).remainder), "openai/gpt-4o");
 });
 
 test("the [1m] window switch travels in ids and never reaches the vendor", () => {

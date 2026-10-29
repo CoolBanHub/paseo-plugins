@@ -1,4 +1,4 @@
-import { isWindowVariant, menuModelId } from "../shared/model-id.ts";
+import { isWindowVariant, menuModelId, parseMenuModelId } from "../shared/model-id.ts";
 import type { StoredAliases } from "./store.ts";
 
 /**
@@ -11,15 +11,27 @@ import type { StoredAliases } from "./store.ts";
 /** Set by the agent.create hook; read (and removed) by the session_open hook. */
 export const MODEL_SELECTED_ENV = "CLAUDE_MODELS_SELECTED";
 
-export type SessionModel = { id: string; contextWindow?: number };
+export type SessionModel = { id: string; vendorId: string; contextWindow?: number };
+
+/** The model a wanted id names: by its menu id, else by vendor id — the
+ *  latter also covers an unscoped menu id from before provider scopes and
+ *  the bare remainder of a scope that no longer exists. The "[1m]" switch
+ *  stays part of the comparison, as it picks the exact variant. */
+function matchModel(models: SessionModel[], wanted: string | null | undefined): SessionModel | undefined {
+  if (!wanted) return undefined;
+  const { remainder, whole } = parseMenuModelId(wanted);
+  return models.find((model) => model.id === wanted)
+    ?? models.find((model) => model.vendorId === whole)
+    ?? models.find((model) => model.vendorId === remainder);
+}
 
 export function modelFamilies(models: SessionModel[], preferred?: string | null) {
   const family = (names: string) => {
-    const matches = models.filter((model) => new RegExp(`(?:^|[-_.:])(?:${names})(?:$|[-_.:\\[])`, "i").test(model.id));
+    const matches = models.filter((model) => new RegExp(`(?:^|[-_.:/])(?:${names})(?:$|[-_.:/\\[])`, "i").test(model.id));
     // Background calls have no use for a 1M window: prefer the plain variant.
     return matches.find((model) => !isWindowVariant(model.id)) ?? matches[0];
   };
-  const chosen = preferred ? models.find((model) => model.id === preferred) : undefined;
+  const chosen = matchModel(models, preferred);
   // The person's chosen model takes the main aliases even next to a "-pro".
   const strong = chosen ?? family("pro|max|ultra|flagship") ?? models[0]!;
   return { strong: strong.id, fast: (family("flash|fast|mini|lite|air|highspeed|turbo") ?? chosen ?? strong).id };
@@ -33,7 +45,8 @@ export function modelFamilies(models: SessionModel[], preferred?: string | null)
  */
 export function claudeModelFor(requested: unknown, models: SessionModel[], preferred?: string | null): string | null {
   if (typeof requested !== "string" || !models.length) return null;
-  if (models.some((model) => model.id === requested)) return requested;
+  const exact = matchModel(models, requested);
+  if (exact) return exact.id;
   const { strong, fast } = modelFamilies(models, preferred);
   return /haiku|flash|fast|small|mini|lite|air/i.test(requested) ? fast : strong;
 }
@@ -43,13 +56,13 @@ export function claudeDefaults(models: SessionModel[], preferred?: string | null
   // An explicit alias points at one of the provider's models by its vendor
   // id (the "[1m]" switch included); the env carries the menu id.
   const resolve = (vendorId: string | undefined, fallback: string): string => {
-    const menuId = vendorId === undefined ? null : menuModelId(vendorId);
-    return menuId && models.some((model) => model.id === menuId) ? menuId : fallback;
+    const hit = vendorId === undefined ? undefined : models.find((model) => model.vendorId === vendorId);
+    return hit ? hit.id : fallback;
   };
   const opus = resolve(aliases?.opus, strong);
   const sonnet = resolve(aliases?.sonnet, strong);
   const haiku = resolve(aliases?.haiku, fast);
-  const window = models.find((model) => model.id === (preferred ?? strong))?.contextWindow;
+  const window = (matchModel(models, preferred) ?? models.find((model) => model.id === strong))?.contextWindow;
   return {
     ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
     ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
@@ -119,9 +132,10 @@ export function takeSelectedMarker(env: Record<string, string>): { env: Record<s
 }
 
 /** Menu model ids for one provider's models, as the session env names them. */
-export function sessionModels(models: ReadonlyArray<{ id: string; contextWindow?: number }>): SessionModel[] {
-  return models.map((model) => ({
-    id: menuModelId(model.id),
+export function sessionModels(provider: { id: string; models: ReadonlyArray<{ id: string; contextWindow?: number }> }): SessionModel[] {
+  return provider.models.map((model) => ({
+    id: menuModelId(provider.id, model.id),
+    vendorId: model.id,
     ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
   }));
 }

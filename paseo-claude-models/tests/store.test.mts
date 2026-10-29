@@ -84,7 +84,7 @@ test("ids stay unique and stable across edits", async () => {
   assert.equal(registry.list().length, 2);
 });
 
-test("menu models come only from enabled providers with keys, first listing wins", async () => {
+test("the same model id under several providers gets one scoped menu entry each", async () => {
   const registry = registryIn();
   await registry.save({
     label: "A", baseUrl: "https://a.example.com", protocol: "anthropic", authHeader: "bearer",
@@ -96,20 +96,47 @@ test("menu models come only from enabled providers with keys, first listing wins
     enabled: true, models: [{ id: "shared-model", label: "Shared B" }], apiKey: "sk-key-bbbbbbbb",
   });
   const menu = registry.menuModels();
-  assert.deepEqual(menu.map((model) => model.id), ["cm:shared-model", "cm:only-a"]);
+  assert.deepEqual(menu.map((model) => model.id), ["cm:a/shared-model", "cm:a/only-a", "cm:b/shared-model"]);
   assert.equal(menu[0]!.label, "Shared A");
   assert.equal(menu[0]!.description, "自定义模型 · A");
   assert.equal(menu[0]!.provider.label, "A");
+  assert.equal(menu[2]!.label, "Shared B");
+  assert.equal(menu[2]!.description, "自定义模型 · B");
+  // Scoped ids and ids from before the scope all name an enabled provider.
+  assert.equal(registry.isOwnMenuModel("cm:a/only-a"), true);
+  assert.equal(registry.isOwnMenuModel("cm:b/shared-model"), true);
   assert.equal(registry.isOwnMenuModel("cm:only-a"), true);
   assert.equal(registry.isOwnMenuModel("cm:missing"), false);
+  assert.equal(registry.providerForModel("cm:b/shared-model")!.label, "B");
+  assert.equal(registry.providerForModel("cm:shared-model")!.label, "A");
 
-  // A disabled provider leaves the menu.
+  // A disabled provider leaves the menu; its scoped id degrades to the next
+  // provider listing the model, and the unscoped id follows it there.
   await registry.save({
     id: "a", label: "A", baseUrl: "https://a.example.com", protocol: "anthropic", authHeader: "bearer",
     enabled: false, models: [{ id: "shared-model", label: "Shared A" }, { id: "only-a", label: "Only A" }],
   });
-  assert.deepEqual(registry.menuModels().map((model) => model.id), ["cm:shared-model"]);
+  assert.deepEqual(registry.menuModels().map((model) => model.id), ["cm:b/shared-model"]);
   assert.equal(registry.providerForModel("cm:shared-model")!.label, "B");
+  assert.equal(registry.providerForModel("cm:a/shared-model")!.label, "B");
+  assert.equal(registry.isOwnMenuModel("cm:a/only-a"), false);
+});
+
+test("gateway vendor ids and legacy menu ids resolve to their provider", async () => {
+  const registry = registryIn();
+  await registry.save({
+    label: "Gateway", baseUrl: "https://gw.example.com", protocol: "anthropic", authHeader: "bearer",
+    enabled: true, models: [{ id: "openai/gpt-4o", label: "GPT-4o" }], apiKey: "sk-key-gggggggg",
+  });
+  const [entry] = registry.menuModels();
+  assert.equal(entry!.id, "cm:gateway/openai/gpt-4o");
+  // The scoped id routes to its provider, scope and switch stripped by callers.
+  assert.equal(registry.providerForModel("cm:gateway/openai/gpt-4o")!.label, "Gateway");
+  // A menu id from before provider scopes (the vendor id alone) still does.
+  assert.equal(registry.providerForModel("cm:openai/gpt-4o")!.label, "Gateway");
+  assert.equal(registry.isOwnMenuModel("cm:openai/gpt-4o"), true);
+  // Ownership ignores the "[1m]" switch on both sides.
+  assert.equal(registry.providerForModel("cm:gateway/openai/gpt-4o[1m]")!.label, "Gateway");
 });
 
 test("remove deletes config and key", async () => {

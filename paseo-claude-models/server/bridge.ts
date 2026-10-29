@@ -6,7 +6,7 @@ import { once } from "node:events";
 import { StringDecoder } from "node:string_decoder";
 import { Readable } from "node:stream";
 import { join } from "node:path";
-import { vendorModelId } from "../shared/model-id.ts";
+import { parseMenuModelId, vendorModelId } from "../shared/model-id.ts";
 import { anthropicToChat } from "./protocol/anthropic-to-chat.ts";
 import type { ProtocolBridge } from "./protocol/types.ts";
 import { estimateAnthropicInputTokens } from "./protocol/estimate.ts";
@@ -256,9 +256,10 @@ export function createBridge(options: BridgeOptions) {
       const provider = targetProvider(route, body.model);
       if (!provider) throw new LocalFailure(503, "模型所属 Provider 未启用或 Key 缺失", "api_error");
       const key = registry.apiKey(provider.id)!;
-      const models = sessionModels(provider.models);
+      const models = sessionModels(provider);
       const listed = claudeModelFor(body.model, models, route.model) ?? models[0]!.id;
-      const model = vendorModelId(listed);
+      // The menu id's provider scope and "[1m]" switch never reach the vendor.
+      const model = vendorModelId(parseMenuModelId(listed).remainder);
       body = { ...body, model };
 
       const bridge: ProtocolBridge | null = provider.protocol === "chat" ? anthropicToChat : null;

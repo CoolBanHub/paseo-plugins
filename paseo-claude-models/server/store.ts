@@ -3,7 +3,7 @@ import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { RESERVED_ENV_KEYS, envKeyPattern, type ProviderInput, type ProviderView } from "../shared/contracts.ts";
-import { menuModelId, ownModelDescription } from "../shared/model-id.ts";
+import { isMenuModel, menuModelId, ownModelDescription, parseMenuModelId, vendorModelId } from "../shared/model-id.ts";
 
 /**
  * Provider configuration and API keys, kept under the plugin's data
@@ -191,6 +191,27 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
     }
   }
 
+  /**
+   * The enabled provider a model id belongs to. A scoped id names its
+   * provider directly; an id without a resolvable scope (a bare vendor id,
+   * or a menu id from before provider scopes) goes to the first enabled
+   * provider listing it, and a scope whose provider is gone degrades to its
+   * remainder the same way — so sessions survive a provider being disabled
+   * or removed. Ownership ignores the "[1m]" switch.
+   */
+  function resolveProvider(model: string): StoredProvider | null {
+    const { scope, remainder, whole } = parseMenuModelId(model);
+    const listing = (wanted: string) => enabledProviders()
+      .find((provider) => provider.models.some((entry) => vendorModelId(entry.id) === wanted));
+    if (scope) {
+      const scoped = enabledProviders().find((provider) => provider.id === scope
+        && provider.models.some((entry) => vendorModelId(entry.id) === vendorModelId(remainder)));
+      if (scoped) return scoped;
+    }
+    const byWhole = listing(vendorModelId(whole));
+    return byWhole ?? (scope ? listing(vendorModelId(remainder)) ?? null : null);
+  }
+
   function uniqueId(existing: StoredProvider[], keepId: string | undefined, label: string): string {
     const taken = new Set(existing.filter((provider) => provider.id !== keepId).map((provider) => provider.id));
     const base = slugify(label);
@@ -273,11 +294,12 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
     /** The menu entries contributed to the Claude provider, in menu order. */
     menuModels(): MenuModel[] {
       const entries: MenuModel[] = [];
-      const seen = new Set<string>();
       for (const provider of enabledProviders()) {
+        // One provider listing an id twice still yields one entry; the same
+        // id under another provider gets its own scoped menu entry.
+        const seen = new Set<string>();
         for (const model of provider.models) {
-          const id = menuModelId(model.id);
-          // The first provider listing an id owns the menu entry.
+          const id = menuModelId(provider.id, model.id);
           if (seen.has(id)) continue;
           seen.add(id);
           entries.push({
@@ -293,18 +315,10 @@ export function createModelRegistry(options: ModelRegistryOptions = {}) {
     },
 
     /** Whether a model id is one of the enabled providers' menu ids. */
-    isOwnMenuModel: (model: unknown): model is string =>
-      typeof model === "string" && model.startsWith("cm:")
-        && enabledProviders().some((provider) => provider.models.some((entry) => menuModelId(entry.id) === model)),
+    isOwnMenuModel: (model: unknown): model is string => isMenuModel(model) && resolveProvider(model) !== null,
 
     /** The enabled provider a menu model id (or vendor id) belongs to. */
-    providerForModel: (model: string): StoredProvider | null => {
-      const wanted = model.startsWith("cm:") ? model.slice("cm:".length) : model;
-      for (const provider of enabledProviders()) {
-        if (provider.models.some((model) => model.id === wanted)) return provider;
-      }
-      return null;
-    },
+    providerForModel: (model: string): StoredProvider | null => resolveProvider(model),
 
     /** Renderer-facing views: configuration without the key, only its hint. */
     views: (): ProviderView[] => readProviders().map((provider) => {
