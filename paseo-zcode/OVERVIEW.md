@@ -55,6 +55,9 @@ local ZCode sessions are listed in Paseo's session picker.
 
 - Prompting, interrupting, model / mode / thinking-level switching, permission
   prompts, usage accounting per turn.
+- Pausing a run maps ZCode's `turn.completed` (`resultType: "cancelled"`) to a
+  canceled Paseo turn: no system error is appended and the prompt is not
+  rolled back. Only execution error result types close the turn as failed.
 - Model labels include the provider name. Model and reasoning selections are
   confirmed before the session becomes ready and travel with every prompt;
   changing the mode or reasoning level preserves the selected model.

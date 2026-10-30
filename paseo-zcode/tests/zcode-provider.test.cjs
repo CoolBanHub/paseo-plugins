@@ -615,6 +615,39 @@ test("a provider failure after turn start closes that turn as failed", async (t)
   assert.ok(f.events.some((event) => event.type === "session.turn" && event.turnId === "turn_started" && event.state === "failed"));
 });
 
+test("pausing (turn.completed resultType cancelled) reports a canceled turn, not a failure", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn_paused" });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn_paused",
+    payload: { response: "", resultType: "cancelled", tokenCount: 0, toolCallCount: 0 },
+  });
+  const turnEnd = f.events.find((event) => event.type === "session.turn" && event.turnId === "turn_paused" && event.state !== "started");
+  assert.equal(turnEnd.state, "canceled");
+  assert.equal(turnEnd.error, undefined);
+  assert.ok(!f.events.some((event) => event.type === "session.turn" && event.state === "failed"));
+  assert.ok(!f.events.some((event) => event.type === "timeline.item" && event.item.type === "error"));
+  assert.ok(!f.events.some((event) => event.type === "session.prompt_result" && event.result.type === "failed"));
+});
+
+test("execution error result types still close the turn as failed", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn_errored" });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn_errored",
+    payload: { response: "", resultType: "error_max_turns", tokenCount: 0, toolCallCount: 0 },
+  });
+  const turnEnd = f.events.find((event) => event.type === "session.turn" && event.turnId === "turn_errored" && event.state !== "started");
+  assert.equal(turnEnd.state, "failed");
+  assert.equal(turnEnd.error.message, "error_max_turns");
+});
+
 test("resetting reasoning preserves the model and uses its advertised default", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM, thinkingOption: "low" });

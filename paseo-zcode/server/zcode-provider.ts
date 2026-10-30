@@ -982,15 +982,21 @@ export function createZcodeProvider(): ProviderRegistration {
             emitAssistantOnce(state, turn, response);
             const usage = (payload.usage ?? {}) as Record<string, unknown>;
             const resultType = String(payload.resultType ?? "success");
+            // A user pause ends the turn with resultType "cancelled"; report it as
+            // a canceled turn so Paseo settles quietly instead of surfacing a
+            // system error and rolling the prompt back as a failed run.
+            const turnState = resultType === "success"
+              ? "completed"
+              : resultType === "cancelled" ? "canceled" : "failed";
             emit({
               type: "session.turn",
               sessionId: state.paseoSessionId,
               turnId: event.turnId,
-              state: resultType === "success" ? "completed" : "failed",
+              state: turnState,
               error:
-                resultType === "success"
-                  ? undefined
-                  : { message: String(payload.response ?? payload.resultType ?? "turn failed") },
+                turnState === "failed"
+                  ? { message: String(payload.response || payload.resultType || "turn failed") }
+                  : undefined,
             });
             emit({
               type: "session.usage",
