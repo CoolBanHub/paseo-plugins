@@ -69,6 +69,17 @@ local ZCode sessions are listed in Paseo's session picker.
 - ZCode todo snapshots and background terminal lifecycle events are mirrored
   into Paseo's todo and shell-call timeline items. Paseo's provider timeline
   does not expose the per-process stop control shown in ZCode's own panel.
+- Subagents spawned by the Agent/Task tool are rendered as nested subsessions
+  under their Agent tool call: Paseo shows each child session with the
+  subagent's own transcript and outcome. Discovery uses ZCode's
+  `session/subagents` listing; running children are followed by polling their
+  snapshot (the app-server does not push child-session events), with a short
+  backfill re-read after they finish. Child sessions are read-only (Paseo
+  cannot prompt them) and only one nesting level is rendered. Subagent-kind
+  background tasks no longer show up as empty shell cards when subsessions
+  render. Hosts that do not negotiate `session.subsession` keep the previous
+  rendering: an Agent tool card with the final summary plus a generic
+  background-task card.
 - Permission cards include the requested command and reason. ZCode's repeated
   announcements for one outstanding permission are coalesced into one card;
   separate permission request IDs remain separate prompts.

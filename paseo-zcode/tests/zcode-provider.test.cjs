@@ -13,13 +13,18 @@ require.extensions[".ts"] = (module, filename) => {
 const protocol = require("../server/zcode-protocol.ts");
 const accounts = require("../server/zcode-account.ts");
 const taskIndex = require("../server/zcode-task-index.ts");
-const { createZcodeProvider, prepareZcodePrompt } = require("../server/zcode-provider.ts");
+const { createZcodeProvider, prepareZcodePrompt, subagentSyncTiming } = require("../server/zcode-provider.ts");
 const { PROVIDER_PROTOCOL_VERSION } = require("@getpaseo/plugin/server/provider");
 
 const ACCOUNT = "account:bigmodel-individual-coding-plan";
 const BINGLM = "zai-api::GLM-5.3";
 const FLASH = "zai-api::GLM-5.3-Flash";
 const accountModel = `${ACCOUNT}::GLM-5.3`;
+
+/** Drains the promise chains started by fired mock timers. */
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+};
 const defaultSelection = { providerId: ACCOUNT, modelId: "GLM-5.3", options: { reasoningLevel: "max" } };
 const available = [
   [ACCOUNT, "GLM-5.3", "个人套餐", ["low", "high", "max"]],
@@ -65,7 +70,7 @@ async function fixture(t, options = {}) {
   const snapshot = (sessionId) => {
     const state = states.get(sessionId);
     return {
-      session: { sessionId, mode: state.runtimeMode ?? state.mode, model: state.model },
+      session: { sessionId, mode: state.runtimeMode ?? state.mode, model: state.model, status: state.sessionStatus ?? "idle" },
       settings: {
         mode: { current: state.mode },
         model: { available, current: state.model },
@@ -84,7 +89,9 @@ async function fixture(t, options = {}) {
     requests.push({ method, params: structuredClone(params) });
     if (method === "session/create" || method === "session/resume") {
       const id = params.sessionId ?? `sess_mock_${++nextSession}`;
+      // Pre-seeded fields (subagent listings, child transcripts) survive resume.
       states.set(id, {
+        ...states.get(id),
         mode: options.initialMode ?? "build",
         runtimeMode: "build",
         revision: 0,
@@ -98,8 +105,12 @@ async function fixture(t, options = {}) {
     }
     if (method === "session/read") return { result: {
       ...snapshot(params.sessionId),
-      messages: structuredClone(options.historyMessages ?? []),
+      messages: structuredClone(states.get(params.sessionId)?.messages ?? options.historyMessages ?? []),
     } };
+    if (method === "session/subagents") {
+      const listing = states.get(params.sessionId)?.subagents;
+      return { result: structuredClone(listing ?? { childSessionIds: [], running: [], ended: { total: 0, items: [] } }) };
+    }
     if (method === "session/list") return { result: { sessions: [...states.keys()].map((id) => snapshot(id).session) } };
     if (method === "session/setModel") {
       if (beforeSet) await beforeSet();
@@ -132,7 +143,7 @@ async function fixture(t, options = {}) {
     if (method === "session/send" && rejectSend) return { error: { code: -1, message: "send rejected" } };
     return { result: {} };
   });
-  const connection = await createZcodeProvider().connect({ versions: [PROVIDER_PROTOCOL_VERSION], capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence", "session.archive", "session.unarchive"] });
+  const connection = await createZcodeProvider().connect({ versions: [PROVIDER_PROTOCOL_VERSION], capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence", "session.archive", "session.unarchive", ...(options.subsessions === false ? [] : ["session.subsession"])] });
   t.after(() => connection.close());
   const events = [];
   connection.onEvent((event) => events.push(structuredClone(event)));
@@ -148,6 +159,16 @@ async function fixture(t, options = {}) {
   });
   return {
     events, open, configure, prompt, connection, archiveCalls,
+    session: (sessionId, patch) => {
+      let state = states.get(sessionId);
+      if (!state) { state = {}; states.set(sessionId, state); }
+      Object.assign(state, structuredClone(patch));
+    },
+    setSubagents: (sessionId, listing) => {
+      let state = states.get(sessionId);
+      if (!state) { state = {}; states.set(sessionId, state); }
+      state.subagents = structuredClone(listing);
+    },
     archive: (sessionId, value = true) => connection.send({ type: value ? "session.archive" : "session.unarchive", requestId: "archive", persistence: { version: 1, data: { zcodeSessionId: sessionId } } }),
     rejectArchive: (message) => { archiveError = message; },
     externalState: (patch, revision, notify = true) => {
@@ -723,4 +744,204 @@ test("a mode change that the runtime does not apply reports failure and retains 
   assert.equal(f.config().mode, "build");
   const failure = f.events.find((event) => event.type === "request.failed" && event.requestId === "configure");
   assert.match(failure.error.message, /did not apply mode/);
+});
+
+test("running ZCode subagents attach as nested Paseo subsessions and poll until done", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.setSubagents(sessionId, {
+    revision: 1,
+    childSessionIds: ["sess_subagent_a"],
+    running: [{
+      childSessionId: "sess_subagent_a", agentId: "agent_a", toolCallId: "agent-call-1",
+      subagentType: "Explore", title: "探索结构", status: "running",
+    }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_subagent_a", {
+    sessionStatus: "running",
+    messages: [
+      { info: { role: "user", messageId: "cu-1", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "cu-1", text: "调研任务" }] },
+    ],
+  });
+
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-agent",
+    payload: { kind: "tool_call", toolCallId: "agent-call-1", toolName: "Agent", input: { description: "探索结构", subagent_type: "Explore" } },
+  });
+  t.mock.timers.tick(subagentSyncTiming.spawnMs); await flush();
+
+  const opened = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_a");
+  assert.ok(opened, "child subsession must be opened");
+  assert.equal(opened.parentSessionId, "paseo-session");
+  assert.equal(opened.toolCallId, "agent-call-1");
+  assert.equal(opened.restoration, "parent");
+  assert.equal(opened.title, "探索结构");
+  const card = f.events.filter((event) => event.type === "timeline.item" && event.item.id === "agent-call-1").at(-1).item;
+  assert.equal(card.status, "running");
+  assert.equal(card.detail.type, "sub_agent");
+  assert.equal(card.detail.childSessionId, "sess_subagent_a");
+  assert.equal(card.detail.subAgentType, "Explore");
+  assert.equal(card.detail.description, "探索结构");
+  const childItems = () => f.events.filter((event) => event.type === "timeline.item" && event.sessionId === "sess_subagent_a");
+  assert.deepEqual(childItems().map((event) => event.item.id), ["cu-1"]);
+
+  // Polling streams new child rows as they appear in the transcript.
+  f.session("sess_subagent_a", { messages: [
+    { info: { role: "user", messageId: "cu-1", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "cu-1", text: "调研任务" }] },
+    { info: { role: "assistant", messageId: "ca-1", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "ca-1", text: "调研结论" }] },
+  ] });
+  t.mock.timers.tick(subagentSyncTiming.subagentPollMs); await flush();
+  assert.deepEqual(childItems().map((event) => event.item.id), ["cu-1", "ca-1:text:0"]);
+
+  // When the child leaves the active status set the turn is settled and polling stops;
+  // one final backfill re-read catches rows persisted after the status flipped.
+  f.session("sess_subagent_a", { sessionStatus: "idle" });
+  t.mock.timers.tick(subagentSyncTiming.subagentPollMs); await flush();
+  const childTurn = f.events.find((event) => event.type === "session.turn" && event.sessionId === "sess_subagent_a");
+  assert.equal(childTurn.state, "completed");
+  const readsAfterDone = f.calls("session/read").filter((call) => call.sessionId === "sess_subagent_a").length;
+  t.mock.timers.tick(subagentSyncTiming.backfillMs); await flush();
+  assert.equal(f.calls("session/read").filter((call) => call.sessionId === "sess_subagent_a").length, readsAfterDone + 1);
+  t.mock.timers.tick(subagentSyncTiming.backfillMs * 4); await flush();
+  assert.equal(f.calls("session/read").filter((call) => call.sessionId === "sess_subagent_a").length, readsAfterDone + 1);
+});
+
+test("a finished Agent tool call replays the ended subagent with its outcome", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-agent-2",
+    payload: { kind: "tool_call", toolCallId: "agent-call-2", toolName: "Agent", input: { description: "读文档", subagent_type: "Explore" } },
+  });
+  f.setSubagents(sessionId, {
+    childSessionIds: ["sess_subagent_b"],
+    running: [],
+    ended: {
+      total: 1,
+      items: [{ childSessionId: "sess_subagent_b", toolCallId: "agent-call-2", subagentType: "Explore", title: "读文档", status: "success", summary: "调研完成" }],
+    },
+  });
+  f.session("sess_subagent_b", { messages: [
+    { info: { role: "assistant", messageId: "cb-1", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "cb-1", text: "调研结论" }] },
+  ] });
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-agent-2",
+    payload: { kind: "result", toolCallId: "agent-call-2", result: { success: true, content: "调研完成汇报" } },
+  });
+  t.mock.timers.tick(0); await flush();
+
+  assert.ok(!f.calls("session/subscribe").some((call) => call.sessionId === "sess_subagent_b"), "ended children are not followed live");
+  const opened = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_b");
+  assert.equal(opened.parentSessionId, "paseo-session");
+  assert.equal(opened.toolCallId, "agent-call-2");
+  const childItems = f.events.filter((event) => event.type === "timeline.item" && event.sessionId === "sess_subagent_b");
+  assert.deepEqual(childItems.map((event) => event.item.id), ["cb-1:text:0"]);
+  const childTurn = f.events.find((event) => event.type === "session.turn" && event.sessionId === "sess_subagent_b");
+  assert.equal(childTurn.state, "completed");
+  const card = f.events.filter((event) => event.type === "timeline.item" && event.item.id === "agent-call-2").at(-1).item;
+  assert.equal(card.status, "completed");
+  assert.equal(card.detail.childSessionId, "sess_subagent_b");
+  assert.equal(card.detail.log, "调研完成汇报");
+});
+
+test("subagent subsessions close with their parent session", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.setSubagents(sessionId, {
+    childSessionIds: ["sess_subagent_e"],
+    running: [{ childSessionId: "sess_subagent_e", toolCallId: "agent-call-5", subagentType: "Explore" }],
+    ended: { total: 0, items: [] },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-agent-5",
+    payload: { kind: "tool_call", toolCallId: "agent-call-5", toolName: "Agent", input: {} },
+  });
+  t.mock.timers.tick(subagentSyncTiming.spawnMs); await flush();
+  assert.ok(f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_e"));
+
+  await f.connection.send({ type: "session.close", requestId: "close", sessionId: "paseo-session" });
+  assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "sess_subagent_e"));
+  assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "paseo-session"));
+});
+
+test("without session.subsession, subagents stay on the legacy background card", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t, { subsessions: false });
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({ type: "session.updated", sessionId, payload: { taskId: "bg-sub-1", taskKind: "subagent", status: "running" } });
+  t.mock.timers.tick(0); await flush();
+  assert.ok(f.events.some((event) => event.type === "timeline.item" && event.item.id === "zcode:background:bg-sub-1"));
+
+  f.setSubagents(sessionId, {
+    childSessionIds: ["sess_subagent_c"],
+    running: [{ childSessionId: "sess_subagent_c", toolCallId: "agent-call-3", subagentType: "Explore" }],
+    ended: { total: 0, items: [] },
+  });
+  f.sessionEvent({ type: "turn.completed", sessionId, turnId: "turn-x", payload: { resultType: "success" } });
+  t.mock.timers.tick(subagentSyncTiming.settledMs); await flush();
+  assert.equal(f.calls("session/subagents").length, 0);
+  assert.ok(!f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_c"));
+});
+
+test("with session.subsession, subagent background tasks render as subsessions instead of shell cards", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.sessionEvent({ type: "session.updated", sessionId, payload: { taskId: "bg-sub-2", taskKind: "subagent", status: "running" } });
+  t.mock.timers.tick(0); await flush();
+  assert.ok(!f.events.some((event) => event.type === "timeline.item" && event.item.id === "zcode:background:bg-sub-2"));
+  // bash background tasks keep their shell card
+  f.sessionEvent({ type: "session.updated", sessionId, payload: { taskId: "bg-bash-1", taskKind: "bash", command: "npm test", status: "running" } });
+  t.mock.timers.tick(0); await flush();
+  assert.ok(f.events.some((event) => event.type === "timeline.item" && event.item.id === "zcode:background:bg-bash-1"));
+});
+
+test("history replay links Agent cards to subagent subsessions", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "assistant", messageId: "ha-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{
+          type: "tool", partId: "hp-1", callId: "agent-call-4", tool: "Agent",
+          state: { status: "completed", input: { description: "历史调研", subagent_type: "Explore" }, output: "历史结论" },
+        }],
+      },
+    ],
+  });
+  f.setSubagents("sess_history", {
+    childSessionIds: ["sess_subagent_d"],
+    running: [],
+    ended: {
+      total: 1,
+      items: [{ childSessionId: "sess_subagent_d", toolCallId: "agent-call-4", subagentType: "Explore", title: "历史调研", status: "success" }],
+    },
+  });
+  f.session("sess_subagent_d", { messages: [
+    { info: { role: "assistant", messageId: "cd-1", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "cd-1", text: "子会话结论" }] },
+  ] });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
+  t.mock.timers.tick(0); await flush();
+
+  const parentCard = f.events.find((event) => event.type === "timeline.item" && event.item.id === "agent-call-4").item;
+  assert.equal(parentCard.detail.childSessionId, "sess_subagent_d");
+  assert.equal(parentCard.detail.log, "历史结论");
+  const cardIndex = f.events.findIndex((event) => event.type === "timeline.item" && event.item.id === "agent-call-4");
+  const openedIndex = f.events.findIndex((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_d");
+  assert.ok(openedIndex > cardIndex, "child subsession opens after the parent timeline rows");
+  assert.ok(f.events.some((event) => event.type === "timeline.item" && event.sessionId === "sess_subagent_d" && event.item.text === "子会话结论"));
+  const childTurn = f.events.find((event) => event.type === "session.turn" && event.sessionId === "sess_subagent_d");
+  assert.equal(childTurn.state, "completed");
 });

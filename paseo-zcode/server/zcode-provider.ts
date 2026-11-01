@@ -43,7 +43,28 @@ const SUPPORTED_CAPABILITIES = [
   "session.archive",
   "session.unarchive",
   "permission",
+  "session.subsession",
 ] as const;
+
+/** Tools whose execution spawns a ZCode subagent child session. */
+const AGENT_TOOL_NAMES = new Set(["Agent", "Task"]);
+
+/**
+ * Delays for the `session/subagents` reconciliation passes. A subagent child
+ * session only exists shortly after the Agent tool call starts executing, so
+ * discovery is scheduled after the tool call streams in and revisited once the
+ * call settles. The app-server does not push child session events to
+ * subscribers, so adopted children are polled at `subagentPollMs`. Exposed for
+ * tests.
+ */
+export const subagentSyncTiming = {
+  spawnMs: 1200,
+  spawnFollowUpMs: 6000,
+  settledMs: 400,
+  subagentPollMs: 2000,
+  /** Delay before re-reading a just-ended child to catch late-persisted rows. */
+  backfillMs: 2500,
+};
 
 // Labels and descriptions mirror the ZCode desktop app's zh-CN strings
 // (mode.label.glm.* / mode.description.glm.*); ids stay protocol-level.
@@ -192,6 +213,45 @@ interface PendingPermission {
   answer?: string;
 }
 
+/** One entry of the ZCode `session/subagents` listing. */
+interface SubagentRef {
+  childSessionId?: string;
+  agentId?: string;
+  toolCallId?: string;
+  subagentType?: string;
+  title?: string;
+  status?: string;
+  summary?: string;
+  ended?: boolean;
+}
+
+interface SessionSubagentsResult {
+  childSessionIds?: string[];
+  running?: SubagentRef[];
+  ended?: { total?: number; items?: SubagentRef[] };
+}
+
+/** A ZCode subagent child session attached to a parent Paseo session. */
+interface SubagentChildRecord {
+  paseoSessionId: string;
+  childSessionId: string;
+  toolCallId?: string;
+  title?: string;
+  adopted: boolean;
+  /** Signatures of timeline rows already forwarded for this child. */
+  emittedRows?: Set<string>;
+  /** Set once the child's final turn state has been reported. */
+  terminalEmitted?: boolean;
+  pollTimer?: ReturnType<typeof setTimeout>;
+  pollGeneration?: number;
+}
+
+function endedSubagentTurnState(status: string | undefined): "completed" | "failed" | "canceled" {
+  if (status === "cancelled" || status === "canceled") return "canceled";
+  if (status === "failed" || status === "timed_out" || status === "spawn_error" || status === "lost") return "failed";
+  return "completed";
+}
+
 interface TurnState {
   turnId: string;
   started: boolean;
@@ -199,7 +259,13 @@ interface TurnState {
   reasoning: string;
   assistantMessageId?: string;
   emittedAssistant: Set<string>;
-  tools: Map<string, { name: string; input?: Record<string, unknown> }>;
+  tools: Map<string, {
+    name: string;
+    input?: Record<string, unknown>;
+    outcome?: "completed" | "failed";
+    error?: string;
+    log?: string;
+  }>;
 }
 
 interface SessionState {
@@ -216,6 +282,14 @@ interface SessionState {
   revision?: number;
   modeEventSeq?: number;
   catalog?: ProviderCatalog;
+  /** True when this state represents a subagent child session. */
+  child?: boolean;
+  cwd?: string;
+  /** Subagent children keyed by ZCode child session id; parents only. */
+  subagents?: Map<string, SubagentChildRecord>;
+  subagentSyncTimers?: Set<ReturnType<typeof setTimeout>>;
+  subagentSyncRunning?: boolean;
+  subagentSyncQueued?: boolean;
 }
 
 function modelId(ref: { providerId: string; modelId: string }): string {
@@ -304,7 +378,12 @@ function buildToolDetail(name: string, input: Record<string, unknown> | undefine
       return { type: "fetch", url: String(i.url ?? "") };
     case "Agent":
     case "Task":
-      return { type: "sub_agent", subAgentType: typeof i.subagent_type === "string" ? i.subagent_type : undefined, log: "" };
+      return {
+        type: "sub_agent",
+        subAgentType: typeof i.subagent_type === "string" ? i.subagent_type : undefined,
+        description: typeof i.description === "string" ? i.description : undefined,
+        log: "",
+      };
     default:
       return { type: "plain_text", label: name };
   }
@@ -321,6 +400,8 @@ function withOutput(detail: ProviderToolCallDetail, output: unknown): ProviderTo
       return { ...detail, content: text.slice(0, 4000) };
     case "fetch":
       return { ...detail, result: text.slice(0, 4000) };
+    case "sub_agent":
+      return { ...detail, log: text.slice(0, 8000) };
     default:
       return detail;
   }
@@ -393,15 +474,6 @@ function emitBackgroundJob(
   });
 }
 
-function emitBackgroundJobs(
-  emit: (event: ProviderEvent) => void,
-  state: SessionState,
-  jobs: NonNullable<CreateOrResumeResult["projection"]>["backgroundJobs"],
-): void {
-  if (!jobs) return;
-  for (const job of jobs) emitBackgroundJob(emit, state, job);
-}
-
 function historyOutput(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? undefined : JSON.stringify(value);
@@ -413,7 +485,11 @@ function historyOutput(value: unknown): string | undefined {
 }
 
 /** Convert the native ZCode snapshot returned by session/read into Paseo timeline rows. */
-export function zcodeHistoryTimelineItems(messages: unknown, sessionId: string): ProviderTimelineItem[] {
+export function zcodeHistoryTimelineItems(
+  messages: unknown,
+  sessionId: string,
+  childSessionIds?: Map<string, string>,
+): ProviderTimelineItem[] {
   if (!Array.isArray(messages)) return [];
   const items: ProviderTimelineItem[] = [];
   for (const [messageIndex, raw] of messages.entries()) {
@@ -472,7 +548,11 @@ export function zcodeHistoryTimelineItems(messages: unknown, sessionId: string):
           ? snapshot.input as Record<string, unknown>
           : undefined;
         const output = historyOutput(snapshot.output);
-        const detail = output === undefined ? buildToolDetail(name, input) : withOutput(buildToolDetail(name, input), output);
+        let detail = output === undefined ? buildToolDetail(name, input) : withOutput(buildToolDetail(name, input), output);
+        const childSessionId = childSessionIds?.get(callId);
+        if (childSessionId && detail.type === "sub_agent") {
+          detail = { ...detail, childSessionId };
+        }
         items.push(status === "failed"
           ? { type: "tool_call", id: callId, callId, name, status, error: String(snapshot.error ?? output ?? `${name} failed`), detail }
           : { type: "tool_call", id: callId, callId, name, status, error: null, detail });
@@ -562,7 +642,13 @@ export function createZcodeProvider(): ProviderRegistration {
       const stateFor = (paseoSessionId: string, zcodeSessionId: string): SessionState => {
         let state = sessions.get(zcodeSessionId);
         if (!state) {
-          state = { paseoSessionId, zcodeSessionId, turns: new Map(), ready: false };
+          state = {
+            paseoSessionId,
+            zcodeSessionId,
+            turns: new Map(),
+            ready: false,
+            subagents: new Map(),
+          };
           sessions.set(zcodeSessionId, state);
           zcodeIdFor.set(paseoSessionId, zcodeSessionId);
         }
@@ -894,6 +980,10 @@ export function createZcodeProvider(): ProviderRegistration {
                     detail: buildToolDetail(toolName, input),
                   },
                 });
+                if (AGENT_TOOL_NAMES.has(toolName)) {
+                  scheduleSubagentSync(state, subagentSyncTiming.spawnMs);
+                  scheduleSubagentSync(state, subagentSyncTiming.spawnFollowUpMs);
+                }
               }
             }
             break;
@@ -909,9 +999,14 @@ export function createZcodeProvider(): ProviderRegistration {
               }
             }
             if (typeof payload.taskId === "string") {
-              emitBackgroundJob(emit, state, payload);
+              if (backgroundJobVisible(payload)) emitBackgroundJob(emit, state, payload);
+              if (String(payload.taskKind ?? "") === "subagent") scheduleSubagentSync(state, 0);
             } else if (Array.isArray(payload.backgroundJobs)) {
-              emitBackgroundJobs(emit, state, payload.backgroundJobs as Array<Record<string, unknown>>);
+              const jobs = payload.backgroundJobs as Array<Record<string, unknown>>;
+              emitVisibleBackgroundJobs(state, jobs);
+              if (jobs.some((job) => String(job?.taskKind ?? "") === "subagent")) {
+                scheduleSubagentSync(state, 0);
+              }
             }
             if (!turn) break;
             if (typeof payload.contextWindow === "number") state.contextWindow = payload.contextWindow;
@@ -940,14 +1035,30 @@ export function createZcodeProvider(): ProviderRegistration {
                   detail: { type: "plain_text", label: toolName },
                 },
               });
+              if (AGENT_TOOL_NAMES.has(toolName)) {
+                scheduleSubagentSync(state, subagentSyncTiming.spawnMs);
+                scheduleSubagentSync(state, subagentSyncTiming.spawnFollowUpMs);
+              }
             } else if (payload.kind === "result") {
               const tool = turn.tools.get(toolCallId);
               const result = (payload.result ?? {}) as Record<string, unknown>;
               const success = result.success !== false;
+              const outputText = typeof result.content === "string"
+                ? result.content
+                : result.content === undefined ? "" : JSON.stringify(result.content);
+              if (tool) {
+                tool.outcome = success ? "completed" : "failed";
+                tool.log = outputText.slice(0, 8000);
+                if (!success) tool.error = String(result.content ?? "tool failed");
+              }
               const detail = withOutput(
                 tool ? buildToolDetail(tool.name, tool.input) : { type: "plain_text" as const, label: "tool" },
                 result.content,
               );
+              const linkedChild = [...(state.subagents?.values() ?? [])].find((entry) => entry.toolCallId === toolCallId);
+              if (linkedChild && detail.type === "sub_agent") {
+                detail.childSessionId = linkedChild.childSessionId;
+              }
               const failureMessage = String(result.content ?? "tool failed");
               emit({
                 type: "timeline.item",
@@ -974,6 +1085,9 @@ export function createZcodeProvider(): ProviderRegistration {
               });
               if (tool?.name === "TodoWrite") {
                 void refreshSession(state).catch((error) => log("todo refresh failed", String(error)));
+              }
+              if (tool && AGENT_TOOL_NAMES.has(tool.name)) {
+                scheduleSubagentSync(state, 0);
               }
             }
             break;
@@ -1013,6 +1127,7 @@ export function createZcodeProvider(): ProviderRegistration {
               },
             });
             state.turns.delete(event.turnId);
+            scheduleSubagentSync(state, subagentSyncTiming.settledMs);
             break;
           }
           default:
@@ -1081,7 +1196,7 @@ export function createZcodeProvider(): ProviderRegistration {
         })) as unknown as CreateOrResumeResult;
         applyOfficialState(state, snapshot);
         emitTodos(emit, state, snapshot.todos);
-        emitBackgroundJobs(emit, state, snapshot.projection?.backgroundJobs);
+        emitVisibleBackgroundJobs(state, snapshot.projection?.backgroundJobs);
         if (state.ready && state.catalog) emitSessionConfig(state, state.catalog);
         return snapshot;
       };
@@ -1092,6 +1207,311 @@ export function createZcodeProvider(): ProviderRegistration {
         });
         applyOfficialState(state, snapshot as unknown as CreateOrResumeResult);
         if (state.mode !== mode) throw new Error(`ZCode did not apply mode "${mode}"; current mode is "${state.mode}"`);
+      };
+
+      const subsessionsNegotiated = () => connection.capabilities.includes("session.subsession");
+
+      const backgroundJobVisible = (job: Record<string, unknown>): boolean =>
+        !(subsessionsNegotiated() && String(job.taskKind ?? "") === "subagent");
+
+      const emitVisibleBackgroundJobs = (
+        state: SessionState,
+        jobs: NonNullable<CreateOrResumeResult["projection"]>["backgroundJobs"],
+      ): void => {
+        if (!jobs) return;
+        for (const job of jobs) {
+          if (backgroundJobVisible(job as Record<string, unknown>)) {
+            emitBackgroundJob(emit, state, job as Record<string, unknown>);
+          }
+        }
+      };
+
+      /** Re-emit the parent's Agent tool card so it links to the child session. */
+      const refreshAgentToolCard = (parent: SessionState, record: SubagentChildRecord): void => {
+        if (!record.toolCallId) return;
+        for (const turn of parent.turns.values()) {
+          const tool = turn.tools.get(record.toolCallId);
+          if (!tool) continue;
+          const base = buildToolDetail(tool.name, tool.input);
+          const detail = base.type === "sub_agent"
+            ? { ...base, childSessionId: record.childSessionId, ...(tool.log ? { log: tool.log } : {}) }
+            : base;
+          emit({
+            type: "timeline.item",
+            sessionId: parent.paseoSessionId,
+            item: tool.outcome === "failed"
+              ? {
+                  type: "tool_call",
+                  id: record.toolCallId,
+                  callId: record.toolCallId,
+                  name: tool.name,
+                  status: "failed",
+                  error: tool.error ?? `${tool.name} failed`,
+                  detail,
+                }
+              : {
+                  type: "tool_call",
+                  id: record.toolCallId,
+                  callId: record.toolCallId,
+                  name: tool.name,
+                  status: tool.outcome ?? "running",
+                  error: null,
+                  detail,
+                },
+          });
+          return;
+        }
+      };
+
+      /**
+       * Register a ZCode subagent child session as a Paseo subsession nested
+       * under the parent's Agent tool call, backfill its transcript so far and
+       * poll it while it runs.
+       */
+      const adoptSubagent = async (parent: SessionState, ref: SubagentRef): Promise<void> => {
+        const childSessionId = String(ref.childSessionId ?? "");
+        if (!childSessionId || !parent.subagents) return;
+        let record = parent.subagents.get(childSessionId);
+        if (!record) {
+          record = {
+            paseoSessionId: childSessionId,
+            childSessionId,
+            toolCallId: typeof ref.toolCallId === "string" ? ref.toolCallId : undefined,
+            title: typeof ref.title === "string" ? ref.title : undefined,
+            adopted: false,
+            emittedRows: new Set(),
+          };
+          parent.subagents.set(childSessionId, record);
+          const childState = stateFor(childSessionId, childSessionId);
+          childState.child = true;
+          childState.cwd = parent.cwd;
+          emit({
+            type: "session.opened",
+            sessionId: record.paseoSessionId,
+            parentSessionId: parent.paseoSessionId,
+            ...(record.toolCallId ? { toolCallId: record.toolCallId } : {}),
+            capabilities: [],
+            restoration: "parent" as const,
+            cwd: parent.cwd ?? bridgeDir,
+            ...(record.title ? { title: record.title } : {}),
+          });
+          refreshAgentToolCard(parent, record);
+        }
+        if (record.adopted) {
+          if (ref.ended && !record.terminalEmitted) {
+            // The listing carries the accurate outcome; a running poll only
+            // reports coarse completion, so prefer this whenever it arrives.
+            record.terminalEmitted = true;
+            scheduleSubagentBackfill(record);
+            emit({
+              type: "session.turn",
+              sessionId: record.paseoSessionId,
+              turnId: `zcode:subagent:${childSessionId}`,
+              state: endedSubagentTurnState(ref.status),
+            });
+          }
+          return;
+        }
+        record.adopted = true;
+        // Resume is idempotent for active sessions and activates ended ones.
+        await client.requestOk("session/resume", { sessionId: childSessionId }).catch(() => undefined);
+        try {
+          const snapshot = await client.requestOk("session/read", {
+            sessionId: childSessionId,
+            messageLimit: 1000,
+          }) as unknown as CreateOrResumeResult;
+          emitSubagentSnapshot(record, snapshot.messages);
+          if (!record.terminalEmitted) {
+            record.terminalEmitted = true;
+            if (!ref.ended && subagentSnapshotRunning(snapshot)) {
+              startSubagentPolling(parent, record);
+            } else {
+              scheduleSubagentBackfill(record);
+              emit({
+                type: "session.turn",
+                sessionId: record.paseoSessionId,
+                turnId: `zcode:subagent:${childSessionId}`,
+                state: ref.ended
+                  ? endedSubagentTurnState(ref.status)
+                  : String(snapshot.session?.status ?? "") === "error" ? "failed" : "completed",
+              });
+            }
+          }
+        } catch (error) {
+          log("subagent transcript unavailable", {
+            sessionId: childSessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          record.adopted = false;
+        }
+      };
+
+      const subagentSnapshotRunning = (snapshot: CreateOrResumeResult): boolean => {
+        const status = String(snapshot.session?.status ?? "running");
+        return status === "running" || status === "waiting" || status === "paused";
+      };
+
+      const rowSignature = (item: ProviderTimelineItem): string => `${item.id}:${item.type}:${JSON.stringify(item).length}`;
+
+      const emitSubagentSnapshot = (record: SubagentChildRecord, messages: unknown): void => {
+        if (!record.emittedRows) record.emittedRows = new Set();
+        for (const item of zcodeHistoryTimelineItems(messages, record.childSessionId)) {
+          const signature = rowSignature(item);
+          if (record.emittedRows.has(signature)) continue;
+          record.emittedRows.add(signature);
+          emit({ type: "timeline.item", sessionId: record.paseoSessionId, item });
+        }
+      };
+
+      const stopSubagentPolling = (record: SubagentChildRecord): void => {
+        record.pollGeneration = (record.pollGeneration ?? 0) + 1;
+        if (record.pollTimer) {
+          clearTimeout(record.pollTimer);
+          record.pollTimer = undefined;
+        }
+      };
+
+      /**
+       * A child that just ended can report an inactive status before its last
+       * rows are persisted, so re-read it briefly and forward anything new.
+       */
+      const scheduleSubagentBackfill = (record: SubagentChildRecord): void => {
+        stopSubagentPolling(record);
+        const generation = record.pollGeneration ?? 0;
+        let growing = true;
+        const tick = async (): Promise<void> => {
+          if (record.pollGeneration !== generation || !growing) return;
+          try {
+            const snapshot = await client.requestOk("session/read", {
+              sessionId: record.childSessionId,
+              messageLimit: 1000,
+            }) as unknown as CreateOrResumeResult;
+            if (record.pollGeneration !== generation) return;
+            const before = record.emittedRows?.size ?? 0;
+            emitSubagentSnapshot(record, snapshot.messages);
+            growing = (record.emittedRows?.size ?? 0) > before;
+          } catch (error) {
+            log("subagent backfill failed", {
+              sessionId: record.childSessionId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return;
+          }
+          if (growing && record.pollGeneration === generation) {
+            record.pollTimer = setTimeout(() => void tick().catch(() => undefined), subagentSyncTiming.backfillMs);
+            record.pollTimer.unref?.();
+          }
+        };
+        record.pollTimer = setTimeout(() => void tick().catch(() => undefined), subagentSyncTiming.backfillMs);
+        record.pollTimer.unref?.();
+      };
+
+      /**
+       * The app-server pushes session events only for sessions subscribed at
+       * the protocol level and keeps subagent child sessions out of that
+       * stream, so a running child is followed by polling its snapshot until
+       * its own status leaves the active set.
+       */
+      const startSubagentPolling = (parent: SessionState, record: SubagentChildRecord): void => {
+        stopSubagentPolling(record);
+        const generation = record.pollGeneration ?? 0;
+        const tick = async (): Promise<void> => {
+          if (record.pollGeneration !== generation) return;
+          try {
+            const snapshot = await client.requestOk("session/read", {
+              sessionId: record.childSessionId,
+              messageLimit: 1000,
+            }) as unknown as CreateOrResumeResult;
+            if (record.pollGeneration !== generation) return;
+            emitSubagentSnapshot(record, snapshot.messages);
+            if (subagentSnapshotRunning(snapshot)) {
+              record.pollTimer = setTimeout(() => void tick().catch(() => undefined), subagentSyncTiming.subagentPollMs);
+              record.pollTimer.unref?.();
+              return;
+            }
+            record.terminalEmitted = true;
+            emit({
+              type: "session.turn",
+              sessionId: record.paseoSessionId,
+              turnId: `zcode:subagent:${record.childSessionId}`,
+              state: String(snapshot.session?.status ?? "") === "error" ? "failed" : "completed",
+            });
+            scheduleSubagentBackfill(record);
+          } catch (error) {
+            log("subagent poll failed", {
+              sessionId: record.childSessionId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        };
+        record.pollTimer = setTimeout(() => void tick().catch(() => undefined), subagentSyncTiming.subagentPollMs);
+        record.pollTimer.unref?.();
+      };
+
+      const syncSubagents = async (parent: SessionState): Promise<void> => {
+        if (parent.child) return;
+        if (parent.subagentSyncRunning) {
+          parent.subagentSyncQueued = true;
+          return;
+        }
+        parent.subagentSyncRunning = true;
+        try {
+          if (!parent.subagents || !subsessionsNegotiated()) return;
+          let result: SessionSubagentsResult;
+          try {
+            result = await client.requestOk("session/subagents", {
+              sessionId: parent.zcodeSessionId,
+              endedLimit: 50,
+            }) as unknown as SessionSubagentsResult;
+          } catch {
+            // Deferred or forgotten parent sessions have no subagent listing.
+            return;
+          }
+          const refs = [
+            ...(result.running ?? []).map((ref) => ({ ...ref, ended: false })),
+            ...(result.ended?.items ?? []).map((ref) => ({ ...ref, ended: true })),
+          ];
+          for (const ref of refs) {
+            try {
+              await adoptSubagent(parent, ref);
+            } catch (error) {
+              log("subagent adoption failed", {
+                childSessionId: ref.childSessionId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        } finally {
+          parent.subagentSyncRunning = false;
+          if (parent.subagentSyncQueued) {
+            parent.subagentSyncQueued = false;
+            scheduleSubagentSync(parent, 0);
+          }
+        }
+      };
+
+      const scheduleSubagentSync = (parent: SessionState, delay: number): void => {
+        if (parent.child) return;
+        const timers = parent.subagentSyncTimers ??= new Set();
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          void syncSubagents(parent).catch((error) => log("subagent sync failed", String(error)));
+        }, delay);
+        timer.unref?.();
+        timers.add(timer);
+      };
+
+      const closeSubagents = (parent: SessionState): void => {
+        for (const timer of parent.subagentSyncTimers ?? []) clearTimeout(timer);
+        parent.subagentSyncTimers?.clear();
+        if (!parent.subagents?.size) return;
+        for (const record of parent.subagents.values()) {
+          stopSubagentPolling(record);
+          emit({ type: "session.closed", sessionId: record.paseoSessionId });
+          sessions.delete(record.childSessionId);
+          zcodeIdFor.delete(record.paseoSessionId);
+        }
+        parent.subagents.clear();
       };
 
       const sessionInputs = new Map<string, Promise<void>>();
@@ -1144,6 +1564,9 @@ export function createZcodeProvider(): ProviderRegistration {
           };
         },
         close: async () => {
+          for (const state of sessions.values()) {
+            if (!state.child) closeSubagents(state);
+          }
           await client.close();
         },
       };
@@ -1200,6 +1623,7 @@ export function createZcodeProvider(): ProviderRegistration {
             state.ready = false;
             state.revision = undefined;
             state.modeEventSeq = undefined;
+            state.cwd = input.config.cwd || bridgeDir;
             const catalog = await ensureCatalog();
             state.catalog = catalog;
             applyOfficialState(state, result);
@@ -1207,6 +1631,7 @@ export function createZcodeProvider(): ProviderRegistration {
             // session.updated { mode, planEnabled }, not by the snapshot.
             await client.requestOk("session/subscribe", { sessionId: zcodeSessionId, deliveryKind: "desktop-continuous" });
             let historyMessages = result.messages;
+            let childSessionIds: Map<string, string> | undefined;
             if (resuming && input.history === "replay") {
               try {
                 const snapshot = await client.requestOk("session/read", {
@@ -1219,6 +1644,27 @@ export function createZcodeProvider(): ProviderRegistration {
                   sessionId: zcodeSessionId,
                   error: error instanceof Error ? error.message : String(error),
                 });
+              }
+              if (subsessionsNegotiated()) {
+                // Map Agent tool calls to their child sessions so replayed
+                // cards link to the subsessions attached below.
+                try {
+                  const listing = await client.requestOk("session/subagents", {
+                    sessionId: zcodeSessionId,
+                    endedLimit: 50,
+                  }) as unknown as SessionSubagentsResult;
+                  childSessionIds = new Map();
+                  for (const ref of [...(listing.running ?? []), ...(listing.ended?.items ?? [])]) {
+                    if (ref.childSessionId && ref.toolCallId) {
+                      childSessionIds.set(ref.toolCallId, ref.childSessionId);
+                    }
+                  }
+                } catch (error) {
+                  log("subagent listing unavailable for replay", {
+                    sessionId: zcodeSessionId,
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
               }
             }
             const current = result.settings?.model?.current ?? result.session.model;
@@ -1247,14 +1693,19 @@ export function createZcodeProvider(): ProviderRegistration {
             emit({ type: "session.persistence", sessionId: input.sessionId, persistence });
             emitSessionConfig(state, state.catalog ?? catalog);
             if (resuming && input.history === "replay") {
-              for (const item of zcodeHistoryTimelineItems(historyMessages, zcodeSessionId)) {
+              for (const item of zcodeHistoryTimelineItems(historyMessages, zcodeSessionId, childSessionIds)) {
                 emit({ type: "timeline.item", sessionId: input.sessionId, item });
               }
             }
             emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
             emit({ type: "request.completed", requestId: input.requestId });
             emitTodos(emit, state, result.todos);
-            emitBackgroundJobs(emit, state, result.projection?.backgroundJobs);
+            emitVisibleBackgroundJobs(state, result.projection?.backgroundJobs);
+            if (resuming) {
+              // Attach (or refresh) subagent child subsessions without
+              // blocking the open handshake.
+              scheduleSubagentSync(state, 0);
+            }
             return;
           }
           case "session.prompt": {
@@ -1336,6 +1787,8 @@ export function createZcodeProvider(): ProviderRegistration {
           }
           case "session.close": {
             const zcodeSessionId = zcodeIdFor.get(input.sessionId) ?? input.sessionId;
+            const state = sessions.get(zcodeSessionId);
+            if (state) closeSubagents(state);
             await client.request("session/close", { sessionId: zcodeSessionId }).catch(() => undefined);
             sessions.delete(zcodeSessionId);
             zcodeIdFor.delete(input.sessionId);
