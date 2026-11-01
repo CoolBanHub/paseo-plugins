@@ -790,6 +790,9 @@ export function createZcodeProvider(): ProviderRegistration {
                 ? firstQuestion.question
                 : "批准后退出计划模式并开始实施。",
               detail: plan ? { type: "plan", text: plan } : undefined,
+              // Paseo's plan card renders the body from metadata.planText
+              // (falling back to input.plan); detail is not displayed here.
+              metadata: plan ? { planText: plan } : undefined,
               actions: [
                 ...(actions.length ? actions : [{
                   id: fallbackAnswer,

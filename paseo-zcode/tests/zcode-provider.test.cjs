@@ -265,6 +265,8 @@ test("plan approval user-input requests become an actionable Paseo plan card", a
   assert.equal(card.request.kind, "plan");
   assert.equal(card.request.name, "ExitPlanMode");
   assert.deepEqual(card.request.detail, { type: "plan", text: plan });
+  // Paseo's plan card renders the body from metadata.planText.
+  assert.deepEqual(card.request.metadata, { planText: plan });
   assert.deepEqual(card.request.actions, [
     { id: "approve", label: "批准并开始实施", behavior: "allow", intent: "implement_resume" },
     { id: "decline", label: "拒绝计划", behavior: "deny", intent: "dismiss" },
