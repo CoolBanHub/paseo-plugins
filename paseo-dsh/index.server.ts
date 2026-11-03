@@ -4,8 +4,10 @@ import { createDshConnector } from "./server/dsh-acp";
 import { dshCatalogCacheKey } from "./server/dsh-catalog";
 import { dshPtcTransformer } from "./server/ptc-present";
 import { dshToolTransformer } from "./server/tool-present";
+import { dshEventTransformer } from "./server/dsh-events";
 import { currentDshSessionLaunchContext, withDshSessionLaunchContext } from "./server/session-launch-context";
 import { withDshHistoryReplay } from "./server/history-replay";
+import { withDshQuestions } from "./server/dsh-questions";
 
 export default function contribute(server: PluginServerContext) {
   const acpProvider = runAcpProvider({
@@ -16,7 +18,7 @@ export default function contribute(server: PluginServerContext) {
     // npx resolution plus first-run acp profile initialization can exceed
     // the 10s default.
     acpOptions: { startupTimeoutMs: 60_000 },
-    transformers: [dshPtcTransformer, dshToolTransformer],
+    transformers: [dshPtcTransformer, dshToolTransformer, dshEventTransformer],
     connector: createDshConnector(
       (message, detail) =>
         console.log(`[dsh] ${message}`, detail === undefined ? "" : JSON.stringify(detail).slice(0, 600)),
@@ -24,9 +26,9 @@ export default function contribute(server: PluginServerContext) {
     ),
   });
 
-  server.registerProvider(withDshHistoryReplay(withDshSessionLaunchContext({
+  server.registerProvider(withDshQuestions(withDshHistoryReplay(withDshSessionLaunchContext({
     ...acpProvider,
     getCatalogCacheKey: async (options) => dshCatalogCacheKey(options),
-  })));
+  }))));
   return () => {};
 }

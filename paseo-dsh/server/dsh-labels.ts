@@ -18,6 +18,11 @@ export const PERMISSION_SETTING_ID = "paseo_dsh_permission_preset";
 export const PERMISSION_SETTING_NAME = "权限";
 export const PERMISSION_SETTING_DESCRIPTION = "选择此项目会话的 dsh 权限模式。";
 
+/** dsh's plan mode is a session toggle, not an Agent preset. */
+export const PLAN_SETTING_ID = "paseo_dsh_plan_mode";
+export const PLAN_SETTING_NAME = "Plan mode";
+export const PLAN_SETTING_DESCRIPTION = "先只读分析并提交计划，审批通过后再执行。";
+
 // Permission labels mirror the dsh desktop app's zh-CN strings
 // (preset.readOnly / preset.workspaceWrite / preset.fullAccess); values stay
 // dsh-protocol-level and are passed to dsh's permissionPresets verbatim.
@@ -50,4 +55,9 @@ export const dshCatalogShape = JSON.stringify({
   },
   permissionOptions: DEFAULT_PERMISSION_OPTIONS,
   permissionLabels: PERMISSION_LABELS,
+  planSetting: {
+    id: PLAN_SETTING_ID,
+    name: PLAN_SETTING_NAME,
+    description: PLAN_SETTING_DESCRIPTION,
+  },
 });

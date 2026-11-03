@@ -15,6 +15,7 @@ import {
 import {
   DSH_TOOL_CALL_METHOD,
   DSH_TOOL_RESULT_METHOD,
+  dshToolDetail,
   dshToolTimelineUpdates,
 } from "../server/tool-present.ts";
 
@@ -129,6 +130,13 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
     );
     assert.match(bridgeSource, /DSH_PTC_EVENT_FILE/);
     assert.match(bridgeSource, /tool\/ptc-dispatch/);
+    assert.match(bridgeSource, /user-questions\/request/);
+    assert.match(bridgeSource, /llm\/retry/);
+    assert.match(bridgeSource, /compaction\/start/);
+    assert.match(bridgeSource, /job\/registered/);
+    assert.match(bridgeSource, /subagent\/start/);
+    assert.match(bridgeSource, /commands\.execute/);
+    assert.match(bridgeSource, /planMode\.set/);
 
     const session = await conn.connection.newSession({
       cwd: "/tmp",
@@ -370,4 +378,27 @@ test("a dispatch-free PTC program surfaces one fallback row", async () => {
   } finally {
     await conn.stream.writable.close();
   }
+});
+
+test("dsh-specific tools get readable structured details", () => {
+  const mcp = dshToolDetail("mcp__paseo__browser_navigate", { url: "https://example.com" });
+  assert.equal(mcp.type, "plain_text");
+  if (mcp.type === "plain_text") {
+    assert.equal(mcp.label, "paseo · browser_navigate");
+    assert.match(mcp.text ?? "", /example\.com/);
+    assert.equal(mcp.icon, "wrench");
+  }
+  const present = dshToolDetail("present", { files: [{ path: "/tmp/a.docx" }, { path: "/tmp/b.xlsx" }] });
+  assert.equal(
+    present.type === "plain_text" && present.text,
+    "/tmp/a.docx\n/tmp/b.xlsx",
+  );
+  const plan = dshToolDetail("exit_plan_mode", { plan: "# Plan\nDo the thing" });
+  assert.equal(plan.type === "plain_text" && plan.text, "# Plan\nDo the thing");
+  const workflow = dshToolDetail("workflow", { meta: { name: "release", description: "Ship it" } });
+  assert.equal(workflow.type === "plain_text" && workflow.label, "release");
+  const skill = dshToolDetail("skill", { name: "eino-agent" });
+  assert.equal(skill.type === "plain_text" && skill.label, "Skill · eino-agent");
+  const goal = dshToolDetail("create_goal", { objective: "Finish the migration" });
+  assert.equal(goal.type === "plain_text" && goal.text, "Finish the migration");
 });

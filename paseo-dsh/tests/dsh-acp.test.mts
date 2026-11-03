@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import {
   dshCatalogShape,
 } from "../server/dsh-labels.ts";
 import { dshCatalogCacheKey, resolvePluginSourceRoot, writeWebModelOverlay } from "../server/dsh-catalog.ts";
+import { resolveDshQuestion } from "../server/dsh-questions.ts";
 import {
   currentDshSessionLaunchContext,
   withDshSessionLaunchContext,
@@ -63,6 +64,49 @@ process.env.DSH_WEB_PRESET_ROOT = presetPatchRoot;
 process.env.DSH_WEB_PROFILE_ROOT = webProfileRoot;
 process.env.DSH_ACP_PROFILE_ROOT = acpProfileRoot;
 test.after(() => rmSync(home, { recursive: true, force: true }));
+
+/** Play the in-dsh bridge: pick a command request and settle it. */
+async function answerBridgeCommand(line: string, text: string): Promise<boolean> {
+  const root = join(home, "plugin-data", "dsh");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    let dirs: string[] = [];
+    try {
+      dirs = readdirSync(root).filter((file) => file.startsWith("bridge-requests-"));
+    } catch {
+      // The connector has not created its directories yet.
+    }
+    for (const dir of dirs) {
+      const requestDir = join(root, dir);
+      let files: string[] = [];
+      try {
+        files = readdirSync(requestDir);
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        if (!file.endsWith(".json")) continue;
+        const path = join(requestDir, file);
+        let request: { kind?: unknown; line?: unknown } | undefined;
+        try {
+          request = JSON.parse(readFileSync(path, "utf8")) as typeof request;
+        } catch {
+          continue;
+        }
+        if (request?.kind !== "command" || request.line !== line) continue;
+        rmSync(path, { force: true });
+        const responseDir = join(root, dir.replace("bridge-requests-", "bridge-responses-"));
+        writeFileSync(join(responseDir, file), JSON.stringify({
+          ok: true,
+          result: { kind: "success", text },
+        }));
+        return true;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
 
 async function openConnection(options?: { mode?: string }) {
   const permissionRequests: Array<Record<string, unknown>> = [];
@@ -166,6 +210,40 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
       "selected permission is forwarded to the dsh bridge",
     );
 
+    // Plan mode is exposed as a session toggle beside the permission preset.
+    const planOption = (real.configOptions ?? []).find((option) => option.id === "paseo_dsh_plan_mode");
+    assert.ok(planOption?.type === "boolean", "plan mode is a boolean config option");
+    assert.equal(planOption?.currentValue, false, "new sessions start outside plan mode");
+    const changedPlan = await first.connection.setSessionConfigOption({
+      sessionId: real.sessionId,
+      configId: "paseo_dsh_plan_mode",
+      type: "boolean",
+      value: true,
+    } as never);
+    const selectedPlan = changedPlan.configOptions.find((option) => option.id === "paseo_dsh_plan_mode");
+    assert.equal(
+      selectedPlan?.type === "boolean" && selectedPlan.currentValue,
+      true,
+      "Paseo receives the selected plan mode value",
+    );
+    const planFile = readdirSync(join(home, "plugin-data", "dsh"))
+      .find((file) => file.startsWith("plan-control-"));
+    assert.ok(planFile, "per-process plan control file exists");
+    const planSelection = JSON.parse(readFileSync(join(home, "plugin-data", "dsh", planFile!), "utf8"))[real.sessionId];
+    assert.equal(planSelection?.active, true, "plan mode selection is forwarded to the dsh bridge");
+    assert.equal(typeof planSelection?.requestId, "string", "each user toggle carries a fresh bridge request id");
+
+    // Session imports carry the title and activity from dsh's projection cache.
+    const projectionDir = join(home, "storages", "session_projcache", "sessions");
+    mkdirSync(projectionDir, { recursive: true });
+    writeFileSync(join(projectionDir, `${real.sessionId}.json`), JSON.stringify({
+      version: 7,
+      record: { rows: {
+        title: { val: "Mock session title" },
+        sessionListMetadata: { val: { lastPromptAt: 1_700_000_000_000 } },
+      } },
+    }));
+
     await first.connection.setSessionMode({ sessionId: real.sessionId, modeId: "ptc" });
     await first.connection.prompt({
       sessionId: real.sessionId,
@@ -209,6 +287,113 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
     assert.ok(!ids.includes(probe.sessionId), "live probe session hidden");
     assert.ok(!ids.includes("legacy-probe"), "registry session hidden");
     assert.ok(ids.includes(real.sessionId), "real session visible");
+    const listedReal = listed.sessions.find((session) => session.sessionId === real.sessionId) as
+      | { title?: string; updatedAt?: string }
+      | undefined;
+    assert.equal(listedReal?.title, "Mock session title", "dsh's cached title reaches Paseo's session list");
+    assert.equal(
+      listedReal?.updatedAt,
+      new Date(1_700_000_000_000).toISOString(),
+      "dsh's cached last-prompt time reaches Paseo's session list",
+    );
+
+    // The bridge's command catalog becomes an ACP available_commands update.
+    const commandCatalog = readdirSync(join(home, "plugin-data", "dsh"))
+      .find((file) => file.startsWith("command-catalog-"));
+    assert.ok(commandCatalog, "per-process command catalog file exists");
+    writeFileSync(join(home, "plugin-data", "dsh", commandCatalog!), JSON.stringify({
+      [real.sessionId]: [
+        { name: "plan", description: "Enter or leave plan mode", argumentHint: "[off|message]" },
+        { name: "compact", description: "Compact the session" },
+      ],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    const commandsUpdate = first.sessionUpdates
+      .map((notification) => notification.update as {
+        sessionUpdate?: string;
+        availableCommands?: Array<{ name?: string; description?: string }>;
+      } | undefined)
+      .find((update) => update?.sessionUpdate === "available_commands_update");
+    assert.deepEqual(
+      commandsUpdate?.availableCommands?.map((command) => command.name),
+      ["plan", "compact"],
+      "dsh's command registry reaches Paseo's command menu",
+    );
+
+    // A slash command is executed by the bridge, not sent to the model.
+    const beforeCommand = first.sessionUpdates.length;
+    const commandPrompt = first.connection.prompt({
+      sessionId: real.sessionId,
+      prompt: [{ type: "text", text: "/plan off" }],
+    });
+    assert.equal(await answerBridgeCommand("/plan off", "Plan mode off."), true, "command reached the bridge");
+    assert.equal((await commandPrompt).stopReason, "end_turn", "the command settles the ACP prompt");
+    const echoed = first.sessionUpdates
+      .slice(beforeCommand)
+      .map((notification) => notification.update as { content?: { text?: string } } | undefined)
+      .map((update) => update?.content?.text ?? "")
+      .join("\n");
+    assert.doesNotMatch(echoed, /\/plan off/, "the command never reaches the model as a user message");
+
+    // A mirrored question becomes Paseo's native form request; the answer is
+    // mapped back into dsh's answer shape.
+    const eventFile = readdirSync(join(home, "plugin-data", "dsh"))
+      .find((file) => file.startsWith("dsh-events-"));
+    assert.ok(eventFile, "per-process event sidecar exists");
+    appendFileSync(join(home, "plugin-data", "dsh", eventFile!), JSON.stringify({
+      kind: "question",
+      sessionId: real.sessionId,
+      data: {
+        requestId: "q-flow-1",
+        questions: [{
+          id: "confirm",
+          header: "Confirm",
+          question: "Proceed?",
+          options: [{ label: "Yes" }, { label: "No" }],
+        }],
+      },
+    }) + "\n");
+    let questionCall: Record<string, unknown> | undefined;
+    const questionDeadline = Date.now() + 5_000;
+    while (Date.now() < questionDeadline) {
+      questionCall = first.permissionRequests.find((request) => {
+        const call = (request as { toolCall?: { toolCallId?: unknown } }).toolCall;
+        return typeof call?.toolCallId === "string" && call.toolCallId.startsWith("paseo-question-");
+      }) as Record<string, unknown> | undefined;
+      if (questionCall) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(questionCall, "question reaches Paseo as a permission request");
+    const questionToolCall = questionCall.toolCall as {
+      toolCallId: string;
+      rawInput?: { questions?: unknown };
+    };
+    assert.deepEqual(
+      questionToolCall.rawInput?.questions,
+      [{
+        header: "Confirm",
+        question: "Proceed?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        multiSelect: false,
+        allowOther: true,
+        allowEmpty: false,
+      }],
+      "the question is shaped for Paseo's native form",
+    );
+    assert.equal(resolveDshQuestion(questionToolCall.toolCallId, { Confirm: "Yes" }), true);
+    const responseDir = readdirSync(join(home, "plugin-data", "dsh"))
+      .find((file) => file.startsWith("bridge-responses-"));
+    assert.ok(responseDir, "bridge response directory exists");
+    const answerFile = join(home, "plugin-data", "dsh", responseDir!, "q-flow-1.json");
+    const answerDeadline = Date.now() + 5_000;
+    while (!existsSync(answerFile) && Date.now() < answerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.deepEqual(
+      JSON.parse(readFileSync(answerFile, "utf8")),
+      { answers: [{ id: "confirm", selected: ["Yes"] }] },
+      "the form answer is mapped back into dsh's answer shape",
+    );
   } finally {
     await first.stream.writable.close();
   }

@@ -21,6 +21,25 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function plain(
+  label: string,
+  body?: string,
+  icon?: Extract<ProviderToolCallDetail, { type: "plain_text" }>["icon"],
+): ProviderToolCallDetail {
+  return { type: "plain_text", label, ...(body ? { text: body.slice(0, 4000) } : {}), ...(icon ? { icon } : {}) };
+}
+
+function mcpDetail(name: string, input: Record<string, unknown>): ProviderToolCallDetail | undefined {
+  if (!name.startsWith("mcp__")) return undefined;
+  const rest = name.slice("mcp__".length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0 || separator >= rest.length - 2) return plain(name, undefined, "wrench");
+  const server = rest.slice(0, separator);
+  const tool = rest.slice(separator + 2);
+  const args = Object.keys(input).length ? JSON.stringify(input, null, 2) : undefined;
+  return plain(`${server} · ${tool}`, args, "wrench");
+}
+
 /**
  * Map one dsh tool invocation to Paseo's structured tool-call detail, the
  * same mapping the ZCode provider uses so rows render identically across
@@ -71,12 +90,52 @@ export function dshToolDetail(name: string, args: Record<string, unknown> | unde
         icon: "square_terminal",
       };
     case "subagent":
+    case "subagent_fork":
       return {
         type: "sub_agent",
         subAgentType: text(input.type ?? input.subagent_type),
         description: text(input.description),
         log: "",
       };
+    case "exit_plan_mode":
+      return plain("Plan review", text(input.plan), "sparkles");
+    case "create_goal":
+    case "update_goal":
+    case "get_goal":
+      return plain(
+        "Goal",
+        text(input.objective) ?? text(input.description) ?? text(input.goal),
+        "sparkles",
+      );
+    case "working_directory":
+      return plain("Working directory", text(input.cwd) ?? text(input.path), "square_terminal");
+    case "skill":
+      return plain(text(input.name) ? `Skill · ${input.name}` : "Skill", undefined, "sparkles");
+    case "present": {
+      const files = Array.isArray(input.files)
+        ? input.files
+          .map((file) => typeof file === "string" ? file : text((file as Record<string, unknown>)?.path))
+          .filter((file): file is string => !!file)
+        : [];
+      return plain("Delivered files", files.join("\n"), "eye");
+    }
+    case "workflow": {
+      const meta = input.meta && typeof input.meta === "object" && !Array.isArray(input.meta)
+        ? input.meta as Record<string, unknown>
+        : {};
+      return plain(
+        text(meta.name) ?? "Workflow",
+        text(meta.description) ?? text(meta.whenToUse),
+        "sparkles",
+      );
+    }
+    case "job_list":
+    case "job_output":
+    case "job_kill":
+    case "send_message":
+    case "interrupt_agent":
+    case "list_agents":
+      return plain(name, text(input.job_id) ?? text(input.message) ?? text(input.description), "square_terminal");
     case "ask_user_question": {
       const first = Array.isArray(input.questions)
         ? input.questions.find((question): question is Record<string, unknown> =>
@@ -86,7 +145,7 @@ export function dshToolDetail(name: string, args: Record<string, unknown> | unde
       return { type: "plain_text", label: text(first?.header) ?? text(input.description) ?? name };
     }
     default:
-      return { type: "plain_text", label: text(input.description) ?? name };
+      return mcpDetail(name, input) ?? { type: "plain_text", label: text(input.description) ?? name };
   }
 }
 

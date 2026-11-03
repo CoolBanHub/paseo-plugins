@@ -118,6 +118,23 @@ export function readDshSessionEvents(
   return events;
 }
 
+/** Last modification time of a session log, for Paseo's session list. */
+export function dshSessionUpdatedAt(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home"> = {},
+): string | undefined {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
+  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
+  if (!sessionDir) return undefined;
+  const path = sessionLogPath(sessionDir);
+  if (!path) return undefined;
+  try {
+    return new Date(statSync(path).mtimeMs).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
 function hasConversationEvent(log: string): boolean {
   // Catalog probes only carry initialization records. Any user, assistant or
   // tool event means the session was actually used and must be preserved.

@@ -122,8 +122,48 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   The separate 权限 setting maps to dsh's current permission preset
   service, including optional presets such as Auto review when the ACP profile
   has them enabled.
-- Session import lists persisted dsh sessions for the project directory
-  (dsh returns no titles, so entries appear by session id).
+- Session import lists persisted dsh sessions for the project directory.
+  Titles and last-activity times come from dsh's per-session projection
+  cache, so entries no longer appear as bare session ids.
+- `ask_user_question` is answered through Paseo's native question form.
+  The bridge registers a `user-questions/request` answerer, the connector
+  forwards the question batch as a `kind: "question"` permission request,
+  and the wrapper returns the form's answers to dsh. Options, multi-select
+  and free-text "Other" work; a single-select custom answer becomes dsh's
+  `custom` field. `exit_plan_mode` uses the same channel, so plan review
+  renders the plan in the timeline and accepts approve / keep-planning /
+  feedback.
+- Plan mode is also a session toggle next to the permission preset. dsh's
+  own `/plan` changes flow back into the toggle, and dsh's command registry
+  is published as Paseo slash commands (`/plan`, `/compact`, `/goal`,
+  `/permission`, …). A slash command is executed by dsh's command service
+  through the bridge instead of being sent to the model; the command's text
+  result appears as a Paseo notice.
+- Retries and compaction surface as they happen: `llm/retry` becomes a
+  warning notice, and `compaction/start|summary|end` becomes Paseo's native
+  compaction timeline item with manual/auto attribution and pre-compaction
+  token counts.
+- Background jobs (`job/registered` / `job/settled`) render as Shell or
+  labelled status rows with the originating command and terminal detail.
+  Subagent runs update their `sub_agent` card with the child session id,
+  provider, status and final output. Goal changes render as a stable Goal
+  row, working-directory changes as a notice, and `present` tool calls list
+  the delivered files. MCP and skill tools get readable `server · tool` /
+  `Skill · name` labels instead of raw tool ids.
+- History replay restores the same todo, background-job, compaction, goal
+  and subagent identity rows in addition to the existing conversation and
+  PTC rows.
+- Subagent cards carry the child session id, but Paseo does not open them
+  as nested sessions: the ACP adapter has no `session.subsession`
+  capability, so child transcripts stay available in dsh's own clients.
+- Images and other non-text assistant/tool output are still not carried
+  over. Commands come from dsh's live registry, so a preset without a
+  command service exposes no slash commands; commands that start their own
+  turn settle the ACP prompt when the command returns. Timed
+  `ask_user_question` calls (`mode: timed`) are not reattached after their
+  foreground wait expires; the shipped presets use blocking mode.
+- The ACP adapter does not implement `session.archive`, `session.unarchive`
+  or `session.revert`; those operations remain dsh-client features.
 - The plugin is kept on the same `@getpaseo/plugin` protocol version as the
   Paseo daemon. It also normalizes dsh failed tool updates that omit an error
   payload, because Paseo requires a JSON error for failed timeline tool items.
@@ -139,8 +179,7 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   content output, instead of the bare tool name; `todo_write` updates
   Paseo's native todo list, live and on history replay. The connector
   replaces dsh's `kind: "other"` tool updates in flight, so no opaque
-  "unknown" row is left behind. Images and dsh-specific presentation cards
-  outside the standard ACP update surface are still not carried over.
+  "unknown" row is left behind.
 - In PTC presets every tool runs inside one `run_code` program, and dsh's
   ACP bridge only reports that aggregate call. The bridge plugin mounted
   into each spawn mirrors dsh's internal per-tool dispatch events into a

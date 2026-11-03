@@ -9,6 +9,7 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import { dshPtcTimelineUpdates, DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
 import { dshTodoItem, dshToolDetail, dshToolDetailWithOutput } from "./tool-present.ts";
+import { DSH_EVENT_METHOD, dshEventUpdates } from "./dsh-events.ts";
 import { dshHomePath, readDshSessionEvents, type DshSessionEvent } from "./probe-cleanup.ts";
 
 const MAX_REPLAY_ITEMS = 4_000;
@@ -53,8 +54,14 @@ function settledToolItem(
   output: unknown,
   failed: boolean,
 ): ProviderTimelineItem {
-  const detail = toolDetail(name, args, output);
+  let detail = toolDetail(name, args, output);
   const resultText = typeof output === "string" ? output : textContent(output);
+  if ((name === "subagent" || name === "subagent_fork") && detail.type === "sub_agent") {
+    // dsh answers a delegation with "started subagent <childId>"; link the
+    // child session so the restored card can show its identity.
+    const match = /started subagent ([A-Za-z0-9_-]+)/.exec(resultText);
+    if (match) detail = { ...detail, childSessionId: match[1] };
+  }
   return failed
     ? { type: "tool_call", id, callId: id, name, status: "failed", error: resultText || `${name} failed`, detail }
     : { type: "tool_call", id, callId: id, name, status: "completed", error: null, detail };
@@ -75,6 +82,9 @@ export function dshHistoryTimelineItems(
 
   const items: ProviderTimelineItem[] = [];
   const calls = new Map<string, { name: string; arguments?: Record<string, unknown> }>();
+  // Calls are removed from `calls` when their result settles, but later job
+  // events still need the originating command.
+  const knownCalls = new Map<string, { name: string; arguments?: Record<string, unknown> }>();
   for (const event of ordered) {
     const data = event.data ?? {};
     const identity = `dsh:history:${sessionId}:${event.seq ?? items.length}`;
@@ -116,6 +126,7 @@ export function dshHistoryTimelineItems(
       if (!callId) continue;
       const args = parseArguments(data.arguments);
       calls.set(callId, { name, arguments: args });
+      knownCalls.set(callId, { name, arguments: args });
       if (name === "run_code" && ptcRoots.has(callId)) continue;
       items.push({
         type: "tool_call",
@@ -146,6 +157,30 @@ export function dshHistoryTimelineItems(
       // produced it only carries the same arguments.
       const todo = dshTodoItem(object(data), sessionId);
       if (todo) items.push(todo);
+      continue;
+    }
+
+    const replayKind = event.type === "job/registered" ? "job-registered"
+      : event.type === "job/settled" ? "job-settled"
+        : event.type === "compaction/start" ? "compaction-start"
+          : event.type === "compaction/summary" ? "compaction-summary"
+            : event.type === "compaction/end" ? "compaction-end"
+              : event.type === "goal/change" ? "goal-change"
+                : undefined;
+    if (replayKind) {
+      const replayData = { ...data };
+      if (event.type === "job/registered" || event.type === "job/settled") {
+        const toolCall = object(data.toolCall);
+        const call = typeof toolCall?.callId === "string" ? knownCalls.get(toolCall.callId) : undefined;
+        const command = call?.arguments && typeof call.arguments.command === "string"
+          ? call.arguments.command
+          : undefined;
+        if (command) replayData.command = command;
+      }
+      const updates = dshEventUpdates(DSH_EVENT_METHOD, { kind: replayKind, data: replayData }, sessionId) ?? [];
+      for (const update of updates) {
+        if (update.type === "timeline") items.push(update.item);
+      }
       continue;
     }
 

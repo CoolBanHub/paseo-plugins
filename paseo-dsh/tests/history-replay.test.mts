@@ -58,11 +58,56 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
         ],
       },
     },
+    {
+      type: "job/registered",
+      seq: 11,
+      data: {
+        jobId: "job-1",
+        owner: "session",
+        kind: "bash",
+        label: "Build",
+        startedAt: 1,
+        toolCall: { callId: "tool-1", rootCallId: "tool-1" },
+      },
+    },
+    {
+      type: "job/settled",
+      seq: 12,
+      data: {
+        jobId: "job-1",
+        owner: "session",
+        kind: "bash",
+        label: "Build",
+        startedAt: 1,
+        finishedAt: 2,
+        status: "completed",
+        cause: "producer",
+        producerReported: true,
+        toolCall: { callId: "tool-1", rootCallId: "tool-1" },
+      },
+    },
+    { type: "compaction/start", seq: 13, data: { compactionId: "compaction-1", turn: 1 } },
+    { type: "compaction/end", seq: 14, data: { compactionId: "compaction-1", turn: 1 } },
+    {
+      type: "goal/change",
+      seq: 15,
+      data: {
+        kind: "goal/change",
+        version: 1,
+        operation: "create",
+        goal: { id: "goal-1", revision: 1, objective: "Ship it", phase: "active" },
+        roundsStarted: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    },
   ];
 
   const items = dshHistoryTimelineItems("history-a", ptcEvents);
   assert.deepEqual(items.map((item) => item.type), [
-    "user_message", "reasoning", "assistant_message", "tool_call", "tool_call", "tool_call", "tool_call", "todo",
+    "user_message", "reasoning", "assistant_message",
+    "tool_call", "tool_call", "tool_call", "tool_call", "todo",
+    "tool_call", "tool_call", "compaction", "compaction", "tool_call",
   ]);
   assert.equal(items[0]?.id, "user-id");
   assert.equal(items[0]?.type === "user_message" ? items[0].text : "", "Hello");
@@ -84,6 +129,17 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
     ],
     "the durable todo/write event restores the native plan list",
   );
+  const job = items[8];
+  assert.equal(job?.type === "tool_call" && job.name, "Build");
+  assert.deepEqual(
+    job?.type === "tool_call" && job.detail,
+    { type: "shell", command: "pwd" },
+    "a background job restores with its originating command",
+  );
+  assert.equal(items[9]?.type === "tool_call" && items[9].status, "completed");
+  assert.equal(items[10]?.type === "compaction" && items[10].status, "loading");
+  assert.equal(items[11]?.type === "compaction" && items[11].status, "completed");
+  assert.equal(items[12]?.id, "dsh:goal");
   assert.ok(!items.some((item) => item.id === "run-1"), "a run_code call with mirrored dispatches is not shown twice");
   assert.ok(!items.some((item) => item.type === "user_message" && item.text.includes("Do not display")));
 });

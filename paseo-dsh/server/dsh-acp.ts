@@ -22,6 +22,9 @@ import type { DshSessionLaunchContext } from "./session-launch-context";
 import { writeWebModelOverlay } from "./dsh-catalog.ts";
 import { DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
 import { DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD } from "./tool-present.ts";
+import { DSH_EVENT_METHOD } from "./dsh-events.ts";
+import { dshSessionLastActivity, dshSessionPlanActive, dshSessionTitle } from "./dsh-projections.ts";
+import { cancelAllDshQuestions, cancelDshQuestion, registerDshQuestion } from "./dsh-questions.ts";
 import {
   DEFAULT_PERMISSION_OPTIONS,
   DSH_MODES,
@@ -29,6 +32,9 @@ import {
   PERMISSION_SETTING_DESCRIPTION,
   PERMISSION_SETTING_ID,
   PERMISSION_SETTING_NAME,
+  PLAN_SETTING_DESCRIPTION,
+  PLAN_SETTING_ID,
+  PLAN_SETTING_NAME,
 } from "./dsh-labels.ts";
 import type { DshModeId } from "./dsh-labels.ts";
 import {
@@ -139,34 +145,104 @@ function versionTupleOf(nodePath: string): number[] | undefined {
 
 const nodeVersionCache = new Map<string, number[]>();
 
-const AGENT_PRESET_BRIDGE_SOURCE = `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+const AGENT_PRESET_BRIDGE_SOURCE = `import { appendFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
+const NL = String.fromCharCode(10);
 const PRESETS = new Set(["standard", "ptc", "minimal", "cordis"]);
 const permissionAgents = new Map();
 const appliedPermissions = new Map();
+const appliedPlanRequests = new Map();
+const toolCalls = new Map();
+const subagentRuns = new Map();
+const startedRuns = new Set();
 const controlFile = process.env.DSH_PERMISSION_CONTROL_FILE;
 const catalogFile = process.env.DSH_PERMISSION_CATALOG_FILE;
 const ptcEventFile = process.env.DSH_PTC_EVENT_FILE;
+const eventFile = process.env.DSH_EVENT_FILE;
+const requestDir = process.env.DSH_BRIDGE_REQUEST_DIR;
+const responseDir = process.env.DSH_BRIDGE_RESPONSE_DIR;
+const commandCatalogFile = process.env.DSH_COMMAND_CATALOG_FILE;
+const planControlFile = process.env.DSH_PLAN_CONTROL_FILE;
+let questionSeq = 0;
+let pollTick = 0;
+let processingRequests = false;
 
 export const name = "paseo-dsh-agent-preset-bridge";
 export const inject = ["agentPresets", "sessionProjections", "permissionPresets"];
 
+function cap(value) {
+  if (typeof value === "string") return value.length > 20000 ? value.slice(0, 20000) : value;
+  if (Array.isArray(value)) return value.map(cap);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map((entry) => [entry[0], cap(entry[1])]));
+  }
+  return value;
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function writeJson(file, value) {
+  try {
+    writeFileSync(file, JSON.stringify(value));
+  } catch {
+    // The connector may have torn down its directories on close.
+  }
+}
+
+function appendEvent(kind, sessionId, data) {
+  if (!eventFile) return;
+  try {
+    appendFileSync(eventFile, JSON.stringify({ kind, sessionId, data: cap(data) }) + NL);
+  } catch {
+    // Event mirroring is best-effort; the agent must keep running.
+  }
+}
+
+function textOf(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(textOf).filter(Boolean).join(NL);
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.message === "string") return value.message;
+  }
+  return "";
+}
+
+function parseArgs(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function selectedPermissions() {
   if (!controlFile) return {};
-  try {
-    return JSON.parse(readFileSync(controlFile, "utf8"));
-  } catch {
-    return {};
-  }
+  const parsed = readJson(controlFile);
+  return parsed && typeof parsed === "object" ? parsed : {};
+}
+
+function planSelections() {
+  if (!planControlFile) return {};
+  const parsed = readJson(planControlFile);
+  return parsed && typeof parsed === "object" ? parsed : {};
 }
 
 async function writeCatalog(ctx) {
   if (!catalogFile) return;
   try {
     const catalog = await ctx.permissionPresets.catalog();
-    const sessionPermissions = Object.fromEntries([...permissionAgents].map(([id, agent]) => [
-      id,
-      ctx.permissionPresets.current(agent.session),
+    const sessionPermissions = Object.fromEntries([...permissionAgents].map((entry) => [
+      entry[0],
+      ctx.permissionPresets.current(entry[1].session),
     ]));
     writeFileSync(catalogFile, JSON.stringify({
       ...catalog,
@@ -189,20 +265,56 @@ async function applyPermission(ctx, agent, preset) {
   }
 }
 
+async function applyPlanRequest(ctx, agent, entry) {
+  if (!entry || typeof entry !== "object") return;
+  const active = entry.active;
+  const requestId = entry.requestId;
+  // A request id makes a repeated user toggle apply even when its value
+  // equals the previous one; entries without one are only UI state.
+  if (typeof active !== "boolean" || typeof requestId !== "string") return;
+  const sessionId = agent.session.id;
+  if (appliedPlanRequests.get(sessionId) === requestId) return;
+  const planMode = ctx.get("planMode");
+  if (!planMode || typeof planMode.set !== "function") return;
+  try {
+    planMode.set(agent, active);
+    appliedPlanRequests.set(sessionId, requestId);
+  } catch (error) {
+    ctx.logger.warn("paseo-dsh: plan mode could not be applied", { active, error });
+  }
+}
+
+function writeCommandCatalog(ctx) {
+  if (!commandCatalogFile) return;
+  const commands = ctx.get("commands");
+  if (!commands || typeof commands.list !== "function") return;
+  const result = {};
+  for (const entry of permissionAgents) {
+    try {
+      result[entry[0]] = commands.list(entry[1]).map((command) => ({
+        name: command.name,
+        description: command.description,
+        ...(command.input && command.input.hint ? { argumentHint: command.input.hint } : {}),
+      }));
+    } catch {
+      // A closing agent can fail discovery; the next tick retries.
+    }
+  }
+  writeJson(commandCatalogFile, result);
+}
+
+function emitSubagentStart(sessionId, callId, childId, provider, label) {
+  if (startedRuns.has(childId)) return;
+  startedRuns.add(childId);
+  appendEvent("subagent-start", sessionId, { callId, childId, provider, label });
+}
+
 // Mirror dsh's internal PTC sub-call events into a JSONL sidecar the Paseo
 // connector tails (see ptc-present.ts). dsh's own ACP bridge only projects
 // the aggregate run_code tool call; the per-tool dispatches recorded here
 // are what dsh's clients render as detailed rows.
 function ptcMirror(ctx) {
   if (!ptcEventFile) return;
-  const cap = (value) => {
-    if (typeof value === "string") return value.length > 20000 ? value.slice(0, 20000) : value;
-    if (Array.isArray(value)) return value.map(cap);
-    if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cap(item)]));
-    }
-    return value;
-  };
   ctx.on("session/event", (session, event) => {
     if (event.type !== "tool/ptc-dispatch-start" && event.type !== "tool/ptc-dispatch") return;
     try {
@@ -218,11 +330,214 @@ function ptcMirror(ctx) {
           isError: event.data.isError,
           content: event.data.content,
         }),
-      }) + "\\n");
+      }) + NL);
     } catch (error) {
       ctx.logger.warn("paseo-dsh: ptc event mirror failed", error);
     }
   });
+}
+
+function recordSubagent(sessionId, callId, call, content) {
+  if (!call || (call.name !== "subagent" && call.name !== "subagent_fork")) return;
+  const output = textOf(content);
+  const match = /started subagent ([A-Za-z0-9_-]+)/.exec(output);
+  if (!match) return;
+  const args = call.arguments && typeof call.arguments === "object" ? call.arguments : {};
+  subagentRuns.set(match[1], {
+    sessionId,
+    callId,
+    label: typeof args.description === "string" ? args.description : undefined,
+  });
+  emitSubagentStart(
+    sessionId,
+    callId,
+    match[1],
+    typeof args.type === "string" ? args.type : "subagent",
+    typeof args.description === "string" ? args.description : undefined,
+  );
+}
+
+// Mirror the events Paseo has no ACP projection for: retries, compaction,
+// background jobs, subagents, goals, working-directory changes and plan mode.
+// The connector maps them onto timeline rows and notices.
+function eventMirror(ctx) {
+  if (!eventFile) return;
+  ctx.on("session/event", (session, event) => {
+    const sessionId = session.header.id;
+    const data = event.data || {};
+    try {
+      if (event.type === "tool/call") {
+        toolCalls.set(data.callId, {
+          sessionId,
+          name: data.name,
+          arguments: parseArgs(data.arguments),
+        });
+        if (toolCalls.size > 1000) {
+          const oldest = toolCalls.keys().next().value;
+          if (oldest !== undefined) toolCalls.delete(oldest);
+        }
+        return;
+      }
+      if (event.type === "tool/ptc-dispatch-start") {
+        toolCalls.set(data.subCallId, {
+          sessionId,
+          name: data.name,
+          arguments: data.arguments,
+        });
+        return;
+      }
+      if (event.type === "tool/result") {
+        const message = data.message || {};
+        recordSubagent(sessionId, message.toolCallId, toolCalls.get(message.toolCallId), message.content);
+        return;
+      }
+      if (event.type === "tool/ptc-dispatch") {
+        recordSubagent(sessionId, data.subCallId, toolCalls.get(data.subCallId), data.content);
+        return;
+      }
+      if (event.type === "llm/retry") {
+        appendEvent("llm-retry", sessionId, data);
+        return;
+      }
+      if (event.type === "compaction/start") {
+        appendEvent("compaction-start", sessionId, data);
+        return;
+      }
+      if (event.type === "compaction/summary") {
+        appendEvent("compaction-summary", sessionId, data);
+        return;
+      }
+      if (event.type === "compaction/end") {
+        appendEvent("compaction-end", sessionId, data);
+        return;
+      }
+      if (event.type === "job/registered" || event.type === "job/settled") {
+        const toolCall = data.toolCall && typeof data.toolCall === "object" ? data.toolCall : undefined;
+        const call = toolCall && toolCall.callId ? toolCalls.get(toolCall.callId) : undefined;
+        const args = call && call.arguments && typeof call.arguments === "object" ? call.arguments : {};
+        const command = call && (call.name === "bash" || call.name === "shell" || call.name === "pwsh")
+          ? args.command
+          : undefined;
+        appendEvent(event.type === "job/registered" ? "job-registered" : "job-settled", sessionId, {
+          ...data,
+          command: typeof command === "string" ? command : undefined,
+        });
+        return;
+      }
+      if (event.type === "goal/change") {
+        appendEvent("goal-change", sessionId, data);
+        return;
+      }
+      if (event.type === "working-directory/change") {
+        appendEvent("working-directory", sessionId, data);
+        return;
+      }
+      if (event.type === "plan/mode") {
+        appendEvent("plan-mode", sessionId, data);
+      }
+    } catch (error) {
+      ctx.logger.warn("paseo-dsh: event mirror failed", { type: event.type, error });
+    }
+  });
+
+  ctx.on("subagent/start", (info) => {
+    const run = subagentRuns.get(info.id);
+    if (!run) return;
+    emitSubagentStart(run.sessionId, run.callId, info.id, info.provider, run.label);
+  });
+
+  ctx.on("subagent/end", (info) => {
+    const run = subagentRuns.get(info.id);
+    if (!run) return;
+    appendEvent("subagent-end", run.sessionId, {
+      callId: run.callId,
+      childId: info.id,
+      provider: info.provider,
+      label: run.label,
+      stopReason: info.stopReason,
+      output: textOf(info.lastAssistantMessage),
+    });
+    subagentRuns.delete(info.id);
+    startedRuns.delete(info.id);
+  });
+}
+
+// The ACP app has no answerer for ctx.userQuestions. Relay each request to
+// Paseo's native question form and return the selected labels / custom text.
+function questionBridge(ctx) {
+  if (!eventFile || !responseDir) return;
+  ctx.on("user-questions/request", async (request, next) => {
+    const agent = request.agent;
+    if (!agent || !agent.session) return next();
+    const requestId = "q-" + Date.now().toString(36) + "-" + (++questionSeq);
+    appendEvent("question", agent.session.id, {
+      requestId,
+      questions: request.questions,
+      wait: request.wait,
+    });
+    const answerFile = join(responseDir, requestId + ".json");
+    while (true) {
+      const answer = readJson(answerFile);
+      if (answer && Array.isArray(answer.answers)) {
+        rmSync(answerFile, { force: true });
+        return { answers: answer.answers };
+      }
+      if (request.signal && request.signal.aborted) throw new Error("user question cancelled");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  });
+}
+
+// Commands and plan-mode changes arrive as request files from the connector.
+async function processRequests(ctx) {
+  if (processingRequests || !requestDir || !responseDir) return;
+  processingRequests = true;
+  try {
+    let names;
+    try {
+      names = readdirSync(requestDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const path = join(requestDir, name);
+      const request = readJson(path);
+      rmSync(path, { force: true });
+      if (!request || typeof request !== "object") continue;
+      const requestId = typeof request.requestId === "string" ? request.requestId : name.slice(0, -5);
+      const responseFile = join(responseDir, requestId + ".json");
+      try {
+        if (request.kind === "plan") {
+          const agent = permissionAgents.get(request.sessionId);
+          const planMode = ctx.get("planMode");
+          if (!agent || !planMode || typeof planMode.set !== "function") throw new Error("plan mode is not available in this preset");
+          planMode.set(agent, request.active === true);
+          writeJson(responseFile, { ok: true });
+        } else if (request.kind === "command") {
+          const agent = permissionAgents.get(request.sessionId);
+          const commands = ctx.get("commands");
+          if (!agent || !commands || typeof commands.execute !== "function") throw new Error("commands are not available in this preset");
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 120000);
+          try {
+            const execution = await commands.execute(agent, String(request.line || ""), [], controller.signal);
+            writeJson(responseFile, execution
+              ? { ok: true, result: execution.result }
+              : { ok: false, error: "unknown command" });
+          } finally {
+            clearTimeout(timer);
+          }
+        } else {
+          writeJson(responseFile, { ok: false, error: "unknown bridge request" });
+        }
+      } catch (error) {
+        writeJson(responseFile, { ok: false, error: error && error.message ? error.message : String(error) });
+      }
+    }
+  } finally {
+    processingRequests = false;
+  }
 }
 
 export function apply(ctx) {
@@ -230,6 +545,8 @@ export function apply(ctx) {
   const fallback = PRESETS.has(requested) ? requested : "standard";
   writeCatalog(ctx);
   ptcMirror(ctx);
+  eventMirror(ctx);
+  questionBridge(ctx);
   ctx.on("agent/created", async ({ agent }) => {
     const recorded = ctx.sessionProjections.stateOf(agent.session, "agentPreset");
     const preset = typeof recorded === "string" ? recorded : fallback;
@@ -238,14 +555,25 @@ export function apply(ctx) {
     else await ctx.agentPresets.select(agent, preset);
     permissionAgents.set(agent.session.id, agent);
     await applyPermission(ctx, agent, selectedPermissions()[agent.session.id]);
+    await applyPlanRequest(ctx, agent, planSelections()[agent.session.id]);
     await writeCatalog(ctx);
+    writeCommandCatalog(ctx);
   });
 
   const poll = setInterval(() => {
+    pollTick += 1;
     const selections = selectedPermissions();
-    for (const [sessionId, agent] of permissionAgents) {
-      void applyPermission(ctx, agent, selections[sessionId]);
+    for (const entry of permissionAgents) {
+      void applyPermission(ctx, entry[1], selections[entry[0]]);
     }
+    // Each Paseo toggle carries a fresh request id, so dsh's own /plan
+    // changes are never overwritten by a stale control value.
+    const plans = planSelections();
+    for (const entry of permissionAgents) {
+      void applyPlanRequest(ctx, entry[1], plans[entry[0]]);
+    }
+    void processRequests(ctx);
+    if (pollTick % 10 === 0) writeCommandCatalog(ctx);
   }, 100);
   poll.unref?.();
 }`;
@@ -356,21 +684,45 @@ function permissionConfigOption(
   };
 }
 
+function planConfigOption(active: boolean): ConfigOption {
+  return {
+    id: PLAN_SETTING_ID,
+    name: PLAN_SETTING_NAME,
+    description: PLAN_SETTING_DESCRIPTION,
+    type: "boolean",
+    currentValue: active,
+  };
+}
+
 function decorateConfigOptions(
   source: unknown,
   permissionOptions: Array<{ value: string; name: string }>,
   currentPermission: string,
+  planActive: boolean,
 ): ConfigOption[] {
   const options = Array.isArray(source) ? source as ConfigOption[] : [];
-  const setting = permissionConfigOption(permissionOptions, currentPermission);
-  const existing = options.findIndex((option) => option.id === PERMISSION_SETTING_ID);
-  if (existing === -1) return [...options, setting];
-  const next = [...options];
-  next[existing] = setting;
-  return next;
+  const insert = (next: ConfigOption[], setting: ConfigOption): ConfigOption[] => {
+    const existing = next.findIndex((option) => option.id === setting.id);
+    if (existing === -1) return [...next, setting];
+    next[existing] = setting;
+    return next;
+  };
+  return insert(
+    insert([...options], permissionConfigOption(permissionOptions, currentPermission)),
+    planConfigOption(planActive),
+  );
 }
 
 function writePermissionSelections(file: string, selections: Map<string, string>): void {
+  const temporaryFile = `${file}.tmp`;
+  writeFileSync(temporaryFile, JSON.stringify(Object.fromEntries(selections)), { mode: 0o600 });
+  renameSync(temporaryFile, file);
+}
+
+function writePlanSelections(
+  file: string,
+  selections: Map<string, { active: boolean; requestId?: string }>,
+): void {
   const temporaryFile = `${file}.tmp`;
   writeFileSync(temporaryFile, JSON.stringify(Object.fromEntries(selections)), { mode: 0o600 });
   renameSync(temporaryFile, file);
@@ -733,14 +1085,30 @@ export function createDshConnector(
     const permissionControlFile = join(dataDir, `permission-control-${randomUUID()}.json`);
     const permissionCatalogFile = join(dataDir, `permission-catalog-${randomUUID()}.json`);
     const ptcEventFile = join(dataDir, `ptc-events-${randomUUID()}.jsonl`);
+    const eventFile = join(dataDir, `dsh-events-${randomUUID()}.jsonl`);
+    const bridgeId = randomUUID();
+    const bridgeRequestDir = join(dataDir, `bridge-requests-${bridgeId}`);
+    const bridgeResponseDir = join(dataDir, `bridge-responses-${bridgeId}`);
+    const commandCatalogFile = join(dataDir, `command-catalog-${randomUUID()}.json`);
+    const planControlFile = join(dataDir, `plan-control-${randomUUID()}.json`);
     mkdirSync(dataDir, { recursive: true });
+    mkdirSync(bridgeRequestDir, { recursive: true });
+    mkdirSync(bridgeResponseDir, { recursive: true });
     writeFileSync(permissionControlFile, "{}", { mode: 0o600 });
+    writeFileSync(planControlFile, "{}", { mode: 0o600 });
+    writeFileSync(commandCatalogFile, "{}", { mode: 0o600 });
     writeFileSync(ptcEventFile, "", { mode: 0o600 });
+    writeFileSync(eventFile, "", { mode: 0o600 });
     const env = { ...process.env };
     env.DSH_AGENT_PRESET = initialMode;
     env.DSH_PERMISSION_CONTROL_FILE = permissionControlFile;
     env.DSH_PERMISSION_CATALOG_FILE = permissionCatalogFile;
     env.DSH_PTC_EVENT_FILE = ptcEventFile;
+    env.DSH_EVENT_FILE = eventFile;
+    env.DSH_BRIDGE_REQUEST_DIR = bridgeRequestDir;
+    env.DSH_BRIDGE_RESPONSE_DIR = bridgeResponseDir;
+    env.DSH_COMMAND_CATALOG_FILE = commandCatalogFile;
+    env.DSH_PLAN_CONTROL_FILE = planControlFile;
     log("starting dsh acp", {
       node,
       script,
@@ -790,7 +1158,12 @@ export function createDshConnector(
     child.once("exit", (code, signal) => {
       rmSync(permissionControlFile, { force: true });
       rmSync(permissionCatalogFile, { force: true });
+      rmSync(planControlFile, { force: true });
+      rmSync(commandCatalogFile, { force: true });
+      rmSync(bridgeRequestDir, { recursive: true, force: true });
+      rmSync(bridgeResponseDir, { recursive: true, force: true });
       stopPtcMirror();
+      stopEventMirror();
       if (child.exitCode !== null || child.signalCode !== null) {
         log("dsh acp exited", { code, signal: signal ?? undefined });
       }
@@ -806,6 +1179,9 @@ export function createDshConnector(
     const tracked = new Map<string | number, TrackedRequest>();
     const sessionConfigOptions = new Map<string, ConfigOption[]>();
     const permissionSelections = new Map<string, string>();
+    // `requestId` is present only on a user toggle, so the bridge can tell a
+    // fresh request from the cached UI state.
+    const planSelections = new Map<string, { active: boolean; requestId?: string }>();
     const sessionCwds = new Map<string, string>();
     const launchPermission = launchContext?.settings?.[PERMISSION_SETTING_ID];
     const configuredPermission = typeof launchPermission === "string" ? launchPermission : undefined;
@@ -833,6 +1209,10 @@ export function createDshConnector(
     const mirroredRootCallIds = new Set<string>();
     let mirroredCallsUnrooted = false;
     let stopPtcMirror: () => void = () => {};
+    let stopEventMirror: () => void = () => {};
+    // Commands the bridge advertised for each dsh session.
+    const sessionCommands = new Map<string, Set<string>>();
+    const FALLBACK_COMMANDS = new Set(["plan", "compact", "goal", "permission", "permissions", "model", "feedback"]);
 
     const writer = base.writable.getWriter();
     let writerClosed = false;
@@ -845,7 +1225,32 @@ export function createDshConnector(
     const toAgent = new WritableStream<AcpStreamMessage>({
       async write(message) {
         wireLog("->agent", message);
+        // The ACP adapter settles a question permission as cancelled when its
+        // session closes; that response belongs to the plugin, not to dsh.
+        if (
+          ("result" in message || "error" in message) &&
+          typeof message.id === "string" &&
+          message.id.startsWith("paseo-question:")
+        ) {
+          return;
+        }
         if ("method" in message && message.method && "id" in message && message.id !== null) {
+          if (message.method === "session/prompt") {
+            const params = message.params as { sessionId?: unknown; prompt?: Array<{ text?: unknown }> } | undefined;
+            const promptText = Array.isArray(params?.prompt)
+              ? params.prompt.map((part) => typeof part?.text === "string" ? part.text : "").join("")
+              : "";
+            const line = promptText.trim();
+            const match = /^\/([A-Za-z0-9_-]+)(?:\s+[\s\S]*)?$/.exec(line);
+            const name = match?.[1]?.toLowerCase();
+            if (
+              match && name && typeof params?.sessionId === "string" &&
+              (sessionCommands.get(params.sessionId)?.has(name) === true || FALLBACK_COMMANDS.has(name))
+            ) {
+              void runBridgeCommand(params.sessionId, line, message.id);
+              return;
+            }
+          }
           if (message.method === "initialize") {
             initializeIds.add(message.id);
           } else if (message.method === "session/new") {
@@ -931,6 +1336,7 @@ export function createDshConnector(
                 sessionConfigOptions.get(params.sessionId),
                 catalog.options,
                 params.value,
+                planSelections.get(params.sessionId)?.active ?? false,
               );
               sessionConfigOptions.set(params.sessionId, currentOptions);
               fromAgentController?.enqueue({
@@ -939,6 +1345,33 @@ export function createDshConnector(
                 result: { configOptions: currentOptions },
               });
               log("changed dsh permission preset", { sessionId: params.sessionId, preset: params.value });
+              return;
+            }
+            if (params?.configId === PLAN_SETTING_ID) {
+              if (typeof params.sessionId !== "string" || typeof params.value !== "boolean") {
+                fromAgentController?.enqueue({
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32602, message: "Plan mode requires a session id and boolean value" },
+                });
+                return;
+              }
+              planSelections.set(params.sessionId, { active: params.value, requestId: randomUUID() });
+              writePlanSelections(planControlFile, planSelections);
+              const catalog = readPermissionCatalog(permissionCatalogFile);
+              const currentOptions = decorateConfigOptions(
+                sessionConfigOptions.get(params.sessionId),
+                catalog.options,
+                currentPermissionFor(params.sessionId, sessionCwds.get(params.sessionId), catalog),
+                params.value,
+              );
+              sessionConfigOptions.set(params.sessionId, currentOptions);
+              fromAgentController?.enqueue({
+                jsonrpc: "2.0",
+                id: message.id,
+                result: { configOptions: currentOptions },
+              });
+              log("changed dsh plan mode", { sessionId: params.sessionId, active: params.value });
               return;
             }
           }
@@ -966,7 +1399,12 @@ export function createDshConnector(
         // is removed after the deadline too, so a child that never exits
         // cannot leak it (the exit handler normally gets there first).
         const timer = setTimeout(() => child.kill("SIGTERM"), 5_000);
-        const sidecarTimer = setTimeout(stopPtcMirror, 5_500);
+        const sidecarTimer = setTimeout(() => {
+          stopPtcMirror();
+          stopEventMirror();
+          rmSync(bridgeRequestDir, { recursive: true, force: true });
+          rmSync(bridgeResponseDir, { recursive: true, force: true });
+        }, 5_500);
         sidecarTimer.unref();
         child.once("exit", () => {
           clearTimeout(timer);
@@ -1144,7 +1582,12 @@ export function createDshConnector(
                 if (typeof sessionId === "string") {
                   const catalog = readPermissionCatalog(permissionCatalogFile);
                   const current = currentPermissionFor(sessionId, sessionCwds.get(sessionId), catalog);
-                  const decorated = decorateConfigOptions(update.configOptions, catalog.options, current);
+                  const decorated = decorateConfigOptions(
+                    update.configOptions,
+                    catalog.options,
+                    current,
+                    planSelections.get(sessionId)?.active ?? false,
+                  );
                   update.configOptions = decorated;
                   sessionConfigOptions.set(sessionId, decorated);
                 }
@@ -1191,17 +1634,27 @@ export function createDshConnector(
                 const sessionId = typeof result.sessionId === "string"
                   ? result.sessionId
                   : request.sessionId;
-                if (sessionId && !request.probe) liveSessions.add(sessionId);
+                if (sessionId && !request.probe) {
+                  liveSessions.add(sessionId);
+                  // Commands may already be in the bridge's catalog by the
+                  // time the ACP session/new or resume response arrives. Send
+                  // once now and once after Paseo has emitted session.ready.
+                  setTimeout(() => refreshCommandCatalog(sessionId), 0);
+                  setTimeout(() => refreshCommandCatalog(sessionId), 750);
+                }
                 if (sessionId) {
                   const cwd = request.cwd ?? launchContext?.cwd;
                   if (cwd) sessionCwds.set(sessionId, cwd);
                   const catalog = readPermissionCatalog(permissionCatalogFile);
                   const currentPermission = currentPermissionFor(sessionId, cwd, catalog);
                   permissionSelections.set(sessionId, currentPermission);
+                  const planActive = dshSessionPlanActive(sessionId) ?? planSelections.get(sessionId)?.active ?? false;
+                  planSelections.set(sessionId, { active: planActive });
                   const decorated = decorateConfigOptions(
                     result.configOptions,
                     catalog.options,
                     currentPermission,
+                    planActive,
                   );
                   result.configOptions = decorated;
                   sessionConfigOptions.set(sessionId, decorated);
@@ -1215,10 +1668,13 @@ export function createDshConnector(
                   sessionCwds.get(request.sessionId),
                   catalog,
                 );
+                const planActive = dshSessionPlanActive(request.sessionId) ?? planSelections.get(request.sessionId)?.active ?? false;
+                planSelections.set(request.sessionId, { active: planActive });
                 const decorated = decorateConfigOptions(
                   result.configOptions,
                   catalog.options,
                   currentPermission,
+                  planActive,
                 );
                 result.configOptions = decorated;
                 sessionConfigOptions.set(request.sessionId, decorated);
@@ -1232,9 +1688,21 @@ export function createDshConnector(
                 log("hid catalog probe session", { sessionId: probeSessionId });
               }
               if (request?.list && Array.isArray(result.sessions)) {
-                const visible = result.sessions.filter(
-                  (session) => typeof session.sessionId !== "string" || !probes.has(session.sessionId),
-                );
+                const visible = result.sessions
+                  .filter((session) => typeof session.sessionId !== "string" || !probes.has(session.sessionId))
+                  .map((session) => {
+                    const sessionId = session.sessionId;
+                    if (typeof sessionId !== "string") return session;
+                    // dsh's ACP list carries no title; its projection cache
+                    // does, and is far cheaper than replaying each session log.
+                    const title = dshSessionTitle(sessionId);
+                    const updatedAt = dshSessionLastActivity(sessionId);
+                    return {
+                      ...session,
+                      ...(title ? { title } : {}),
+                      ...(updatedAt ? { updatedAt } : {}),
+                    };
+                  });
                 if (visible.length !== result.sessions.length) {
                   log("filtered probe sessions from list", {
                     hidden: result.sessions.length - visible.length,
@@ -1328,6 +1796,355 @@ export function createDshConnector(
       drainPtcEvents();
       rmSync(ptcEventFile, { force: true });
     };
+
+    // Mirrored dsh events (retries, compaction, jobs, subagents, goals,
+    // questions, commands) are re-emitted as one vendor notification kind;
+    // dsh-events.ts maps them onto Paseo timeline items and notices.
+    let eventOffset = 0;
+    const emitEventRecord = (record: { kind?: unknown; sessionId?: unknown; data?: unknown }): boolean => {
+      if (!fromAgentController) return false;
+      if (typeof record.sessionId !== "string" || !liveSessions.has(record.sessionId)) return true;
+      if (typeof record.kind !== "string") return true;
+      const sessionId = record.sessionId;
+      const data = record.data && typeof record.data === "object" && !Array.isArray(record.data)
+        ? record.data as Record<string, unknown>
+        : {};
+      // Questions carry a request/answer round trip, so they never become a
+      // plain timeline event; the handler emits question cards itself.
+      if (record.kind === "question") {
+        void handleQuestionEvent(sessionId, data);
+        return true;
+      }
+      if (record.kind === "plan-mode") syncPlanSetting(sessionId, data);
+      try {
+        fromAgentController.enqueue({
+          jsonrpc: "2.0",
+          method: DSH_EVENT_METHOD,
+          params: { kind: record.kind, sessionId, data },
+        });
+      } catch {
+        return false;
+      }
+      return true;
+    };
+    const drainDshEvents = (): void => {
+      let text: string;
+      try {
+        text = readFileSync(eventFile, "utf8");
+      } catch {
+        return;
+      }
+      if (text.length < eventOffset) eventOffset = 0; // the file was replaced
+      const chunk = text.slice(eventOffset);
+      const lastNewline = chunk.lastIndexOf("\n");
+      if (lastNewline === -1) return;
+      eventOffset += lastNewline + 1;
+      let consumerAlive = true;
+      for (const line of chunk.slice(0, lastNewline).split("\n")) {
+        if (!line.trim() || !consumerAlive) continue;
+        let record: { kind?: unknown; sessionId?: unknown; data?: unknown };
+        try {
+          record = JSON.parse(line) as { kind?: unknown; sessionId?: unknown; data?: unknown };
+        } catch {
+          log("dsh event record was skipped", { record: line.slice(0, 200) });
+          continue;
+        }
+        consumerAlive = emitEventRecord(record);
+      }
+    };
+    const eventWatcher: FSWatcher = watch(eventFile, () => drainDshEvents());
+    eventWatcher.on("error", () => {});
+    const eventPoll = setInterval(drainDshEvents, 250);
+    eventPoll.unref?.();
+    let eventMirrorStopped = false;
+    let bridgeDisposed = false;
+    stopEventMirror = () => {
+      if (eventMirrorStopped) return;
+      eventMirrorStopped = true;
+      bridgeDisposed = true;
+      eventWatcher.close();
+      clearInterval(eventPoll);
+      clearInterval(commandPoll);
+      drainDshEvents();
+      // Unblock questions owned by this connector that are still waiting on
+      // a client which just went away.
+      cancelAllDshQuestions(bridgeId);
+      rmSync(eventFile, { force: true });
+    };
+
+    function emitDshEvent(sessionId: string, kind: string, data: Record<string, unknown>): void {
+      if (!fromAgentController) return;
+      try {
+        fromAgentController.enqueue({
+          jsonrpc: "2.0",
+          method: DSH_EVENT_METHOD,
+          params: { kind, sessionId, data },
+        });
+      } catch {
+        // The stream is gone; nothing left to render.
+      }
+    }
+
+    /** Keep the Plan mode toggle in sync when dsh changes it itself (/plan). */
+    function syncPlanSetting(sessionId: string, data: Record<string, unknown>): void {
+      const active = data.active;
+      if (typeof active !== "boolean" || planSelections.get(sessionId)?.active === active) return;
+      // Keep a pending request id so a user toggle still reaches the bridge.
+      planSelections.set(sessionId, { ...planSelections.get(sessionId), active });
+      const catalog = readPermissionCatalog(permissionCatalogFile);
+      const options = decorateConfigOptions(
+        sessionConfigOptions.get(sessionId),
+        catalog.options,
+        currentPermissionFor(sessionId, sessionCwds.get(sessionId), catalog),
+        active,
+      );
+      sessionConfigOptions.set(sessionId, options);
+      if (!fromAgentController) return;
+      try {
+        fromAgentController.enqueue({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: { sessionUpdate: "config_option_update", configOptions: options },
+          },
+        });
+      } catch {
+        // The stream is gone; the next session open decorates from disk.
+      }
+    }
+
+    let commandCatalogSignature = "";
+    /** Publish the bridge's command catalog as ACP available_commands. */
+    function refreshCommandCatalog(forceSessionId?: string): void {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(readFileSync(commandCatalogFile, "utf8")) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+      const signature = JSON.stringify(parsed);
+      if (signature === commandCatalogSignature && forceSessionId === undefined) return;
+      commandCatalogSignature = signature;
+      for (const [sessionId, value] of Object.entries(parsed)) {
+        if (forceSessionId !== undefined && sessionId !== forceSessionId) continue;
+        if (!Array.isArray(value)) continue;
+        const commands = value.filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object");
+        sessionCommands.set(
+          sessionId,
+          new Set(commands.map((entry) => typeof entry.name === "string" ? entry.name.toLowerCase() : "").filter(Boolean)),
+        );
+        if (!liveSessions.has(sessionId) || !fromAgentController) continue;
+        const availableCommands = commands
+          .filter((entry) => typeof entry.name === "string" && entry.name.length > 0)
+          .map((entry) => ({
+            name: entry.name as string,
+            description: typeof entry.description === "string" ? entry.description : "",
+            ...(typeof entry.argumentHint === "string" && entry.argumentHint
+              ? { input: { hint: entry.argumentHint } }
+              : {}),
+          }));
+        try {
+          fromAgentController.enqueue({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { sessionId, update: { sessionUpdate: "available_commands_update", availableCommands } },
+          });
+        } catch {
+          // The stream is gone; the next pump retries.
+        }
+      }
+    }
+    const commandPoll = setInterval(refreshCommandCatalog, 1000);
+    commandPoll.unref?.();
+
+    function emitQuestionCard(sessionId: string, data: Record<string, unknown>): void {
+      emitDshEvent(sessionId, "question-card", data);
+    }
+
+    /** One question becomes one native Paseo permission card. */
+    function questionHeader(question: Record<string, unknown>, index: number, used: Set<string>): string {
+      const base = (typeof question.header === "string" && question.header.trim())
+        ? question.header.trim()
+        : (typeof question.question === "string" && question.question.trim())
+          ? question.question.trim().slice(0, 40)
+          : `问题 ${index + 1}`;
+      let header = base;
+      let suffix = 2;
+      while (used.has(header)) header = `${base} (${suffix++})`;
+      used.add(header);
+      return header;
+    }
+
+    /** Paseo joins selected labels and custom text with ", ". */
+    function mapQuestionAnswer(raw: string, labels: string[]): { selected: string[]; custom?: string } {
+      if (!raw) return { selected: [] };
+      if (labels.includes(raw)) return { selected: [raw] };
+      const selected: string[] = [];
+      const custom: string[] = [];
+      for (const token of raw.split(/,\s+/).map((part) => part.trim()).filter(Boolean)) {
+        if (labels.includes(token)) selected.push(token);
+        else custom.push(token);
+      }
+      return { selected, ...(custom.length ? { custom: custom.join(", ") } : {}) };
+    }
+
+    async function handleQuestionEvent(sessionId: string, data: Record<string, unknown>): Promise<void> {
+      const requestId = typeof data.requestId === "string" ? data.requestId : `q-${randomUUID()}`;
+      const questions = Array.isArray(data.questions)
+        ? data.questions.filter((question): question is Record<string, unknown> =>
+          !!question && typeof question === "object",
+        )
+        : [];
+      if (questions.length === 0) {
+        try {
+          writeFileSync(join(bridgeResponseDir, `${requestId}.json`), JSON.stringify({ answers: [] }), { mode: 0o600 });
+        } catch {
+          // The bridge is gone; its question wait will abort with the process.
+        }
+        return;
+      }
+      const used = new Set<string>();
+      const headers: string[] = [];
+      const forms = questions.map((question, index) => {
+        const options = Array.isArray(question.options)
+          ? question.options
+            .filter((option): option is Record<string, unknown> => !!option && typeof option === "object")
+            .map((option) => ({
+              label: typeof option.label === "string" ? option.label : `选项 ${index + 1}`,
+              ...(typeof option.description === "string" ? { description: option.description } : {}),
+            }))
+          : [];
+        const header = questionHeader(question, index, used);
+        headers.push(header);
+        return {
+          header,
+          question: typeof question.question === "string" ? question.question : "",
+          options,
+          multiSelect: question.multiSelect === true,
+          allowOther: true,
+          allowEmpty: options.length === 0,
+        };
+      });
+      const toolCallId = `paseo-question-${requestId}`;
+      const answersPromise = new Promise<Record<string, string> | undefined>((resolve) => {
+        registerDshQuestion(toolCallId, { requestId, scope: bridgeId, resolve });
+      });
+      for (let index = 0; index < questions.length; index += 1) {
+        emitQuestionCard(sessionId, {
+          requestId,
+          index,
+          header: headers[index],
+          question: questions[index]!.question,
+          detail: questions[index]!.detail,
+          status: "running",
+        });
+      }
+      try {
+        fromAgentController?.enqueue({
+          jsonrpc: "2.0",
+          id: `paseo-question:${requestId}`,
+          method: "session/request_permission",
+          params: {
+            sessionId,
+            toolCall: {
+              toolCallId,
+              title: headers[0] ?? "问题",
+              name: "ask_user_question",
+              kind: "other",
+              status: "pending",
+              rawInput: { questions: forms },
+            },
+            // A dummy allow option lets the wrapper settle the ACP adapter's
+            // pending permission after Paseo's question form answers.
+            options: [{ optionId: "answer", name: "Answer", kind: "allow_once" }],
+          },
+        });
+      } catch {
+        cancelDshQuestion(toolCallId);
+      }
+      const answerMap = await answersPromise;
+      const answers = questions.map((question, index) => {
+        const header = headers[index]!;
+        const raw = answerMap?.[header] ?? "";
+        const labels = forms[index]?.options.map((option) => option.label) ?? [];
+        return {
+          id: typeof question.id === "string" ? question.id : String(index),
+          ...mapQuestionAnswer(raw, labels),
+        };
+      });
+      for (let index = 0; index < questions.length; index += 1) {
+        const header = headers[index]!;
+        emitQuestionCard(sessionId, {
+          requestId,
+          index,
+          header,
+          question: questions[index]!.question,
+          detail: questions[index]!.detail,
+          status: "completed",
+          answer: answerMap?.[header] || "跳过",
+        });
+      }
+      try {
+        writeFileSync(
+          join(bridgeResponseDir, `${requestId}.json`),
+          JSON.stringify({ answers }),
+          { mode: 0o600 },
+        );
+      } catch {
+        // The bridge is gone; its question wait will abort with the process.
+      }
+    }
+
+    /** Execute one slash command inside dsh and resolve the ACP prompt. */
+    async function runBridgeCommand(sessionId: string, line: string, promptId: string | number): Promise<void> {
+      const requestId = `cmd-${randomUUID()}`;
+      const requestFile = join(bridgeRequestDir, `${requestId}.json`);
+      const responseFile = join(bridgeResponseDir, `${requestId}.json`);
+      try {
+        writeFileSync(requestFile, JSON.stringify({ kind: "command", requestId, sessionId, line }), { mode: 0o600 });
+      } catch (error) {
+        log("command request could not be queued", { sessionId, error: String(error) });
+        return;
+      }
+      const deadline = Date.now() + 130_000;
+      let response: Record<string, unknown> | undefined;
+      while (!bridgeDisposed && Date.now() < deadline) {
+        try {
+          response = JSON.parse(readFileSync(responseFile, "utf8")) as Record<string, unknown>;
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      rmSync(responseFile, { force: true });
+      const result = response && typeof response.result === "object" && !Array.isArray(response.result)
+        ? response.result as Record<string, unknown>
+        : undefined;
+      const failed = !response || response.ok !== true || result?.kind === "error";
+      const output = typeof result?.text === "string"
+        ? result.text
+        : failed
+          ? typeof response?.error === "string" ? response.error : "命令执行失败或超时"
+          : "";
+      emitDshEvent(sessionId, "command-result", {
+        requestId,
+        line,
+        kind: failed ? "error" : "success",
+        text: output,
+      });
+      if (!fromAgentController) return;
+      try {
+        fromAgentController.enqueue({
+          jsonrpc: "2.0",
+          id: promptId,
+          result: { stopReason: "end_turn" },
+        });
+      } catch {
+        // The prompt is already gone with the stream.
+      }
+    }
 
     return { writable: toAgent, readable: fromAgent };
   };
