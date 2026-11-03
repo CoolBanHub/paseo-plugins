@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, Text, View } from "react-native";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, Text, View, type ScrollView as RNScrollView } from "react-native";
 import { Icon, Modal, ScrollView } from "@getpaseo/plugin/client/react-native";
 import { useRpc } from "@getpaseo/plugin/client";
 import { gitDiffRpc } from "../shared/contracts";
 import { basename } from "./format";
-import { MONO_FONT, type PanelTheme } from "./parts";
+import { IconButton, MONO_FONT, type PanelTheme } from "./parts";
 import type { DiffResult } from "../shared/types";
 
 /**
@@ -69,12 +69,28 @@ export function DiffView({
   const diffRpc = useRpc(gitDiffRpc);
   const [result, setResult] = useState<DiffResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const hScrollRef = useRef<RNScrollView>(null);
+  const [scrollX, setScrollX] = useState(0);
+  const [contentWidth, setContentWidth] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(0);
+  const maxScrollX = Math.max(0, contentWidth - viewportWidth);
+  const canScrollX = maxScrollX > 1;
+  const scrollStep = Math.max(160, Math.round(viewportWidth * 0.7));
+
+  const scrollDiffBy = (delta: number) => {
+    const next = Math.max(0, Math.min(maxScrollX, scrollX + delta));
+    hScrollRef.current?.scrollTo({ x: next, animated: true });
+    setScrollX(next);
+  };
 
   useEffect(() => {
     if (!open || !repoPath || !request) return;
     let cancelled = false;
     setLoading(true);
     setResult(null);
+    setScrollX(0);
+    setContentWidth(0);
+    hScrollRef.current?.scrollTo({ x: 0, animated: false });
     diffRpc({ repoPath, mode: request.mode, ref: request.ref, path: request.path, maxLines: 2000 })
       .then((next) => {
         if (!cancelled) setResult(next);
@@ -106,9 +122,35 @@ export function DiffView({
       <Modal.Content scrollable={false}>
         <View style={{ gap: 6 }}>
           {request ? (
-            <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT }}>
-              {request.path}
-            </Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, minHeight: 26 }}>
+              <Text
+                numberOfLines={1}
+                style={{ flex: 1, minWidth: 0, color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT }}
+              >
+                {request.path}
+              </Text>
+              {canScrollX ? (
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9 }}>左右滑动</Text>
+                  <IconButton
+                    icon="ChevronLeft"
+                    label="向左滚动差异"
+                    theme={theme}
+                    size={12}
+                    disabled={scrollX <= 1}
+                    onPress={() => scrollDiffBy(-scrollStep)}
+                  />
+                  <IconButton
+                    icon="ChevronRight"
+                    label="向右滚动差异"
+                    theme={theme}
+                    size={12}
+                    disabled={scrollX >= maxScrollX - 1}
+                    onPress={() => scrollDiffBy(scrollStep)}
+                  />
+                </View>
+              ) : null}
+            </View>
           ) : null}
           {loading ? (
             <View style={{ paddingVertical: 24, alignItems: "center", gap: 8 }}>
@@ -144,13 +186,26 @@ export function DiffView({
               }}
             >
               {/* The host modal caps its width (~520px), so the diff must fit
-                  the dialog instead of using a window-derived width. Long
-                  lines wrap inside the code column; the line-number gutter
-                  stays fixed, and no line is hidden past the right edge. */}
-              <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 8 }}>
-                {lines.map((line, index) => (
-                  <DiffRow key={index} line={line} theme={theme} />
-                ))}
+                  the dialog instead of using a window-derived width. Code lines
+                  keep their natural width and scroll horizontally; the arrow
+                  controls next to the path make that gesture discoverable. */}
+              <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 8 }} nestedScrollEnabled>
+                <ScrollView
+                  ref={hScrollRef}
+                  horizontal
+                  nestedScrollEnabled
+                  scrollEventThrottle={16}
+                  onScroll={(event) => setScrollX(event.nativeEvent.contentOffset.x)}
+                  onContentSizeChange={(width) => setContentWidth(width)}
+                  onLayout={(event) => setViewportWidth(event.nativeEvent.layout.width)}
+                  contentContainerStyle={{ minWidth: "100%", alignItems: "flex-start" }}
+                >
+                  <View style={{ minWidth: "100%" }}>
+                    {lines.map((line, index) => (
+                      <DiffRow key={index} line={line} theme={theme} />
+                    ))}
+                  </View>
+                </ScrollView>
                 {result.truncated ? (
                   <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingVertical: 8, textAlign: "center" }}>
                     差异过长，已截断显示
@@ -169,11 +224,12 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
   if (line.kind === "hunk") {
     return (
       <Text
+        numberOfLines={1}
         style={{
           alignSelf: "stretch",
           color: theme.colors.foregroundMuted,
           fontSize: 10,
-          lineHeight: 14,
+          lineHeight: 15,
           fontFamily: MONO_FONT,
           backgroundColor: theme.colors.surface2,
           paddingVertical: 2,
@@ -206,7 +262,8 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
         {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
       </Text>
       <Text
-        style={{ flex: 1, minWidth: 0, color: tint, fontSize: 10.5, lineHeight: 15, fontFamily: MONO_FONT, paddingRight: 8 }}
+        numberOfLines={1}
+        style={{ flexShrink: 0, color: tint, fontSize: 10.5, lineHeight: 15, fontFamily: MONO_FONT, paddingRight: 8 }}
       >
         {line.text}
       </Text>
