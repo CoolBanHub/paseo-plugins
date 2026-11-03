@@ -279,6 +279,8 @@ interface SessionState {
   modelSelection?: ZcodeModelSelection;
   mode?: string;
   ready: boolean;
+  /** Set once Paseo closed the session; late async work must not emit events. */
+  closed?: boolean;
   revision?: number;
   modeEventSeq?: number;
   catalog?: ProviderCatalog;
@@ -1264,13 +1266,22 @@ export function createZcodeProvider(): ProviderRegistration {
       };
 
       /**
+       * Paseo rejects a child session.opened unless the parent session has
+       * already announced the session.subsession capability. The open
+       * handshake is asynchronous, so events replayed by the app-server may
+       * request a reconciliation pass before the parent is announced.
+       */
+      const canAttachSubagents = (parent: SessionState): boolean =>
+        !parent.child && parent.ready && !parent.closed;
+
+      /**
        * Register a ZCode subagent child session as a Paseo subsession nested
        * under the parent's Agent tool call, backfill its transcript so far and
        * poll it while it runs.
        */
       const adoptSubagent = async (parent: SessionState, ref: SubagentRef): Promise<void> => {
         const childSessionId = String(ref.childSessionId ?? "");
-        if (!childSessionId || !parent.subagents) return;
+        if (!childSessionId || !parent.subagents || !canAttachSubagents(parent)) return;
         let record = parent.subagents.get(childSessionId);
         if (!record) {
           record = {
@@ -1320,6 +1331,8 @@ export function createZcodeProvider(): ProviderRegistration {
             sessionId: childSessionId,
             messageLimit: 1000,
           }) as unknown as CreateOrResumeResult;
+          // The parent may have closed while the child transcript was loading.
+          if (!canAttachSubagents(parent)) return;
           emitSubagentSnapshot(record, snapshot.messages);
           if (!record.terminalEmitted) {
             record.terminalEmitted = true;
@@ -1449,7 +1462,7 @@ export function createZcodeProvider(): ProviderRegistration {
       };
 
       const syncSubagents = async (parent: SessionState): Promise<void> => {
-        if (parent.child) return;
+        if (!canAttachSubagents(parent)) return;
         if (parent.subagentSyncRunning) {
           parent.subagentSyncQueued = true;
           return;
@@ -1472,6 +1485,8 @@ export function createZcodeProvider(): ProviderRegistration {
             ...(result.ended?.items ?? []).map((ref) => ({ ...ref, ended: true })),
           ];
           for (const ref of refs) {
+            // Adoption can take a while; stop if the parent closed meanwhile.
+            if (!canAttachSubagents(parent)) return;
             try {
               await adoptSubagent(parent, ref);
             } catch (error) {
@@ -1491,7 +1506,7 @@ export function createZcodeProvider(): ProviderRegistration {
       };
 
       const scheduleSubagentSync = (parent: SessionState, delay: number): void => {
-        if (parent.child) return;
+        if (!canAttachSubagents(parent)) return;
         const timers = parent.subagentSyncTimers ??= new Set();
         const timer = setTimeout(() => {
           timers.delete(timer);
@@ -1565,7 +1580,10 @@ export function createZcodeProvider(): ProviderRegistration {
         },
         close: async () => {
           for (const state of sessions.values()) {
-            if (!state.child) closeSubagents(state);
+            if (!state.child) {
+              state.closed = true;
+              closeSubagents(state);
+            }
           }
           await client.close();
         },
@@ -1621,6 +1639,7 @@ export function createZcodeProvider(): ProviderRegistration {
             const zcodeSessionId = result.session.sessionId;
             const state = stateFor(input.sessionId, zcodeSessionId);
             state.ready = false;
+            state.closed = false;
             state.revision = undefined;
             state.modeEventSeq = undefined;
             state.cwd = input.config.cwd || bridgeDir;
@@ -1788,7 +1807,10 @@ export function createZcodeProvider(): ProviderRegistration {
           case "session.close": {
             const zcodeSessionId = zcodeIdFor.get(input.sessionId) ?? input.sessionId;
             const state = sessions.get(zcodeSessionId);
-            if (state) closeSubagents(state);
+            if (state) {
+              state.closed = true;
+              closeSubagents(state);
+            }
             await client.request("session/close", { sessionId: zcodeSessionId }).catch(() => undefined);
             sessions.delete(zcodeSessionId);
             zcodeIdFor.delete(input.sessionId);

@@ -66,6 +66,7 @@ async function fixture(t, options = {}) {
   let nextSession = 0;
   let rejectModel;
   let beforeSet;
+  let beforeSubagents;
   let rejectSend = false;
   const snapshot = (sessionId) => {
     const state = states.get(sessionId);
@@ -108,6 +109,7 @@ async function fixture(t, options = {}) {
       messages: structuredClone(states.get(params.sessionId)?.messages ?? options.historyMessages ?? []),
     } };
     if (method === "session/subagents") {
+      if (beforeSubagents) await beforeSubagents();
       const listing = states.get(params.sessionId)?.subagents;
       return { result: structuredClone(listing ?? { childSessionIds: [], running: [], ended: { total: 0, items: [] } }) };
     }
@@ -196,6 +198,7 @@ async function fixture(t, options = {}) {
     config: () => events.filter((event) => event.type === "session.config").at(-1)?.config,
     rejectModel: (id) => { rejectModel = id; },
     beforeSet: (fn) => { beforeSet = fn; },
+    beforeSubagents: (fn) => { beforeSubagents = fn; },
     rejectSend: () => { rejectSend = true; },
   };
   function fSessionId() {
@@ -870,6 +873,75 @@ test("subagent subsessions close with their parent session", async (t) => {
   await f.connection.send({ type: "session.close", requestId: "close", sessionId: "paseo-session" });
   assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "sess_subagent_e"));
   assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "paseo-session"));
+});
+
+test("subagent subsessions wait for the parent open handshake", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  const parentSessionId = "sess_resume_parent";
+  f.setSubagents(parentSessionId, {
+    revision: 1,
+    childSessionIds: ["sess_subagent_deferred"],
+    running: [{
+      childSessionId: "sess_subagent_deferred", toolCallId: "agent-call-deferred",
+      subagentType: "Explore", title: "延迟挂载", status: "running",
+    }],
+    ended: { total: 0, items: [] },
+  });
+  f.session(parentSessionId, { sessionStatus: "running" });
+  f.session("sess_subagent_deferred", { sessionStatus: "running", messages: [] });
+
+  let releaseSetModel;
+  f.beforeSet(() => new Promise((resolve) => { releaseSetModel = resolve; }));
+  const opening = f.open({}, { version: 1, data: { zcodeSessionId: parentSessionId } }, "replay");
+  await flush();
+  assert.ok(releaseSetModel, "the open handshake reaches model selection");
+
+  // The app-server replays subagent background jobs while the handshake is
+  // still waiting on model selection, i.e. before session.opened is emitted.
+  f.sessionEvent({
+    type: "session.updated", sessionId: parentSessionId,
+    payload: { backgroundJobs: [{ taskId: "task-deferred", taskKind: "subagent", status: "running" }] },
+  });
+  t.mock.timers.tick(0); await flush();
+  assert.ok(
+    !f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_deferred"),
+    "a subsession must not open before the parent session.opened",
+  );
+
+  releaseSetModel();
+  await opening; await flush();
+  t.mock.timers.tick(0); await flush();
+  const parentIndex = f.events.findIndex((event) => event.type === "session.opened" && event.sessionId === "paseo-session");
+  const childIndex = f.events.findIndex((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_deferred");
+  assert.ok(parentIndex >= 0, "the parent session must open");
+  assert.ok(childIndex > parentIndex, "the child opens only after the parent");
+});
+
+test("in-flight subagent adoption stops when the parent session closes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.setSubagents(sessionId, {
+    childSessionIds: ["sess_subagent_late"],
+    running: [{ childSessionId: "sess_subagent_late", toolCallId: "agent-call-late", subagentType: "Explore" }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_subagent_late", { sessionStatus: "running", messages: [] });
+  let releaseListing;
+  f.beforeSubagents(() => new Promise((resolve) => { releaseListing = resolve; }));
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-late",
+    payload: { kind: "tool_call", toolCallId: "agent-call-late", toolName: "Agent", input: {} },
+  });
+  t.mock.timers.tick(subagentSyncTiming.spawnMs); await flush();
+  assert.ok(releaseListing, "the reconciliation pass is waiting on the listing");
+
+  await f.connection.send({ type: "session.close", requestId: "close", sessionId: "paseo-session" });
+  releaseListing(); await flush();
+  t.mock.timers.tick(subagentSyncTiming.spawnFollowUpMs); await flush();
+  assert.ok(!f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_late"));
 });
 
 test("without session.subsession, subagents stay on the legacy background card", async (t) => {
