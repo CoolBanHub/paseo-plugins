@@ -3,7 +3,6 @@ import { ActivityIndicator, Text, View } from "react-native";
 import { Icon, Modal, ScrollView } from "@getpaseo/plugin/client/react-native";
 import { useRpc } from "@getpaseo/plugin/client";
 import { gitDiffRpc } from "../shared/contracts";
-import { dialogWidth } from "./filters";
 import { basename } from "./format";
 import { MONO_FONT, type PanelTheme } from "./parts";
 import type { DiffResult } from "../shared/types";
@@ -136,8 +135,7 @@ export function DiffView({
             <View
               style={{
                 height: 420,
-                maxHeight: 420,
-                width: dialogWidth(720),
+                alignSelf: "stretch",
                 borderRadius: 6,
                 borderWidth: 1,
                 borderColor: theme.colors.border,
@@ -145,21 +143,14 @@ export function DiffView({
                 overflow: "hidden",
               }}
             >
-              {/* Vertical scroll outside, horizontal scroll inside: long code
-                  lines keep their natural width and can be swiped, instead of
-                  being cut off at the dialog edge. */}
+              {/* The host modal caps its width (~520px), so the diff must fit
+                  the dialog instead of using a window-derived width. Long
+                  lines wrap inside the code column; the line-number gutter
+                  stays fixed, and no line is hidden past the right edge. */}
               <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 8 }}>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={{ minWidth: "100%", alignItems: "flex-start" }}
-                >
-                  <View>
-                    {lines.map((line, index) => (
-                      <DiffRow key={index} line={line} theme={theme} />
-                    ))}
-                  </View>
-                </ScrollView>
+                {lines.map((line, index) => (
+                  <DiffRow key={index} line={line} theme={theme} />
+                ))}
                 {result.truncated ? (
                   <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingVertical: 8, textAlign: "center" }}>
                     差异过长，已截断显示
@@ -178,11 +169,11 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
   if (line.kind === "hunk") {
     return (
       <Text
-        numberOfLines={1}
         style={{
           alignSelf: "stretch",
           color: theme.colors.foregroundMuted,
           fontSize: 10,
+          lineHeight: 14,
           fontFamily: MONO_FONT,
           backgroundColor: theme.colors.surface2,
           paddingVertical: 2,
@@ -204,18 +195,19 @@ function DiffRow({ line, theme }: { line: DiffLine; theme: PanelTheme }) {
   const tint =
     line.kind === "add" ? "#7fb069" : line.kind === "del" ? "#d1675a" : theme.colors.foreground;
   return (
-    <View style={{ flexDirection: "row", alignSelf: "flex-start", backgroundColor: background }}>
-      <Text style={{ width: 44, textAlign: "right", paddingRight: 6, color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT, opacity: 0.7 }}>
+    <View style={{ flexDirection: "row", alignSelf: "stretch", backgroundColor: background }}>
+      <Text style={{ width: 44, textAlign: "right", paddingRight: 6, color: theme.colors.foregroundMuted, fontSize: 10, lineHeight: 15, fontFamily: MONO_FONT, opacity: 0.7 }}>
         {oldNo}
       </Text>
-      <Text style={{ width: 44, textAlign: "right", paddingRight: 8, color: theme.colors.foregroundMuted, fontSize: 10, fontFamily: MONO_FONT, opacity: 0.7 }}>
+      <Text style={{ width: 44, textAlign: "right", paddingRight: 8, color: theme.colors.foregroundMuted, fontSize: 10, lineHeight: 15, fontFamily: MONO_FONT, opacity: 0.7 }}>
         {newNo}
       </Text>
+      <Text style={{ width: 12, textAlign: "center", color: tint, fontSize: 10.5, lineHeight: 15, fontFamily: MONO_FONT }}>
+        {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
+      </Text>
       <Text
-        numberOfLines={1}
-        style={{ color: tint, fontSize: 10.5, fontFamily: MONO_FONT, flexShrink: 0, paddingRight: 8 }}
+        style={{ flex: 1, minWidth: 0, color: tint, fontSize: 10.5, lineHeight: 15, fontFamily: MONO_FONT, paddingRight: 8 }}
       >
-        {line.kind === "add" ? "+ " : line.kind === "del" ? "- " : "  "}
         {line.text}
       </Text>
     </View>
