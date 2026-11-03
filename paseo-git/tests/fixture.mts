@@ -13,7 +13,15 @@ export const testRun: GitRun = async (args, cwd, timeoutMs = 15_000) => {
     cwd,
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },
+    env: {
+      ...process.env,
+      LC_ALL: "C",
+      GIT_OPTIONAL_LOCKS: "0",
+      // Sequence continues must not launch an interactive editor when the
+      // suite runs without a TTY (git defaults to vi).
+      GIT_EDITOR: "true",
+      GIT_SEQUENCE_EDITOR: "true",
+    },
   });
   return stdout;
 };
