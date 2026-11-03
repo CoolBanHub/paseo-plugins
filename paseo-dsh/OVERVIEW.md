@@ -134,8 +134,13 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   untitled rows in the dsh web UI sidebar. Sessions containing user,
   assistant or tool events, archived sessions, and Workspace members are
   never removed.
-- Tool output, images and dsh-specific presentation cards outside the
-  standard ACP update surface are not carried over.
+- Standard (non-PTC) presets render each dsh tool call as a structured
+  Paseo row — Shell, Read, Edit, Write, Search or Fetch — with its ACP
+  content output, instead of the bare tool name; `todo_write` updates
+  Paseo's native todo list, live and on history replay. The connector
+  replaces dsh's `kind: "other"` tool updates in flight, so no opaque
+  "unknown" row is left behind. Images and dsh-specific presentation cards
+  outside the standard ACP update surface are still not carried over.
 - In PTC presets every tool runs inside one `run_code` program, and dsh's
   ACP bridge only reports that aggregate call. The bridge plugin mounted
   into each spawn mirrors dsh's internal per-tool dispatch events into a

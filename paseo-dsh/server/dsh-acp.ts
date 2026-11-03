@@ -21,6 +21,7 @@ import type { AcpConnector, AcpStream, AcpStreamMessage } from "@getpaseo/plugin
 import type { DshSessionLaunchContext } from "./session-launch-context";
 import { writeWebModelOverlay } from "./dsh-catalog.ts";
 import { DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
+import { DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD } from "./tool-present.ts";
 import {
   DEFAULT_PERMISSION_OPTIONS,
   DSH_MODES,
@@ -585,8 +586,65 @@ function aggregateOutputText(content: unknown): string {
       const text = (inner as Record<string, unknown>).text;
       if (typeof text === "string") parts.push(text);
     }
+    // normalizeFailedToolUpdate supplies {message} for failed calls that
+    // carried no content; surface it as the row's error text.
+    if (typeof block.message === "string") parts.push(block.message);
   }
   return parts.filter(Boolean).join("\n");
+}
+
+/** Parse a dsh rawInput value, which is an object or a JSON string. */
+function parseToolInput(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-emit one standard dsh tool update as a `dsh/tool/*` vendor
+ * notification. dsh reports `kind: "other"` and delivers output in ACP
+ * `content` blocks, both of which Paseo's generic adapter cannot turn into
+ * a useful row; the transformer rebuilds the structured detail instead.
+ */
+function standardToolNotification(
+  update: Record<string, unknown>,
+  snapshot: { title?: unknown; rawInput?: unknown } | undefined,
+): AcpStreamMessage | undefined {
+  const callId = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+  if (!callId) return undefined;
+  const title = typeof update.title === "string" && update.title
+    ? update.title
+    : typeof snapshot?.title === "string" ? snapshot.title : undefined;
+  const name = title ?? "tool";
+  if (update.sessionUpdate === "tool_call") {
+    return {
+      jsonrpc: "2.0",
+      method: DSH_TOOL_CALL_METHOD,
+      params: { callId, name, arguments: parseToolInput(update.rawInput) ?? {} },
+    };
+  }
+  const status = typeof update.status === "string" ? update.status : undefined;
+  return {
+    jsonrpc: "2.0",
+    method: DSH_TOOL_RESULT_METHOD,
+    params: {
+      callId,
+      name,
+      arguments: parseToolInput(snapshot?.rawInput) ?? {},
+      status,
+      isError: status === "failed",
+      output: aggregateOutputText(update.content) || aggregateOutputText(update.rawOutput),
+    },
+  };
 }
 
 /** A PTC program's aggregate `run_code` call, kept for the fallback row. */
@@ -1060,6 +1118,26 @@ export function createDshConnector(
                 // Paseo would render the aggregate as an opaque "Run code"
                 // JSON row; the mirrored sub-call rows replace it.
                 return;
+              }
+              if (
+                processMode !== "ptc" &&
+                typeof update?.toolCallId === "string" &&
+                (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
+              ) {
+                const sessionId = (message.params as { sessionId?: unknown }).sessionId;
+                if (typeof sessionId === "string" && liveSessions.has(sessionId) && fromAgentController) {
+                  const notification = standardToolNotification(update, toolSnapshots.get(update.toolCallId));
+                  if (notification) {
+                    try {
+                      fromAgentController.enqueue(notification);
+                    } catch {
+                      // The consumer tore the stream down; nothing left to render.
+                    }
+                    // Paseo's ACP adapter would show the bare tool name and
+                    // drop the ACP content output; the vendor row replaces it.
+                    return;
+                  }
+                }
               }
               if (update?.sessionUpdate === "config_option_update") {
                 const sessionId = (message.params as { sessionId?: unknown }).sessionId;

@@ -3,6 +3,7 @@ import { runAcpProvider } from "@getpaseo/plugin/server/acp";
 import { createDshConnector } from "./server/dsh-acp";
 import { dshCatalogCacheKey } from "./server/dsh-catalog";
 import { dshPtcTransformer } from "./server/ptc-present";
+import { dshToolTransformer } from "./server/tool-present";
 import { currentDshSessionLaunchContext, withDshSessionLaunchContext } from "./server/session-launch-context";
 import { withDshHistoryReplay } from "./server/history-replay";
 
@@ -15,7 +16,7 @@ export default function contribute(server: PluginServerContext) {
     // npx resolution plus first-run acp profile initialization can exceed
     // the 10s default.
     acpOptions: { startupTimeoutMs: 60_000 },
-    transformers: [dshPtcTransformer],
+    transformers: [dshPtcTransformer, dshToolTransformer],
     connector: createDshConnector(
       (message, detail) =>
         console.log(`[dsh] ${message}`, detail === undefined ? "" : JSON.stringify(detail).slice(0, 600)),

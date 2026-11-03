@@ -7,7 +7,8 @@ import type {
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
-import { dshPtcTimelineUpdates, DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD, dshToolDetail, dshToolDetailWithOutput } from "./ptc-present.ts";
+import { dshPtcTimelineUpdates, DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
+import { dshTodoItem, dshToolDetail, dshToolDetailWithOutput } from "./tool-present.ts";
 import { dshHomePath, readDshSessionEvents, type DshSessionEvent } from "./probe-cleanup.ts";
 
 const MAX_REPLAY_ITEMS = 4_000;
@@ -137,6 +138,14 @@ export function dshHistoryTimelineItems(
       if (ptcRoots.has(callId)) continue;
       const name = call?.name ?? (typeof message?.name === "string" ? message.name : "tool");
       items.push(settledToolItem(callId, name, call?.arguments ?? parseArguments(message?.arguments), message?.content, message?.isError === true));
+      continue;
+    }
+
+    if (event.type === "todo/write") {
+      // The durable todo event is the authoritative list; the tool call that
+      // produced it only carries the same arguments.
+      const todo = dshTodoItem(object(data), sessionId);
+      if (todo) items.push(todo);
       continue;
     }
 

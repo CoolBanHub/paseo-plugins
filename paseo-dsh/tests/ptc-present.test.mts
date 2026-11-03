@@ -12,6 +12,11 @@ import {
   DSH_PTC_RESULT_METHOD,
   dshPtcTimelineUpdates,
 } from "../server/ptc-present.ts";
+import {
+  DSH_TOOL_CALL_METHOD,
+  DSH_TOOL_RESULT_METHOD,
+  dshToolTimelineUpdates,
+} from "../server/tool-present.ts";
 
 // PTC sub-call presentation: the connector mirrors dsh's internal
 // tool/ptc-dispatch events out of the spawned process and re-emits them as
@@ -58,22 +63,32 @@ test.after(() => rmSync(home, { recursive: true, force: true }));
 
 type PtcNotification = { method: string; params: Record<string, unknown> };
 
-async function openConnection() {
+async function openConnection(mode = "ptc") {
   const ptcNotifications: PtcNotification[] = [];
+  const toolNotifications: PtcNotification[] = [];
   const sessionUpdates: Array<Record<string, unknown>> = [];
-  const stream = await createDshConnector(noLog, () => ({ cwd: "/tmp", mode: "ptc" }))();
+  const stream = await createDshConnector(noLog, () => ({ cwd: "/tmp", mode }))();
   // Paseo's adapter diverts non-ACP notification methods to the plugin's
-  // transformer before the SDK connection; mirror that routing here so the
-  // SDK never observes dsh/ptc/* messages, and keep them for assertions.
+  // transformers before the SDK connection; mirror that routing here so the
+  // SDK never observes dsh/* messages, and keep them for assertions.
   const readable = stream.readable.pipeThrough(
     new TransformStream<AcpStreamMessage, AcpStreamMessage>({
       transform(message, controller) {
-        if ("method" in message && !("id" in message) && message.method.startsWith("dsh/ptc/")) {
-          ptcNotifications.push({
-            method: message.method,
-            params: (message.params ?? {}) as Record<string, unknown>,
-          });
-          return;
+        if ("method" in message && !("id" in message)) {
+          if (message.method.startsWith("dsh/ptc/")) {
+            ptcNotifications.push({
+              method: message.method,
+              params: (message.params ?? {}) as Record<string, unknown>,
+            });
+            return;
+          }
+          if (message.method.startsWith("dsh/tool/")) {
+            toolNotifications.push({
+              method: message.method,
+              params: (message.params ?? {}) as Record<string, unknown>,
+            });
+            return;
+          }
         }
         controller.enqueue(message);
       },
@@ -89,7 +104,7 @@ async function openConnection() {
     () => client as never,
     { writable: stream.writable, readable } as never,
   );
-  return { stream, connection, ptcNotifications, sessionUpdates };
+  return { stream, connection, ptcNotifications, toolNotifications, sessionUpdates };
 }
 
 async function waitForPtcRecords(notifications: PtcNotification[], count: number): Promise<void> {
@@ -204,6 +219,86 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
     leftovers = readdirSync(dataDir).filter((file) => file.startsWith("ptc-events-"));
   }
   assert.equal(leftovers.length, 0, "ptc mirror sidecar removed after the connection closes");
+});
+
+test("standard dsh tool calls render as structured timeline rows", async () => {
+  const conn = await openConnection("standard");
+  try {
+    await conn.connection.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    const session = await conn.connection.newSession({
+      cwd: "/tmp",
+      mcpServers: [],
+      _meta: { _paseo: {} },
+    } as never);
+    await conn.connection.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "use standard tools" }],
+    });
+    await waitForPtcRecords(conn.toolNotifications, 6);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const ids = new Set(["call-std-bash", "call-std-edit", "call-std-todo"]);
+    const notifications = conn.toolNotifications.filter((notification) => ids.has(String(notification.params.callId)));
+    assert.deepEqual(
+      notifications.map((notification) => notification.method),
+      [
+        DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD,
+        DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD,
+        DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD,
+      ],
+      "each standard tool update is re-emitted through the vendor channel",
+    );
+
+    // The connector drops the generic ACP tool rows, so Paseo never sees an
+    // opaque "unknown" card for these calls.
+    const leaked = conn.sessionUpdates.filter((notification) => {
+      const update = notification.update as { sessionUpdate?: string; toolCallId?: string } | undefined;
+      return update?.sessionUpdate?.startsWith("tool_call") && typeof update.toolCallId === "string" && ids.has(update.toolCallId);
+    });
+    assert.equal(leaked.length, 0, "generic ACP tool rows are suppressed");
+
+    const items = notifications
+      .flatMap((notification) =>
+        dshToolTimelineUpdates(notification.method, notification.params, "paseo-standard") ?? [])
+      .filter((update) => update.type === "timeline")
+      .map((update) => update.item);
+    const bashRows = items.filter((item) => item.type === "tool_call" && item.name === "bash");
+    assert.equal(bashRows.length, 2, "bash is announced running, then settled");
+    assert.equal(bashRows[0].type === "tool_call" && bashRows[0].status, "running");
+    assert.deepEqual(
+      bashRows[1].type === "tool_call" && bashRows[1].detail,
+      { type: "shell", command: "ls -la", output: "file-a\nfile-b" },
+      "the bash row carries its command and ACP content output",
+    );
+    const editRow = items.filter((item) => item.type === "tool_call" && item.name === "edit").at(-1);
+    assert.equal(editRow?.type === "tool_call" && editRow.status, "failed");
+    assert.equal(editRow?.type === "tool_call" && editRow.error, "edit failed: no match");
+    assert.deepEqual(
+      editRow?.type === "tool_call" && editRow.detail,
+      { type: "edit", filePath: "/tmp/src/a.ts", oldString: "x", newString: "y" },
+      "edit rows get a structured diff detail",
+    );
+    const todo = items.find((item) => item.type === "todo");
+    assert.deepEqual(
+      todo && todo.type === "todo" && todo.items.map(({ text, status }) => ({ text, status })),
+      [
+        { text: "scan the repo", status: "completed" },
+        { text: "fix the bug", status: "in_progress" },
+      ],
+      "todo_write renders the native todo list",
+    );
+    assert.equal(
+      items.filter((item) => item.type === "tool_call" && item.name === "todo_write").length,
+      0,
+      "a successful todo_write does not add a redundant tool row",
+    );
+  } finally {
+    await conn.stream.writable.close();
+  }
 });
 
 test("transformer ignores unrelated and malformed notifications", () => {

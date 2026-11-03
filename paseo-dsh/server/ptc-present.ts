@@ -1,5 +1,5 @@
 import type { AcpTransformer, AcpVendorUpdate } from "@getpaseo/plugin/server/acp";
-import type { ProviderTimelineItem, ProviderToolCallDetail } from "@getpaseo/plugin/server/provider";
+import { dshTodoItem, dshToolDetail, dshToolDetailWithOutput } from "./tool-present.ts";
 
 /**
  * Presentation of dsh PTC (programmatic tool calling) sub-calls.
@@ -32,121 +32,6 @@ export interface DshPtcRecordParams {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-/**
- * Map one dsh tool invocation to Paseo's structured tool-call detail, the
- * same mapping the ZCode provider uses so rows render identically across
- * providers. dsh tools take snake_case arguments.
- */
-export function dshToolDetail(name: string, args: Record<string, unknown> | undefined): ProviderToolCallDetail {
-  const input = args ?? {};
-  switch (name) {
-    case "bash":
-    case "pwsh":
-    case "shell":
-      return { type: "shell", command: text(input.command) ?? "" };
-    case "read":
-    case "read_image":
-      return { type: "read", filePath: text(input.file_path ?? input.path) ?? "" };
-    case "edit":
-      return {
-        type: "edit",
-        filePath: text(input.file_path ?? input.path) ?? "",
-        oldString: text(input.old_string),
-        newString: text(input.new_string),
-      };
-    case "write":
-      return {
-        type: "write",
-        filePath: text(input.file_path ?? input.path) ?? "",
-        content: text(input.content) ?? "",
-      };
-    case "glob":
-    case "grep":
-      return {
-        type: "search",
-        query: text(input.pattern ?? input.query) ?? "",
-        toolName: name === "glob" ? "glob" : "grep",
-      };
-    case "web_search":
-      return { type: "search", query: text(input.query ?? input.keywords) ?? "", toolName: "web_search" };
-    case "web_fetch":
-    case "web":
-      return { type: "fetch", url: text(input.url) ?? "" };
-    case "run_code":
-      // Fallback row for a PTC program that dispatched no tools: the
-      // description labels it and the code stands in for its activity.
-      return {
-        type: "plain_text",
-        label: text(input.description) ?? "Run code",
-        text: text(input.code)?.slice(0, 4000),
-        icon: "square_terminal",
-      };
-    case "subagent":
-      return {
-        type: "sub_agent",
-        subAgentType: text(input.type ?? input.subagent_type),
-        description: text(input.description),
-        log: "",
-      };
-    case "ask_user_question": {
-      const first = Array.isArray(input.questions)
-        ? input.questions.find((question): question is Record<string, unknown> =>
-          !!question && typeof question === "object",
-        )
-        : undefined;
-      return { type: "plain_text", label: text(first?.header) ?? text(input.description) ?? name };
-    }
-    default:
-      return { type: "plain_text", label: text(input.description) ?? name };
-  }
-}
-
-/** Attach a finished sub-call's output where Paseo's row detail expects it. */
-export function dshToolDetailWithOutput(detail: ProviderToolCallDetail, output: string): ProviderToolCallDetail {
-  switch (detail.type) {
-    case "shell":
-      return { ...detail, output: output.slice(0, 8000) };
-    case "read":
-      return { ...detail, content: output.slice(0, 8000) };
-    case "search":
-      return { ...detail, content: output.slice(0, 4000) };
-    case "fetch":
-      return { ...detail, result: output.slice(0, 4000) };
-    case "plain_text":
-      // Keep a non-empty detail text (e.g. the run_code fallback's program)
-      // unless the call produced output worth showing instead.
-      return output ? { ...detail, text: output.slice(0, 4000) } : detail;
-    default:
-      return detail;
-  }
-}
-
-/**
- * dsh's todo_write mirrors Paseo's native todo timeline item. The first
- * completed call renders the list; later calls update the same item id.
- */
-function dshTodoItem(args: Record<string, unknown> | undefined, sessionId: string): ProviderTimelineItem | undefined {
-  const todos = Array.isArray(args?.todos)
-    ? args.todos.filter((todo): todo is Record<string, unknown> => !!todo && typeof todo === "object")
-    : [];
-  if (!todos.length) return undefined;
-  return {
-    type: "todo",
-    id: `dsh:${sessionId}:todos`,
-    items: todos.map((todo, index) => {
-      const status = todo.status === "in_progress" || todo.status === "pending" || todo.status === "completed"
-        ? todo.status
-        : "pending";
-      return {
-        id: String(index),
-        text: text(todo.content) ?? text(todo.subject) ?? "",
-        status,
-        completed: status === "completed",
-      };
-    }),
-  };
 }
 
 /** Reject mirrored records that lack the fields the timeline rows need. */

@@ -48,11 +48,21 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
     { type: "tool/ptc-dispatch-start", seq: 7, data: { rootCallId: "run-1", subCallId: "sub-1", name: "bash", arguments: { command: "echo ok" } } },
     { type: "tool/ptc-dispatch", seq: 8, data: { rootCallId: "run-1", subCallId: "sub-1", name: "bash", arguments: { command: "echo ok" }, content: [{ type: "text", text: "ok" }] } },
     { type: "tool/result", seq: 9, data: { message: { toolCallId: "run-1", isError: false, content: [{ type: "text", text: "ok" }] } } },
+    {
+      type: "todo/write",
+      seq: 10,
+      data: {
+        todos: [
+          { content: "scan the repo", status: "completed" },
+          { content: "fix the bug", status: "in_progress" },
+        ],
+      },
+    },
   ];
 
   const items = dshHistoryTimelineItems("history-a", ptcEvents);
   assert.deepEqual(items.map((item) => item.type), [
-    "user_message", "reasoning", "assistant_message", "tool_call", "tool_call", "tool_call", "tool_call",
+    "user_message", "reasoning", "assistant_message", "tool_call", "tool_call", "tool_call", "tool_call", "todo",
   ]);
   assert.equal(items[0]?.id, "user-id");
   assert.equal(items[0]?.type === "user_message" ? items[0].text : "", "Hello");
@@ -64,6 +74,16 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
   assert.equal(items[4]?.type === "tool_call" ? items[4].status : "", "completed");
   assert.equal(items[5]?.id, "sub-1");
   assert.equal(items[6]?.id, "sub-1");
+  assert.deepEqual(
+    items[7]?.type === "todo"
+      ? items[7].items.map(({ text, status }) => ({ text, status }))
+      : undefined,
+    [
+      { text: "scan the repo", status: "completed" },
+      { text: "fix the bug", status: "in_progress" },
+    ],
+    "the durable todo/write event restores the native plan list",
+  );
   assert.ok(!items.some((item) => item.id === "run-1"), "a run_code call with mirrored dispatches is not shown twice");
   assert.ok(!items.some((item) => item.type === "user_message" && item.text.includes("Do not display")));
 });

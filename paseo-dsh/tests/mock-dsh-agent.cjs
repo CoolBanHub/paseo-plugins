@@ -158,7 +158,75 @@ rl.on("line", (line) => {
         ? message.params.prompt.map((part) => part.text ?? "").join("\n")
         : "";
       const dispatchesTools = !prompt.includes("no dispatch");
-      if (dispatchesTools) mirrorPtcDispatches(message.params?.sessionId);
+      const standardTools = prompt.includes("standard tools");
+      if (dispatchesTools && !standardTools) mirrorPtcDispatches(message.params?.sessionId);
+      if (standardTools) {
+        const sessionId = message.params?.sessionId;
+        const emit = (update) => send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { sessionId, update },
+        });
+        // Standard dsh tool lifecycle: title is the bare tool name,
+        // kind is always "other", and output arrives in ACP content blocks.
+        emit({
+          sessionUpdate: "tool_call",
+          toolCallId: "call-std-bash",
+          title: "bash",
+          kind: "other",
+          status: "in_progress",
+          rawInput: { command: "ls -la", description: "List files" },
+        });
+        emit({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-std-bash",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "file-a\nfile-b" } }],
+        });
+        emit({
+          sessionUpdate: "tool_call",
+          toolCallId: "call-std-edit",
+          title: "edit",
+          kind: "other",
+          status: "in_progress",
+          rawInput: { file_path: "/tmp/src/a.ts", old_string: "x", new_string: "y" },
+        });
+        emit({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-std-edit",
+          status: "failed",
+          content: [{ type: "content", content: { type: "text", text: "edit failed: no match" } }],
+        });
+        emit({
+          sessionUpdate: "tool_call",
+          toolCallId: "call-std-todo",
+          title: "todo_write",
+          kind: "other",
+          status: "in_progress",
+          rawInput: {
+            todos: [
+              { content: "scan the repo", status: "completed" },
+              { content: "fix the bug", status: "in_progress" },
+            ],
+          },
+        });
+        emit({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-std-todo",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "Updated todo list" } }],
+        });
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: prompt } },
+          },
+        });
+        respond({ stopReason: "end_turn" });
+        break;
+      }
       // Like real dsh PTC: one aggregate run_code tool call wraps the
       // program; only the title says "run_code", and the settle update
       // carries nested content blocks.
