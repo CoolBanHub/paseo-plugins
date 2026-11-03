@@ -71,18 +71,32 @@ async function fixture(t, options = {}) {
   const snapshot = (sessionId) => {
     const state = states.get(sessionId);
     return {
-      session: { sessionId, mode: state.runtimeMode ?? state.mode, model: state.model, status: state.sessionStatus ?? "idle" },
+      session: {
+        sessionId,
+        mode: state.runtimeMode ?? state.mode,
+        model: state.model,
+        status: state.sessionStatus ?? "idle",
+        ...(state.sessionKind ? { sessionKind: state.sessionKind } : {}),
+        ...(state.target !== undefined ? { target: structuredClone(state.target) } : {}),
+      },
       settings: {
         mode: { current: state.mode },
         model: { available, current: state.model },
-        thoughtLevel: { current: state.model.options?.reasoningLevel },
+        thoughtLevel: { current: state.model?.options?.reasoningLevel },
       },
-      runtime: { stateRevision: state.revision, eventSeq: state.eventSeq },
+      runtime: {
+        stateRevision: state.revision,
+        eventSeq: state.eventSeq,
+        ...(state.activeTurnKind ? { activeTurnKind: state.activeTurnKind } : {}),
+      },
       projection: {
         contextWindow: 500_000,
         mode: state.runtimeMode ?? state.mode,
+        ...(state.contextUsed !== undefined ? { contextUsed: state.contextUsed } : {}),
+        ...(state.target !== undefined ? { target: structuredClone(state.target) } : {}),
         ...(state.backgroundJobs ? { backgroundJobs: structuredClone(state.backgroundJobs) } : {}),
       },
+      ...(state.slashCommands ? { slashCommands: structuredClone(state.slashCommands) } : {}),
       ...(state.todos ? { todos: structuredClone(state.todos) } : {}),
     };
   };
@@ -101,6 +115,13 @@ async function fixture(t, options = {}) {
         model: structuredClone(method === "session/resume" ? options.resumeSelection ?? defaultSelection : defaultSelection),
         ...(options.initialTodos ? { todos: structuredClone(options.initialTodos) } : {}),
         ...(options.initialBackgroundJobs ? { backgroundJobs: structuredClone(options.initialBackgroundJobs) } : {}),
+        ...(options.slashCommands ? { slashCommands: structuredClone(options.slashCommands) } : {}),
+        ...(options.initialTarget !== undefined ? { target: structuredClone(options.initialTarget) } : {}),
+        ...(options.initialContextUsed !== undefined ? { contextUsed: options.initialContextUsed } : {}),
+        goalActions: [],
+        forkTargets: [],
+        cancelledTasks: [],
+        compactionRequests: 0,
       });
       return { result: snapshot(id) };
     }
@@ -143,9 +164,85 @@ async function fixture(t, options = {}) {
     }
     if (method === "session/subscribe") states.get(params.sessionId).subscribed = true;
     if (method === "session/send" && rejectSend) return { error: { code: -1, message: "send rejected" } };
+    if (method === "session/compact") {
+      const state = states.get(params.sessionId);
+      state.compactionRequests++;
+      state.activeTurnKind = "compact";
+      state.revision++;
+      return { result: { snapshot: snapshot(params.sessionId), compact: { state: "accepted" } } };
+    }
+    if (method === "session/goal") {
+      const state = states.get(params.sessionId);
+      state.goalActions.push({ action: params.action, objective: params.objective });
+      if (params.action === "clear") state.target = null;
+      else if (params.action === "pause" && state.target) state.target = { ...state.target, status: "paused" };
+      else if (params.action === "resume" && state.target) state.target = { ...state.target, status: "active" };
+      else if (params.action !== "show") {
+        state.target = {
+          targetID: "goal-1",
+          objective: params.objective ?? state.target?.objective ?? "Goal",
+          status: "active",
+          tokensUsed: 0,
+          tokenBudget: null,
+          timeUsedSeconds: 0,
+        };
+      }
+      state.revision++;
+      return {
+        result: {
+          response: params.action === "show" ? "Goal active" : "Goal " + params.action,
+          snapshot: snapshot(params.sessionId),
+          startedTurn: false,
+        },
+      };
+    }
+    if (method === "session/fork") {
+      const state = states.get(params.sessionId);
+      state.forkTargets.push(structuredClone(params.target));
+      if (!states.has("forked-session")) {
+        states.set("forked-session", {
+          sessionKind: "fork",
+          mode: "build",
+          runtimeMode: "build",
+          model: structuredClone(defaultSelection),
+          revision: 0,
+          eventSeq: 0,
+        });
+      }
+      return {
+        result: {
+          forkedSessionId: "forked-session",
+          parentSessionId: params.sessionId,
+          targetMessageId: "message-1",
+          response: "",
+          // Real ZCode returns the forked session's snapshot here.
+          snapshot: snapshot("forked-session"),
+        },
+      };
+    }
+    if (method === "session/cancelBackgroundTask") {
+      const state = states.get(params.sessionId);
+      state.cancelledTasks.push(params.taskId);
+      const job = state.backgroundJobs?.find((entry) => entry.taskId === params.taskId);
+      if (job) job.status = "cancelled";
+      return { result: {} };
+    }
+    if (method === "session/usage") {
+      return { result: {
+        sessionId: params.sessionId,
+        totalTokens: 1234,
+        inputTokens: 1000,
+        outputTokens: 234,
+        reasoningTokens: 10,
+        cacheReadTokens: 50,
+        cacheCreationTokens: 0,
+        modelRequestCount: 3,
+        modelErrorCount: 0,
+      } };
+    }
     return { result: {} };
   });
-  const connection = await createZcodeProvider().connect({ versions: [PROVIDER_PROTOCOL_VERSION], capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence", "session.archive", "session.unarchive", ...(options.subsessions === false ? [] : ["session.subsession"])] });
+  const connection = await createZcodeProvider().connect({ versions: [PROVIDER_PROTOCOL_VERSION], capabilities: ["prompt.message", "prompt.command", "prompt.image", "session.configure", "session.persistence", "session.archive", "session.unarchive", ...(options.subsessions === false ? [] : ["session.subsession"])] });
   t.after(() => connection.close());
   const events = [];
   connection.onEvent((event) => events.push(structuredClone(event)));
@@ -159,8 +256,12 @@ async function fixture(t, options = {}) {
     type: "session.prompt", sessionId: "paseo-session",
     prompt: { clientMessageId: "message", delivery, input: { type: "message", content } },
   });
+  const command = (name, args = "", clientMessageId = "command-message") => connection.send({
+    type: "session.prompt", sessionId: "paseo-session",
+    prompt: { clientMessageId, delivery: "auto", input: { type: "command", name, arguments: args } },
+  });
   return {
-    events, open, configure, prompt, connection, archiveCalls,
+    events, open, configure, prompt, command, connection, archiveCalls,
     session: (sessionId, patch) => {
       let state = states.get(sessionId);
       if (!state) { state = {}; states.set(sessionId, state); }
@@ -189,7 +290,7 @@ async function fixture(t, options = {}) {
       state.revision = revision;
       if (notify) stateListener({ sessionId: id, scope: "session", revision, patch });
     },
-    notify: (patch, revision) => stateListener({ sessionId: fSessionId(), scope: "session", revision, patch }),
+    notify: (patch, revision, reason) => stateListener({ sessionId: fSessionId(), scope: "session", revision, patch, ...(reason ? { reason } : {}) }),
     sessionEvent: (event) => eventListener({ seq: 1, timestamp: Date.now(), payload: {}, ...event }),
     serverRequest: (id, params, method = "interaction/requestPermission") => serverRequestListener({ id, method, params }),
     serverReplies,
@@ -200,6 +301,12 @@ async function fixture(t, options = {}) {
     beforeSet: (fn) => { beforeSet = fn; },
     beforeSubagents: (fn) => { beforeSubagents = fn; },
     rejectSend: () => { rejectSend = true; },
+    commandList: () => events.filter((event) => event.type === "session.commands").at(-1)?.commands,
+    goalItems: () => events.filter((event) => event.type === "timeline.item" && event.item.type === "tool_call" && event.item.id.endsWith(":goal")),
+    compactionItems: () => events.filter((event) => event.type === "timeline.item" && event.item.type === "compaction"),
+    notifications: () => events.filter((event) => event.type === "timeline.item" && event.item.type === "notification"),
+    state: (id = fSessionId()) => states.get(id),
+    listSessions: () => connection.send({ type: "sessions", requestId: "sessions" }),
   };
   function fSessionId() {
     return events.find((event) => event.type === "session.persistence")?.persistence.data.zcodeSessionId;
@@ -1016,4 +1123,231 @@ test("history replay links Agent cards to subagent subsessions", async (t) => {
   assert.ok(f.events.some((event) => event.type === "timeline.item" && event.sessionId === "sess_subagent_d" && event.item.text === "子会话结论"));
   const childTurn = f.events.find((event) => event.type === "session.turn" && event.sessionId === "sess_subagent_d");
   assert.equal(childTurn.state, "completed");
+});
+
+test("generic AskUserQuestion requests use Paseo's native question form", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.serverRequest("server-question-1", {
+    sessionId,
+    requestId: "ask-1",
+    toolName: "AskUserQuestion",
+    questions: [{
+      header: "Confirm",
+      question: "Proceed with the migration?",
+      options: [{ label: "Yes", description: "Run it" }, { label: "No" }],
+    }],
+  }, "interaction/requestUserInput");
+
+  const card = f.events.find((event) => event.type === "session.permission");
+  assert.equal(card.request.kind, "question");
+  assert.equal(card.request.name, "AskUserQuestion");
+  assert.deepEqual(card.request.input, {
+    questions: [{
+      header: "Confirm",
+      question: "Proceed with the migration?",
+      options: [{ label: "Yes", description: "Run it" }, { label: "No" }],
+      multiSelect: false,
+      allowOther: true,
+      allowEmpty: false,
+    }],
+  });
+  assert.deepEqual(card.request.actions, []);
+  assert.deepEqual(f.serverReplies, []);
+
+  await f.connection.send({
+    type: "session.permission",
+    sessionId: "paseo-session",
+    permissionId: "server-question-1",
+    response: { behavior: "allow", updatedInput: { answers: { Confirm: "Yes" } } },
+  });
+  assert.deepEqual(f.serverReplies, [{
+    id: "server-question-1",
+    result: { action: "accept", content: { answers: { "Proceed with the migration?": "Yes" } } },
+  }]);
+});
+
+test("declining a generic question resolves as declined", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.serverRequest("server-question-2", {
+    sessionId,
+    requestId: "ask-2",
+    toolName: "AskUserQuestion",
+    questions: [{ header: "Confirm", question: "Proceed?", options: [{ label: "Yes" }] }],
+  }, "interaction/requestUserInput");
+
+  await f.connection.send({
+    type: "session.permission",
+    sessionId: "paseo-session",
+    permissionId: "server-question-2",
+    response: { behavior: "deny" },
+  });
+  assert.deepEqual(f.serverReplies, [{ id: "server-question-2", result: { action: "decline" } }]);
+});
+
+test("the command catalog exposes ZCode commands Paseo can execute", async (t) => {
+  const f = await fixture(t, {
+    slashCommands: [
+      { name: "compact", description: "Compact the conversation", inputHint: "[instructions]", source: "builtin" },
+      { name: "goal", description: "Show or set the goal", inputHint: "[objective]", source: "builtin" },
+      { name: "fork", description: "Fork from a checkpoint", inputHint: "[latest|id]", source: "builtin" },
+      { name: "help", description: "Show help", source: "builtin" },
+      { name: "review", description: "Review the diff", source: "custom" },
+    ],
+  });
+  await f.open({ model: BINGLM });
+  assert.deepEqual(
+    f.commandList().map((command) => command.name),
+    ["compact", "goal", "fork", "review", "tasks", "stop-task", "usage"],
+    "supported builtins and custom commands stay; UI-only builtins are filtered",
+  );
+  assert.equal(f.commandList().find((command) => command.name === "compact").argumentHint, "[instructions]");
+});
+
+test("slash commands execute through ZCode and settle Paseo prompts", async (t) => {
+  const f = await fixture(t, {
+    initialBackgroundJobs: [{ taskId: "task-1", status: "running", toolName: "Bash", command: "npm test" }],
+  });
+  await f.open({ model: BINGLM });
+  const zcodeSessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  await f.command("compact", "focus on tests");
+  assert.equal(f.calls("session/compact").at(-1).sessionId, zcodeSessionId);
+  assert.equal(f.calls("session/compact").at(-1).instructions, "focus on tests");
+  assert.equal(f.compactionItems().at(-1).item.trigger, "manual");
+  assert.equal(f.compactionItems().at(-1).item.status, "loading");
+  assert.ok(f.events.some((event) => event.type === "session.prompt_result" && event.clientMessageId === "command-message" && event.result.type === "completed"));
+
+  await f.command("goal", "Ship the migration");
+  const goalCall = f.calls("session/goal").at(-1);
+  assert.equal(goalCall.sessionId, zcodeSessionId);
+  assert.equal(goalCall.action, "set");
+  assert.equal(goalCall.objective, "Ship the migration");
+  const goal = f.goalItems().at(-1).item;
+  assert.equal(goal.status, "running");
+  assert.match(goal.detail.text, /Ship the migration/);
+
+  await f.command("tasks");
+  assert.match(f.notifications().at(-1).item.message, /task-1/);
+  await f.command("stop-task", "task-1");
+  assert.deepEqual(f.calls("session/cancelBackgroundTask").at(-1), {
+    sessionId: zcodeSessionId,
+    taskId: "task-1",
+  });
+  assert.match(f.notifications().at(-1).item.message, /task-1/);
+
+  await f.command("usage");
+  assert.match(f.notifications().at(-1).item.message, /total: 1234/);
+  await f.command("fork", "latest");
+  assert.deepEqual(f.calls("session/fork").at(-1).target, { kind: "latestCheckpoint" });
+  assert.match(f.notifications().at(-1).item.message, /forked-session/);
+
+  await f.command("review", "src/app.ts");
+  assert.equal(f.calls("session/send").at(-1).content, "/review src/app.ts");
+});
+
+test("goal state and context usage surface on open and update", async (t) => {
+  const f = await fixture(t, {
+    initialTarget: {
+      targetID: "goal-1",
+      objective: "Ship the migration",
+      status: "active",
+      tokensUsed: 10,
+      tokenBudget: 100,
+      timeUsedSeconds: 5,
+    },
+    initialContextUsed: 1234,
+  });
+  await f.open({ model: BINGLM });
+  const goal = f.goalItems().at(-1).item;
+  assert.equal(goal.status, "running");
+  assert.equal(goal.detail.label, "Goal · active");
+  assert.match(goal.detail.text, /Tokens: 10 \/ 100/);
+  const usage = f.events.filter((event) => event.type === "session.usage").at(-1);
+  assert.equal(usage.usage.contextWindowUsedTokens, 1234);
+  assert.equal(usage.usage.contextWindowMaxTokens, 500_000);
+
+  await f.command("goal", "pause");
+  assert.equal(f.goalItems().at(-1).item.detail.label, "Goal · paused");
+  await f.command("goal", "clear");
+  assert.equal(f.goalItems().at(-1).item.status, "completed");
+  assert.match(f.goalItems().at(-1).item.detail.text, /目标已清除/);
+});
+
+test("compaction state updates render loading and completed rows", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const before = f.state().revision ?? 0;
+  f.notify({}, before + 1, "compact_started");
+  assert.equal(f.compactionItems().at(-1).item.status, "loading");
+  f.notify({}, before + 2, "session_compacted");
+  assert.equal(f.compactionItems().at(-1).item.status, "completed");
+});
+
+test("forked ZCode sessions appear in the import list", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  f.session("forked-session", {
+    sessionKind: "fork",
+    mode: "build",
+    runtimeMode: "build",
+    model: structuredClone(defaultSelection),
+    revision: 0,
+    eventSeq: 0,
+  });
+  f.session("side-chat", {
+    sessionKind: "selection_side_chat",
+    mode: "build",
+    runtimeMode: "build",
+    model: structuredClone(defaultSelection),
+    revision: 0,
+    eventSeq: 0,
+  });
+  await f.listSessions();
+  const sessions = f.events.filter((event) => event.type === "sessions").at(-1).sessions;
+  const ids = sessions.map((session) => session.persistence.data.zcodeSessionId);
+  assert.ok(ids.includes("forked-session"), "forked sessions are importable");
+  assert.ok(!ids.includes("side-chat"), "auxiliary side chats stay out of the picker");
+});
+
+test("history replay surfaces compaction, fork and goal-verification markers", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [{
+      info: { role: "assistant", messageId: "history-marker-1", semantics: { transcriptVisibility: "visible" } },
+      parts: [
+        { type: "compaction", partId: "compact-part-1", auto: true },
+        {
+          type: "timeline", partId: "compact-part-2", timelineType: "context_compaction",
+          status: "completed", trigger: "manual", preCompactTokenCount: 12345,
+        },
+        {
+          type: "timeline", partId: "verify-part-1", timelineType: "goal_verification",
+          verification: { passed: false, reason: "tests fail" },
+        },
+        {
+          type: "timeline", partId: "fork-part-1", timelineType: "session_fork",
+          targetCheckpointId: "checkpoint-9",
+        },
+        { type: "text", partId: "text-part-1", text: "done" },
+      ],
+    }],
+  });
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history_markers" } }, "replay");
+
+  const items = f.events
+    .filter((event) => event.type === "timeline.item" && event.sessionId === "paseo-session")
+    .map((event) => event.item);
+  const compactions = items.filter((item) => item.type === "compaction");
+  assert.equal(compactions.length, 2);
+  assert.equal(compactions[0].trigger, "auto");
+  assert.equal(compactions[1].trigger, "manual");
+  assert.equal(compactions[1].preTokens, 12345);
+  const notifications = items.filter((item) => item.type === "notification");
+  assert.ok(notifications.some((item) => /not satisfied/.test(item.message)));
+  assert.ok(notifications.some((item) => /checkpoint-9/.test(item.message)));
+  assert.ok(items.some((item) => item.type === "assistant_message" && item.text === "done"));
 });

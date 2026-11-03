@@ -55,6 +55,34 @@ local ZCode sessions are listed in Paseo's session picker.
 
 - Prompting, interrupting, model / mode / thinking-level switching, permission
   prompts, usage accounting per turn.
+- ZCode's generic `AskUserQuestion` flow uses Paseo's native question form.
+  The plugin answers `interaction/requestUserInput` as a `question`
+  permission, maps Paseo's form answers back to ZCode's
+  `{action:"accept", content:{answers}}` shape, and disables ZCode's
+  auto-resolution preference so questions wait for the user. Plan approval
+  keeps its dedicated plan card.
+- ZCode's slash-command catalog is published to Paseo. Commands this provider
+  can execute are `/compact` (via `session/compact`), `/goal` (via
+  `session/goal`), `/fork` (via `session/fork`), custom prompt commands (via
+  `session/send`), plus provider-local `/tasks`, `/stop-task <taskId>` and
+  `/usage`. UI-only commands (`/help`, `/model`, `/mode`, `/effort`, `/new`,
+  `/resume`, `/plugins`, `/login`, `/locale`, …) are hidden because they only
+  work in ZCode's own client. Command results and errors appear as timeline
+  notifications and settle the Paseo prompt.
+- Goal state (`session.target`) renders as a stable Goal row with objective,
+  status, token budget and elapsed time; it refreshes after goal commands,
+  goal-related state updates and turns while a goal is active. Context usage
+  from the snapshot feeds Paseo's context meter.
+- Compaction is visible: manual `/compact` and automatic compaction emit
+  Paseo's compaction timeline item (`loading` / `completed`), and failures
+  produce a warning. History replay restores compaction markers,
+  goal-verification notices and fork notices from the persisted transcript.
+- Forked ZCode sessions (`sessionKind: "fork"`) are included in Paseo's
+  session-import picker; auxiliary side chats and child sessions stay out.
+  `/fork latest` or `/fork <checkpointId>` creates a fork and reports its
+  session id for import.
+- Background tasks can be listed with `/tasks` and stopped with
+  `/stop-task <taskId>`; the task rows themselves remain display-only.
 - Pausing a run maps ZCode's `turn.completed` (`resultType: "cancelled"`) to a
   canceled Paseo turn: no system error is appended and the prompt is not
   rolled back. Only execution error result types close the turn as failed.
@@ -120,6 +148,12 @@ local ZCode sessions are listed in Paseo's session picker.
   CLI with your existing credentials. Official-plugin MCP servers that need
   desktop auth headers (for example hexin) are not available inside
   provider sessions.
+- Steering a running turn is not implemented: the legacy `session/send` path
+  rejects a second prompt while a turn is active, and Paseo only offers
+  steering when the provider declares `prompt.steer`. Rewind, session
+  lifecycle restart, MCP Apps/CUA/browser surfaces and workspace hook/MCP
+  trust reviews likewise remain ZCode-client features; their protocol
+  methods are not exposed by this provider.
 
 ## Development
 

@@ -9,6 +9,7 @@ import {
   type ProviderInput,
   type ProviderRegistration,
   type ProviderCatalog,
+  type ProviderCommand,
   type ProviderContent,
   type ProviderModel,
   type ProviderMode,
@@ -36,6 +37,7 @@ import { zcodeCatalogCacheKey } from "./zcode-catalog-key";
 
 const SUPPORTED_CAPABILITIES = [
   "prompt.message",
+  "prompt.command",
   "prompt.image",
   "session.list",
   "session.persistence",
@@ -167,6 +169,23 @@ interface ZcodeModelSelection {
   options?: { reasoningLevel: string };
 }
 
+interface ZcodeTarget {
+  targetID?: string;
+  objective?: string;
+  summaryTitle?: string | null;
+  status?: "active" | "paused" | "budget_limited" | "complete";
+  tokenBudget?: number | null;
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+}
+
+interface ZcodeSlashCommand {
+  name: string;
+  description: string;
+  inputHint?: string;
+  source?: "builtin" | "custom";
+}
+
 interface CreateOrResumeResult {
   session: {
     sessionId: string;
@@ -175,6 +194,7 @@ interface CreateOrResumeResult {
     mode?: string;
     title?: string;
     model?: ZcodeModelSelection | null;
+    target?: ZcodeTarget | null;
     workspace?: { workspacePath?: string; workspaceKey?: string };
   };
   settings?: {
@@ -191,13 +211,21 @@ interface CreateOrResumeResult {
     };
     thoughtLevel?: { current?: string };
   };
-  runtime?: { stateRevision?: number; eventSeq?: number };
+  runtime?: {
+    stateRevision?: number;
+    eventSeq?: number;
+    activeTurnKind?: "regular" | "compact" | "rewind";
+    contextUsage?: { used?: number; size?: number };
+  };
   projection?: {
     contextWindow?: number;
+    contextUsed?: number;
     status?: string;
     mode?: string;
+    target?: ZcodeTarget | null;
     backgroundJobs?: Array<Record<string, unknown>>;
   };
+  slashCommands?: ZcodeSlashCommand[];
   todos?: Array<{
     content: string;
     status: "pending" | "in_progress" | "completed";
@@ -209,8 +237,10 @@ interface CreateOrResumeResult {
 interface PendingPermission {
   request: ZcodeServerRequest;
   logicalId?: string;
-  kind: "permission" | "user_input";
+  kind: "permission" | "user_input" | "question";
   answer?: string;
+  /** Original question batch for mapping Paseo's form answers back. */
+  questions?: Array<Record<string, unknown>>;
 }
 
 /** One entry of the ZCode `session/subagents` listing. */
@@ -275,6 +305,7 @@ interface SessionState {
   zcodeSessionId: string;
   turns: Map<string, TurnState>;
   contextWindow?: number;
+  contextUsed?: number;
   pendingClientMessageId?: string;
   modelSelection?: ZcodeModelSelection;
   mode?: string;
@@ -292,6 +323,14 @@ interface SessionState {
   subagentSyncTimers?: Set<ReturnType<typeof setTimeout>>;
   subagentSyncRunning?: boolean;
   subagentSyncQueued?: boolean;
+  /** Last emitted command catalog / goal / usage signatures. */
+  commandsSignature?: string;
+  goalSignature?: string;
+  goalActive?: boolean;
+  usageSignature?: string;
+  compactionId?: string;
+  compactionTrigger?: "manual" | "auto";
+  goalRefreshTimer?: ReturnType<typeof setTimeout>;
 }
 
 function modelId(ref: { providerId: string; modelId: string }): string {
@@ -476,6 +515,237 @@ function emitBackgroundJob(
   });
 }
 
+/** ZCode slash commands the plugin can execute through this provider. */
+const SUPPORTED_BUILTIN_COMMANDS = new Set(["compact", "goal", "fork"]);
+
+/** Builtins the plugin can run even when an older snapshot omits them. */
+const FALLBACK_BUILTIN_COMMANDS: ProviderCommand[] = [
+  { name: "compact", description: "压缩当前会话，可附加摘要说明", argumentHint: "[instructions]" },
+  { name: "goal", description: "查看或设置当前会话目标", argumentHint: "[pause|resume|clear|replace <objective>|<objective>]" },
+  { name: "fork", description: "从检查点创建分支会话", argumentHint: "[latest|checkpointId]" },
+];
+
+/** Provider-local commands for ZCode background tasks and session usage. */
+const SYNTHETIC_COMMANDS: ProviderCommand[] = [
+  { name: "tasks", description: "列出 ZCode 后台任务" },
+  { name: "stop-task", description: "停止一个 ZCode 后台任务", argumentHint: "<taskId>" },
+  { name: "usage", description: "查看当前 ZCode 会话的 token 用量" },
+];
+
+let commandNoticeSeq = 0;
+
+function emitCommands(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  slashCommands: ZcodeSlashCommand[] | undefined,
+): void {
+  if (state.child) return;
+  const byName = new Map<string, ProviderCommand>();
+  for (const command of slashCommands ?? []) {
+    if (!command || typeof command.name !== "string" || !command.name.trim()) continue;
+    const name = command.name.trim().toLowerCase();
+    if (command.source !== "custom" && !SUPPORTED_BUILTIN_COMMANDS.has(name)) continue;
+    if (byName.has(name)) continue;
+    byName.set(name, {
+      name,
+      description: typeof command.description === "string" ? command.description : name,
+      ...(typeof command.inputHint === "string" && command.inputHint
+        ? { argumentHint: command.inputHint }
+        : {}),
+    });
+  }
+  for (const command of FALLBACK_BUILTIN_COMMANDS) {
+    if (!byName.has(command.name)) byName.set(command.name, command);
+  }
+  for (const command of SYNTHETIC_COMMANDS) {
+    if (!byName.has(command.name)) byName.set(command.name, command);
+  }
+  const commands = [...byName.values()];
+  const signature = JSON.stringify(commands);
+  if (signature === state.commandsSignature) return;
+  state.commandsSignature = signature;
+  emit({ type: "session.commands", sessionId: state.paseoSessionId, commands });
+}
+
+function goalStatus(target: ZcodeTarget): { status: "running" | "completed"; label: string } {
+  if (target.status === "complete") return { status: "completed", label: "Goal · complete" };
+  if (target.status === "paused") return { status: "running", label: "Goal · paused" };
+  if (target.status === "budget_limited") return { status: "running", label: "Goal · budget limited" };
+  return { status: "running", label: "Goal · active" };
+}
+
+function emitGoal(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  target: ZcodeTarget | null | undefined,
+): void {
+  if (!target || typeof target.objective !== "string" || !target.objective.trim()) {
+    if (!state.goalActive) return;
+    state.goalActive = false;
+    state.goalSignature = undefined;
+    emit({
+      type: "timeline.item",
+      sessionId: state.paseoSessionId,
+      item: {
+        type: "tool_call",
+        id: `zcode:${state.paseoSessionId}:goal`,
+        callId: `zcode:${state.paseoSessionId}:goal`,
+        name: "Goal",
+        status: "completed",
+        error: null,
+        detail: { type: "plain_text", label: "Goal", text: "目标已清除", icon: "sparkles" },
+      },
+    });
+    return;
+  }
+  const signature = JSON.stringify({
+    objective: target.objective,
+    status: target.status,
+    tokensUsed: target.tokensUsed,
+    tokenBudget: target.tokenBudget,
+    timeUsedSeconds: target.timeUsedSeconds,
+  });
+  if (signature === state.goalSignature) return;
+  state.goalSignature = signature;
+  state.goalActive = true;
+  const { status, label } = goalStatus(target);
+  const lines = [target.objective];
+  if (typeof target.tokensUsed === "number") {
+    lines.push(
+      "Tokens: " + target.tokensUsed +
+      (typeof target.tokenBudget === "number" ? " / " + target.tokenBudget : ""),
+    );
+  }
+  if (typeof target.timeUsedSeconds === "number") lines.push("Time: " + target.timeUsedSeconds + "s");
+  emit({
+    type: "timeline.item",
+    sessionId: state.paseoSessionId,
+    item: {
+      type: "tool_call",
+      id: `zcode:${state.paseoSessionId}:goal`,
+      callId: `zcode:${state.paseoSessionId}:goal`,
+      name: "Goal",
+      status,
+      error: null,
+      detail: {
+        type: "plain_text",
+        label,
+        text: lines.join("\n"),
+        icon: "sparkles",
+      },
+    },
+  });
+}
+
+function emitUsageContext(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  used: number | undefined,
+  size: number | undefined,
+): void {
+  const usedTokens = typeof used === "number" ? used : state.contextUsed;
+  const maxTokens = typeof size === "number" ? size : state.contextWindow;
+  if (usedTokens === undefined && maxTokens === undefined) return;
+  if (usedTokens !== undefined) state.contextUsed = usedTokens;
+  const signature = String(usedTokens) + "/" + String(maxTokens);
+  if (signature === state.usageSignature) return;
+  state.usageSignature = signature;
+  emit({
+    type: "session.usage",
+    sessionId: state.paseoSessionId,
+    usage: {
+      ...(maxTokens !== undefined ? { contextWindowMaxTokens: maxTokens } : {}),
+      ...(usedTokens !== undefined ? { contextWindowUsedTokens: usedTokens } : {}),
+    },
+  });
+}
+
+function emitCompaction(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  status: "loading" | "completed",
+  trigger: "manual" | "auto",
+  preTokens?: number,
+): void {
+  if (!state.compactionId) {
+    state.compactionId = `zcode:${state.paseoSessionId}:compact:${Date.now()}`;
+    state.compactionTrigger = trigger;
+  }
+  emit({
+    type: "timeline.item",
+    sessionId: state.paseoSessionId,
+    item: {
+      type: "compaction",
+      id: state.compactionId,
+      status,
+      trigger: state.compactionTrigger ?? trigger,
+      ...(typeof preTokens === "number" ? { preTokens } : {}),
+    },
+  });
+  if (status === "completed") {
+    state.compactionId = undefined;
+    state.compactionTrigger = undefined;
+  }
+}
+
+function emitCommandNotice(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  message: string,
+  level: "info" | "warning" | "error" = "info",
+): void {
+  const text = message.trim();
+  if (!text) return;
+  commandNoticeSeq += 1;
+  emit({
+    type: "timeline.item",
+    sessionId: state.paseoSessionId,
+    item: {
+      type: "notification",
+      id: `zcode:${state.paseoSessionId}:command:${Date.now()}:${commandNoticeSeq}`,
+      level,
+      message: text,
+    },
+  });
+}
+
+function parseGoalCommand(args: string): { action: "show" | "set" | "replace" | "pause" | "resume" | "clear"; objective?: string } {
+  const trimmed = args.trim();
+  if (!trimmed) return { action: "show" };
+  const [head, ...rest] = trimmed.split(/\s+/u);
+  if (head === "pause" || head === "resume" || head === "clear") {
+    return { action: head };
+  }
+  if (head === "replace") {
+    const objective = rest.join(" ").trim();
+    return objective ? { action: "replace", objective } : { action: "show" };
+  }
+  return { action: "set", objective: trimmed };
+}
+
+function parseForkTarget(args: string): Record<string, unknown> {
+  const trimmed = args.trim();
+  if (!trimmed || trimmed === "latest") return { kind: "latestCheckpoint" };
+  return { kind: "checkpoint", checkpointId: trimmed };
+}
+
+function formatUsage(result: Record<string, unknown>): string {
+  const entries: Array<[string, unknown]> = [
+    ["total", result.totalTokens],
+    ["input", result.inputTokens],
+    ["output", result.outputTokens],
+    ["reasoning", result.reasoningTokens],
+    ["cache read", result.cacheReadTokens],
+    ["cache write", result.cacheCreationTokens],
+    ["requests", result.modelRequestCount],
+    ["errors", result.modelErrorCount],
+  ];
+  return entries
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number")
+    .map(([label, value]) => label + ": " + value)
+    .join("\n");
+}
+
 function historyOutput(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? undefined : JSON.stringify(value);
@@ -510,6 +780,63 @@ export function zcodeHistoryTimelineItems(
     const parts = Array.isArray(message.parts) ? message.parts : [];
     const role = info?.role;
     const messageId = typeof info?.messageId === "string" ? info.messageId : `zcode:history:${sessionId}:${messageIndex}`;
+    // Persisted compaction/fork/verification markers are message parts, not
+    // model text. Surface them before the role-specific replay below.
+    for (const [partIndex, rawPart] of parts.entries()) {
+      if (!rawPart || typeof rawPart !== "object") continue;
+      const part = rawPart as Record<string, unknown>;
+      const partId = typeof part.partId === "string" ? part.partId : `${messageId}:part:${partIndex}`;
+      if (part.type === "compaction") {
+        items.push({
+          type: "compaction",
+          id: partId,
+          status: "completed",
+          trigger: part.auto === true ? "auto" : "manual",
+        });
+        continue;
+      }
+      if (part.type !== "timeline") continue;
+      if (part.timelineType === "context_compaction") {
+        const failed = part.status === "failed" || part.status === "error";
+        items.push({
+          type: "compaction",
+          id: partId,
+          status: "completed",
+          trigger: part.trigger === "manual" ? "manual" : "auto",
+          ...(typeof part.preCompactTokenCount === "number" ? { preTokens: part.preCompactTokenCount } : {}),
+        });
+        if (failed) {
+          items.push({
+            type: "notification",
+            id: `${partId}:failed`,
+            level: "warning",
+            message: "上下文压缩失败" + (typeof part.reason === "string" && part.reason ? "：" + part.reason : ""),
+          });
+        }
+      } else if (part.timelineType === "goal_verification") {
+        const verification = part.verification && typeof part.verification === "object"
+          ? part.verification as Record<string, unknown>
+          : {};
+        const passed = verification.passed === true;
+        items.push({
+          type: "notification",
+          id: partId,
+          level: passed ? "info" : "warning",
+          message: "Goal verification " + (passed ? "passed" : "not satisfied") +
+            (typeof verification.reason === "string" && verification.reason ? "：" + verification.reason : ""),
+        });
+      } else if (part.timelineType === "session_fork") {
+        items.push({
+          type: "notification",
+          id: partId,
+          level: "info",
+          message: "会话已从此处创建分支" +
+            (typeof part.targetCheckpointId === "string" && part.targetCheckpointId
+              ? "（" + part.targetCheckpointId + "）"
+              : ""),
+        });
+      }
+    }
     if (role === "user") {
       const text = parts
         .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
@@ -695,17 +1022,42 @@ export function createZcodeProvider(): ProviderRegistration {
         }
         const selected = state.catalog?.models.find((model) => model.id === (state.modelSelection && modelId(state.modelSelection)));
         state.contextWindow = snapshot.projection?.contextWindow ?? selected?.contextWindowMaxTokens ?? state.contextWindow;
+        if (typeof snapshot.projection?.contextUsed === "number") {
+          state.contextUsed = snapshot.projection.contextUsed;
+        }
       };
 
       client.onStateUpdate((update) => {
         const state = sessions.get(update.sessionId);
         if (!state || (update.scope && update.scope !== "session")
           || (state.revision !== undefined && update.revision < state.revision)) return;
+        const patch = update.patch && typeof update.patch === "object" && !Array.isArray(update.patch)
+          ? update.patch as Record<string, unknown>
+          : {};
         applyOfficialState(state, {
           settings: update.patch as CreateOrResumeResult["settings"],
           runtime: { stateRevision: update.revision },
         });
         if (state.ready && state.catalog) emitSessionConfig(state, state.catalog);
+        const reason = typeof update.reason === "string" ? update.reason : "";
+        if (reason === "compact_started") {
+          emitCompaction(emit, state, "loading", state.compactionTrigger ?? "auto");
+        } else if (reason === "session_compacted") {
+          emitCompaction(emit, state, "completed", state.compactionTrigger ?? "auto");
+          scheduleGoalRefresh(state);
+        } else if (reason === "session_compact_failed" || reason === "session_compact_cancelled") {
+          emitCompaction(emit, state, "completed", state.compactionTrigger ?? "auto");
+          emitCommandNotice(
+            emit,
+            state,
+            reason === "session_compact_cancelled" ? "上下文压缩已取消" : "上下文压缩失败",
+            "warning",
+          );
+          scheduleGoalRefresh(state);
+        } else if (reason.includes("goal")) {
+          scheduleGoalRefresh(state);
+        }
+        if (patch.target !== undefined) emitGoal(emit, state, patch.target as ZcodeTarget | null);
       });
 
       const turnFor = (state: SessionState, turnId: string): TurnState => {
@@ -819,19 +1171,7 @@ export function createZcodeProvider(): ProviderRegistration {
           const logicalId = typeof params.requestId === "string" && params.requestId
             ? `${zcodeSessionId}:${params.requestId}`
             : undefined;
-          const isPlanApproval = schema?.interaction === "plan_approval"
-            || toolName === "ExitPlanMode";
-          if (!isPlanApproval) {
-            log("unsupported user input request, declining", { sessionId: zcodeSessionId, toolName });
-            client.replyServerRequest(request.id, { action: "decline" });
-            return true;
-          }
-          log("user input request", {
-            sessionId: zcodeSessionId,
-            toolName,
-            requestId: params.requestId,
-            kind: "plan",
-          });
+          const questions = Array.isArray(params.questions) ? params.questions as Array<Record<string, unknown>> : [];
           if (!state) {
             log("user input for unknown session, declining", zcodeSessionId);
             client.replyServerRequest(request.id, { action: "decline" });
@@ -842,8 +1182,77 @@ export function createZcodeProvider(): ProviderRegistration {
             return true;
           }
 
+          const isPlanApproval = schema?.interaction === "plan_approval"
+            || toolName === "ExitPlanMode";
+          if (!isPlanApproval) {
+            const headers = new Set<string>();
+            const entries: Array<Record<string, unknown>> = [];
+            const formQuestions = questions.map((question, index) => {
+              const questionText = typeof question.question === "string" ? question.question : "";
+              const base = (typeof question.header === "string" && question.header.trim())
+                ? question.header.trim()
+                : questionText.trim().slice(0, 40) || `Question ${index + 1}`;
+              let header = base;
+              let suffix = 2;
+              while (headers.has(header)) header = `${base} (${suffix++})`;
+              headers.add(header);
+              const options = Array.isArray(question.options)
+                ? question.options
+                  .filter((option): option is Record<string, unknown> => !!option && typeof option === "object")
+                  .map((option) => {
+                    const label = String(option.label ?? option.value ?? "").trim() || "Option";
+                    const description = typeof option.description === "string"
+                      ? option.description
+                      : typeof option.preview === "string" ? option.preview : undefined;
+                    return { label, ...(description ? { description } : {}) };
+                  })
+                : [];
+              entries.push({ header, question: questionText, options });
+              return {
+                header,
+                question: questionText,
+                options,
+                multiSelect: question.multiSelect === true,
+                allowOther: true,
+                allowEmpty: options.length === 0,
+              };
+            });
+            if (!formQuestions.length) {
+              log("user input request without questions, declining", { sessionId: zcodeSessionId, toolName });
+              client.replyServerRequest(request.id, { action: "decline" });
+              return true;
+            }
+            const permissionId = String(request.id);
+            permissions.set(permissionId, {
+              request,
+              logicalId,
+              kind: "question",
+              questions: entries,
+            });
+            if (logicalId) pendingPermissionIds.set(logicalId, permissionId);
+            emit({
+              type: "session.permission",
+              sessionId: state.paseoSessionId,
+              request: {
+                id: permissionId,
+                name: toolName,
+                kind: "question",
+                title: String(formQuestions[0]?.header ?? "Question"),
+                description: typeof questions[0]?.question === "string" ? questions[0].question as string : undefined,
+                input: { questions: formQuestions },
+                actions: [],
+              },
+            });
+            return true;
+          }
+
+          log("user input request", {
+            sessionId: zcodeSessionId,
+            toolName,
+            requestId: params.requestId,
+            kind: "plan",
+          });
           const permissionId = String(request.id);
-          const questions = Array.isArray(params.questions) ? params.questions as Array<Record<string, unknown>> : [];
           const firstQuestion = questions[0];
           const options = firstQuestion && Array.isArray(firstQuestion.options)
             ? firstQuestion.options as Array<Record<string, unknown>>
@@ -1126,9 +1535,11 @@ export function createZcodeProvider(): ProviderRegistration {
                 outputTokens: typeof usage.outputTokens === "number" ? usage.outputTokens : undefined,
                 cachedInputTokens: typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined,
                 contextWindowMaxTokens: state.contextWindow,
+                contextWindowUsedTokens: state.contextUsed,
               },
             });
             state.turns.delete(event.turnId);
+            if (state.goalActive) scheduleGoalRefresh(state);
             scheduleSubagentSync(state, subagentSyncTiming.settledMs);
             break;
           }
@@ -1198,10 +1609,28 @@ export function createZcodeProvider(): ProviderRegistration {
         })) as unknown as CreateOrResumeResult;
         applyOfficialState(state, snapshot);
         emitTodos(emit, state, snapshot.todos);
+        emitCommands(emit, state, snapshot.slashCommands);
+        emitGoal(emit, state, snapshot.session.target ?? snapshot.projection?.target);
+        emitUsageContext(emit, state, snapshot.projection?.contextUsed, snapshot.projection?.contextWindow);
+        if (snapshot.runtime?.activeTurnKind === "compact") {
+          emitCompaction(emit, state, "loading", state.compactionTrigger ?? "auto", snapshot.projection?.contextUsed);
+        }
         emitVisibleBackgroundJobs(state, snapshot.projection?.backgroundJobs);
         if (state.ready && state.catalog) emitSessionConfig(state, state.catalog);
         return snapshot;
       };
+
+      /** Coalesce goal/compaction refreshes into one snapshot read. */
+      function scheduleGoalRefresh(state: SessionState): void {
+        if (state.closed) return;
+        if (state.goalRefreshTimer) clearTimeout(state.goalRefreshTimer);
+        state.goalRefreshTimer = setTimeout(() => {
+          state.goalRefreshTimer = undefined;
+          if (state.closed) return;
+          void refreshSession(state).catch((error) => log("session refresh failed", String(error)));
+        }, 300);
+        state.goalRefreshTimer.unref?.();
+      }
 
       const applyMode = async (state: SessionState, mode: string) => {
         const snapshot = await client.requestOk("session/setMode", {
@@ -1209,6 +1638,143 @@ export function createZcodeProvider(): ProviderRegistration {
         });
         applyOfficialState(state, snapshot as unknown as CreateOrResumeResult);
         if (state.mode !== mode) throw new Error(`ZCode did not apply mode "${mode}"; current mode is "${state.mode}"`);
+      };
+
+      const completePrompt = (
+        state: SessionState,
+        clientMessageId: string,
+        result: { type: "completed" } | { type: "failed"; error: { message: string } } = { type: "completed" },
+      ): void => {
+        emit({
+          type: "session.prompt_result",
+          sessionId: state.paseoSessionId,
+          clientMessageId,
+          result,
+        });
+      };
+
+      /** Execute one Paseo command prompt against the ZCode app-server. */
+      const handleCommandPrompt = async (
+        state: SessionState,
+        input: { name: string; arguments: string },
+        clientMessageId: string,
+      ): Promise<void> => {
+        const name = input.name.trim().toLowerCase();
+        const args = input.arguments.trim();
+        try {
+          switch (name) {
+            case "compact": {
+              state.compactionTrigger = "manual";
+              const response = await client.requestOk("session/compact", {
+                sessionId: state.zcodeSessionId,
+                expectedRevision: state.revision,
+                ...(args ? { instructions: args } : {}),
+              });
+              const snapshot = response.snapshot as CreateOrResumeResult | undefined;
+              if (snapshot) applyOfficialState(state, snapshot);
+              emitCompaction(emit, state, "loading", "manual", snapshot?.projection?.contextUsed);
+              emitCommandNotice(emit, state, args ? "已开始压缩会话：" + args : "已开始压缩会话");
+              completePrompt(state, clientMessageId);
+              return;
+            }
+            case "goal": {
+              const parsed = parseGoalCommand(args);
+              const response = await client.requestOk("session/goal", {
+                sessionId: state.zcodeSessionId,
+                action: parsed.action,
+                ...(parsed.objective ? { objective: parsed.objective } : {}),
+                expectedRevision: state.revision,
+              });
+              const snapshot = response.snapshot as CreateOrResumeResult | undefined;
+              if (snapshot) {
+                applyOfficialState(state, snapshot);
+                emitGoal(emit, state, snapshot.session.target ?? snapshot.projection?.target);
+              }
+              emitCommandNotice(
+                emit,
+                state,
+                typeof response.response === "string" && response.response.trim()
+                  ? response.response
+                  : "Goal updated",
+              );
+              completePrompt(state, clientMessageId);
+              scheduleGoalRefresh(state);
+              return;
+            }
+            case "tasks": {
+              const snapshot = await refreshSession(state);
+              const jobs = (snapshot.projection?.backgroundJobs ?? [])
+                .filter((job): job is Record<string, unknown> => !!job && typeof job === "object");
+              const lines = jobs.map((job) => {
+                const id = String(job.taskId ?? "?");
+                const status = String(job.status ?? "running");
+                const label = String(job.toolName ?? job.taskKind ?? job.command ?? "task");
+                return id + " · " + status + " · " + label;
+              });
+              emitCommandNotice(emit, state, lines.length ? lines.join("\n") : "没有后台任务");
+              completePrompt(state, clientMessageId);
+              return;
+            }
+            case "stop-task": {
+              const taskId = args.split(/\s+/u)[0] ?? "";
+              if (!taskId) {
+                emitCommandNotice(emit, state, "用法：/stop-task <taskId>", "warning");
+                completePrompt(state, clientMessageId);
+                return;
+              }
+              await client.requestOk("session/cancelBackgroundTask", {
+                sessionId: state.zcodeSessionId,
+                taskId,
+              });
+              emitCommandNotice(emit, state, "已请求停止后台任务 " + taskId);
+              completePrompt(state, clientMessageId);
+              scheduleGoalRefresh(state);
+              return;
+            }
+            case "usage": {
+              const usage = await client.requestOk("session/usage", { sessionId: state.zcodeSessionId });
+              emitCommandNotice(emit, state, formatUsage(usage) || "暂无用量数据");
+              completePrompt(state, clientMessageId);
+              return;
+            }
+            case "fork": {
+              const response = await client.requestOk("session/fork", {
+                sessionId: state.zcodeSessionId,
+                expectedRevision: state.revision,
+                target: parseForkTarget(args),
+              });
+              // The response snapshot belongs to the forked session, not this
+              // one; applying it to the parent state would fail the identity
+              // check and mix revisions.
+              const forkedSessionId = typeof response.forkedSessionId === "string" ? response.forkedSessionId : "";
+              emitCommandNotice(
+                emit,
+                state,
+                forkedSessionId
+                  ? "已创建分支会话 " + forkedSessionId + "，可在 Paseo 会话导入中打开"
+                  : "ZCode 已创建分支会话",
+              );
+              completePrompt(state, clientMessageId);
+              return;
+            }
+            default: {
+              // Custom/prompt commands are expanded by ZCode's prompt path.
+              const line = "/" + name + (args ? " " + args : "");
+              await client.requestOk("session/send", {
+                sessionId: state.zcodeSessionId,
+                content: line,
+                ...(state.modelSelection ? { modelSelection: state.modelSelection } : {}),
+                expectedRevision: state.revision,
+              });
+              completePrompt(state, clientMessageId);
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log("command failed", { sessionId: state.paseoSessionId, command: name, error: message });
+          emitCommandNotice(emit, state, "命令 /" + name + " 失败：" + message, "error");
+          completePrompt(state, clientMessageId, { type: "failed", error: { message } });
+        }
       };
 
       const subsessionsNegotiated = () => connection.capabilities.includes("session.subsession");
@@ -1603,8 +2169,11 @@ export function createZcodeProvider(): ProviderRegistration {
               sessions?: Array<Record<string, unknown>>;
             };
             const hidden = taskIndex.available ? await taskIndex.hiddenSessionIds() : new Set<string>();
+            // Forked sessions are user-facing conversations too; auxiliary
+            // side chats and workflow/subagent children stay out of the picker.
+            const importableKinds = new Set(["interactive", "fork"]);
             const summaries: ProviderSessionSummary[] = (list.sessions ?? [])
-              .filter((s) => s.sessionKind === undefined || s.sessionKind === "interactive")
+              .filter((s) => s.sessionKind === undefined || importableKinds.has(String(s.sessionKind)))
               .filter((s) => !hidden.has(String(s.sessionId)))
               .map((s) => ({
                 persistence: { version: 1, data: { zcodeSessionId: String(s.sessionId) } },
@@ -1719,6 +2288,12 @@ export function createZcodeProvider(): ProviderRegistration {
             emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
             emit({ type: "request.completed", requestId: input.requestId });
             emitTodos(emit, state, result.todos);
+            emitCommands(emit, state, result.slashCommands);
+            emitGoal(emit, state, result.session.target ?? result.projection?.target);
+            emitUsageContext(emit, state, result.projection?.contextUsed, result.projection?.contextWindow);
+            if (result.runtime?.activeTurnKind === "compact") {
+              emitCompaction(emit, state, "loading", "auto", result.projection?.contextUsed);
+            }
             emitVisibleBackgroundJobs(state, result.projection?.backgroundJobs);
             if (resuming) {
               // Attach (or refresh) subagent child subsessions without
@@ -1732,9 +2307,11 @@ export function createZcodeProvider(): ProviderRegistration {
             const state = sessions.get(zcodeSessionId);
             if (!state?.ready || !state.modelSelection) throw new Error("ZCode session is not ready; reopen it before sending");
             await refreshSession(state);
-            const prepared = input.prompt.input.type === "message"
-              ? prepareZcodePrompt(input.prompt.input.content)
-              : { text: "" };
+            if (input.prompt.input.type === "command") {
+              await handleCommandPrompt(state, input.prompt.input, input.prompt.clientMessageId);
+              return;
+            }
+            const prepared = prepareZcodePrompt(input.prompt.input.content);
             state.pendingClientMessageId = input.prompt.clientMessageId;
             log("sending with model", { sessionId: input.sessionId, ...state.modelSelection });
             await client.requestOk("session/send", {
@@ -1791,7 +2368,33 @@ export function createZcodeProvider(): ProviderRegistration {
             if (pending.logicalId && pendingPermissionIds.get(pending.logicalId) === input.permissionId) {
               pendingPermissionIds.delete(pending.logicalId);
             }
-            if (pending.kind === "user_input") {
+            if (pending.kind === "question") {
+              if (input.response.behavior !== "allow") {
+                client.replyServerRequest(pending.request.id, { action: "decline" });
+              } else {
+                const updated = input.response.updatedInput as Record<string, unknown> | undefined;
+                const rawAnswers = updated && typeof updated.answers === "object" && !Array.isArray(updated.answers)
+                  ? updated.answers as Record<string, unknown>
+                  : {};
+                const answers: Record<string, string> = {};
+                for (const question of pending.questions ?? []) {
+                  const header = typeof question.header === "string" ? question.header : "";
+                  const text = typeof question.question === "string" && question.question
+                    ? question.question
+                    : header;
+                  if (!text) continue;
+                  const value = (header ? rawAnswers[header] : undefined) ?? rawAnswers[text];
+                  const answer = Array.isArray(value)
+                    ? value.filter((entry) => typeof entry === "string").join(", ")
+                    : typeof value === "string" ? value.trim() : "";
+                  if (answer) answers[text] = answer;
+                }
+                client.replyServerRequest(pending.request.id, {
+                  action: "accept",
+                  content: { answers },
+                });
+              }
+            } else if (pending.kind === "user_input") {
               if (input.response.behavior === "allow") {
                 const answer = input.response.selectedActionId ?? pending.answer ?? "approve";
                 client.replyServerRequest(pending.request.id, { action: "accept", content: { answer } });
