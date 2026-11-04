@@ -393,6 +393,64 @@ function buildCatalog(result: CreateOrResumeResult): ProviderCatalog {
   return catalog;
 }
 
+/** Tool input can arrive as an object or as a JSON-encoded string. */
+function readToolInput(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Tool input that is not JSON stays opaque; the row falls back to its name.
+    }
+  }
+  return undefined;
+}
+
+/** ZCode persists some tool parts with the original call under `state.raw`. */
+function readRawToolInput(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return readToolInput((parsed as Record<string, unknown>).input);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Timeline rows need a visible summary. When the tool input never reached the
+ * stream (for example a tool scheduled without a preceding model streaming
+ * event), structured details such as shell/read would render as a bare label,
+ * so fall back to a plain text row until input arrives.
+ */
+function buildTimelineToolDetail(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): ProviderToolCallDetail {
+  const detail = buildToolDetail(name, input);
+  switch (detail.type) {
+    case "shell":
+      return detail.command.trim() ? detail : { type: "plain_text", label: name };
+    case "read":
+      return detail.filePath.trim() ? detail : { type: "plain_text", label: name };
+    case "edit":
+    case "write":
+      return detail.filePath.trim() ? detail : { type: "plain_text", label: name };
+    case "search":
+      return detail.query.trim() ? detail : { type: "plain_text", label: name };
+    case "fetch":
+      return detail.url.trim() ? detail : { type: "plain_text", label: name };
+    default:
+      return detail;
+  }
+}
+
 function buildToolDetail(name: string, input: Record<string, unknown> | undefined): ProviderToolCallDetail {
   const i = input ?? {};
   switch (name) {
@@ -873,11 +931,14 @@ export function zcodeHistoryTimelineItems(
         const rawStatus = String(snapshot.status ?? part.status ?? "completed");
         const status = rawStatus === "error" || rawStatus === "failed" ? "failed"
           : rawStatus === "running" || rawStatus === "pending" ? "running" : "completed";
-        const input = snapshot.input && typeof snapshot.input === "object" && !Array.isArray(snapshot.input)
-          ? snapshot.input as Record<string, unknown>
-          : undefined;
+        const input = readToolInput(snapshot.input)
+          ?? readToolInput(part.input)
+          ?? readToolInput(part.arguments)
+          ?? readRawToolInput(snapshot.raw);
         const output = historyOutput(snapshot.output);
-        let detail = output === undefined ? buildToolDetail(name, input) : withOutput(buildToolDetail(name, input), output);
+        let detail = output === undefined
+          ? buildTimelineToolDetail(name, input)
+          : withOutput(buildTimelineToolDetail(name, input), output);
         const childSessionId = childSessionIds?.get(callId);
         if (childSessionId && detail.type === "sub_agent") {
           detail = { ...detail, childSessionId };
@@ -1375,9 +1436,14 @@ export function createZcodeProvider(): ProviderRegistration {
               flushReasoning(state, turn);
               const toolCallId = String(payload.toolCallId ?? "");
               const toolName = String(payload.toolName ?? "tool");
-              const input = (payload.input ?? undefined) as Record<string, unknown> | undefined;
+              const input = readToolInput(payload.input);
               if (toolCallId) {
-                turn.tools.set(toolCallId, { name: toolName, input });
+                const existing = turn.tools.get(toolCallId);
+                turn.tools.set(toolCallId, {
+                  ...existing,
+                  name: toolName,
+                  input: input ?? existing?.input,
+                });
                 emit({
                   type: "timeline.item",
                   sessionId: state.paseoSessionId,
@@ -1388,7 +1454,7 @@ export function createZcodeProvider(): ProviderRegistration {
                     name: toolName,
                     status: "running",
                     error: null,
-                    detail: buildToolDetail(toolName, input),
+                    detail: buildTimelineToolDetail(toolName, input ?? existing?.input),
                   },
                 });
                 if (AGENT_TOOL_NAMES.has(toolName)) {
@@ -1430,9 +1496,17 @@ export function createZcodeProvider(): ProviderRegistration {
           case "tool.updated": {
             const toolCallId = String(payload.toolCallId ?? "");
             if (!toolCallId || !turn) break;
-            if (payload.kind === "started" && !turn.tools.has(toolCallId)) {
-              const toolName = String(payload.toolName ?? "tool");
-              turn.tools.set(toolCallId, { name: toolName });
+            const payloadName = typeof payload.toolName === "string" && payload.toolName ? payload.toolName : undefined;
+            const incomingInput = readToolInput(payload.input) ?? readToolInput(payload.arguments);
+            if (payload.kind === "scheduled") {
+              // ZCode reports the complete tool arguments here. Some tools
+              // (notably subagent children) never get a model.streaming
+              // tool_call event, so without this branch their rows only know
+              // the tool name and render as bare "Shell"/"Read" entries.
+              const existing = turn.tools.get(toolCallId);
+              const toolName = payloadName ?? existing?.name ?? "tool";
+              const input = incomingInput ?? existing?.input;
+              turn.tools.set(toolCallId, { ...existing, name: toolName, input });
               emit({
                 type: "timeline.item",
                 sessionId: state.paseoSessionId,
@@ -1443,7 +1517,31 @@ export function createZcodeProvider(): ProviderRegistration {
                   name: toolName,
                   status: "running",
                   error: null,
-                  detail: { type: "plain_text", label: toolName },
+                  detail: buildTimelineToolDetail(toolName, input),
+                },
+              });
+              if (AGENT_TOOL_NAMES.has(toolName)) {
+                scheduleSubagentSync(state, subagentSyncTiming.spawnMs);
+                scheduleSubagentSync(state, subagentSyncTiming.spawnFollowUpMs);
+              }
+            } else if (payload.kind === "started") {
+              const existing = turn.tools.get(toolCallId);
+              const toolName = payloadName ?? existing?.name ?? "tool";
+              const input = incomingInput ?? existing?.input;
+              turn.tools.set(toolCallId, { ...existing, name: toolName, input });
+              // A scheduled event already published this row with arguments.
+              if (existing && existing.name === toolName && existing.input !== undefined && input !== undefined) break;
+              emit({
+                type: "timeline.item",
+                sessionId: state.paseoSessionId,
+                item: {
+                  type: "tool_call",
+                  id: toolCallId,
+                  callId: toolCallId,
+                  name: toolName,
+                  status: "running",
+                  error: null,
+                  detail: buildTimelineToolDetail(toolName, input),
                 },
               });
               if (AGENT_TOOL_NAMES.has(toolName)) {
@@ -1451,19 +1549,23 @@ export function createZcodeProvider(): ProviderRegistration {
                 scheduleSubagentSync(state, subagentSyncTiming.spawnFollowUpMs);
               }
             } else if (payload.kind === "result") {
-              const tool = turn.tools.get(toolCallId);
+              const existing = turn.tools.get(toolCallId);
+              const toolName = payloadName ?? existing?.name ?? "tool";
+              const input = incomingInput ?? existing?.input;
+              const tool = existing ?? { name: toolName, input };
+              tool.name = toolName;
+              tool.input = input;
+              turn.tools.set(toolCallId, tool);
               const result = (payload.result ?? {}) as Record<string, unknown>;
               const success = result.success !== false;
               const outputText = typeof result.content === "string"
                 ? result.content
                 : result.content === undefined ? "" : JSON.stringify(result.content);
-              if (tool) {
-                tool.outcome = success ? "completed" : "failed";
-                tool.log = outputText.slice(0, 8000);
-                if (!success) tool.error = String(result.content ?? "tool failed");
-              }
+              tool.outcome = success ? "completed" : "failed";
+              tool.log = outputText.slice(0, 8000);
+              if (!success) tool.error = String(result.content ?? "tool failed");
               const detail = withOutput(
-                tool ? buildToolDetail(tool.name, tool.input) : { type: "plain_text" as const, label: "tool" },
+                buildTimelineToolDetail(tool.name, tool.input),
                 result.content,
               );
               const linkedChild = [...(state.subagents?.values() ?? [])].find((entry) => entry.toolCallId === toolCallId);
@@ -1479,7 +1581,7 @@ export function createZcodeProvider(): ProviderRegistration {
                       type: "tool_call",
                       id: toolCallId,
                       callId: toolCallId,
-                      name: tool?.name ?? "tool",
+                      name: tool.name,
                       status: "completed",
                       error: null,
                       detail,
@@ -1488,16 +1590,16 @@ export function createZcodeProvider(): ProviderRegistration {
                       type: "tool_call",
                       id: toolCallId,
                       callId: toolCallId,
-                      name: tool?.name ?? "tool",
+                      name: tool.name,
                       status: "failed",
                       error: failureMessage,
                       detail,
                     },
               });
-              if (tool?.name === "TodoWrite") {
+              if (tool.name === "TodoWrite") {
                 void refreshSession(state).catch((error) => log("todo refresh failed", String(error)));
               }
-              if (tool && AGENT_TOOL_NAMES.has(tool.name)) {
+              if (AGENT_TOOL_NAMES.has(tool.name)) {
                 scheduleSubagentSync(state, 0);
               }
             }
@@ -1800,7 +1902,7 @@ export function createZcodeProvider(): ProviderRegistration {
         for (const turn of parent.turns.values()) {
           const tool = turn.tools.get(record.toolCallId);
           if (!tool) continue;
-          const base = buildToolDetail(tool.name, tool.input);
+          const base = buildTimelineToolDetail(tool.name, tool.input);
           const detail = base.type === "sub_agent"
             ? { ...base, childSessionId: record.childSessionId, ...(tool.log ? { log: tool.log } : {}) }
             : base;

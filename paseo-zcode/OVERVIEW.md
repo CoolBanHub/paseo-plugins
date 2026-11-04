@@ -108,6 +108,11 @@ local ZCode sessions are listed in Paseo's session picker.
   render. Hosts that do not negotiate `session.subsession` keep the previous
   rendering: an Agent tool card with the final summary plus a generic
   background-task card.
+- Tool rows recover their arguments from ZCode's scheduled tool events and
+  persisted `state.raw` data when no streaming `tool_call` was delivered, so
+  Shell/Read rows keep the command or path instead of rendering as bare
+  labels. If the arguments never arrived at all, the row falls back to the
+  tool name rather than an empty structured card.
 - Permission cards include the requested command and reason. ZCode's repeated
   announcements for one outstanding permission are coalesced into one card;
   separate permission request IDs remain separate prompts.

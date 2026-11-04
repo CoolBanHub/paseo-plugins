@@ -567,6 +567,108 @@ test("resuming replays visible ZCode history before session.ready when requested
   assert.equal(f.calls("session/read").filter((call) => call.messageLimit === 1000).length, 1);
 });
 
+test("tool.updated scheduled supplies arguments that streaming never delivered", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  const items = () => f.events.filter((event) => event.type === "timeline.item" && event.item.id === "scheduled-shell");
+
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-scheduled",
+    payload: { kind: "scheduled", toolCallId: "scheduled-shell", toolName: "Bash", input: { command: "echo hi" } },
+  });
+  let item = items().at(-1).item;
+  assert.equal(item.status, "running");
+  assert.deepEqual(item.detail, { type: "shell", command: "echo hi" });
+
+  // The started event repeats the name but carries no arguments; the row
+  // must keep the scheduled input and not emit an empty replacement.
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-scheduled",
+    payload: { kind: "started", toolCallId: "scheduled-shell", toolName: "Bash" },
+  });
+  assert.equal(items().length, 1);
+
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-scheduled",
+    payload: { kind: "result", toolCallId: "scheduled-shell", result: { success: true, content: "hi" } },
+  });
+  item = items().at(-1).item;
+  assert.equal(item.status, "completed");
+  assert.deepEqual(item.detail, { type: "shell", command: "echo hi", output: "hi" });
+});
+
+test("a started tool row is enriched when its scheduled arguments arrive later", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  const items = () => f.events.filter((event) => event.type === "timeline.item" && event.item.id === "late-read");
+
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-late",
+    payload: { kind: "started", toolCallId: "late-read", toolName: "Read" },
+  });
+  assert.deepEqual(items().at(-1).item.detail, { type: "plain_text", label: "Read" });
+
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-late",
+    payload: { kind: "scheduled", toolCallId: "late-read", toolName: "Read", input: { file_path: "/workspace/README.md" } },
+  });
+  assert.deepEqual(items().at(-1).item.detail, { type: "read", filePath: "/workspace/README.md" });
+
+  f.sessionEvent({
+    type: "tool.updated", sessionId, turnId: "turn-late",
+    payload: { kind: "result", toolCallId: "late-read", result: { success: true, content: "# README" } },
+  });
+  assert.deepEqual(items().at(-1).item.detail, {
+    type: "read", filePath: "/workspace/README.md", content: "# README",
+  });
+});
+
+test("replayed tool parts recover arguments persisted only in state.raw", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "assistant", messageId: "assistant-raw", semantics: { transcriptVisibility: "visible" } },
+        parts: [
+          {
+            type: "tool", partId: "tool-raw", callId: "tool-raw", tool: "Bash",
+            state: {
+              status: "completed",
+              raw: JSON.stringify({ tool: "Bash", input: { command: "pwd" } }),
+              output: "/workspace",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_raw" } }, "replay");
+  const item = f.events.find((event) => event.type === "timeline.item" && event.item.id === "tool-raw").item;
+  assert.deepEqual(item.detail, { type: "shell", command: "pwd", output: "/workspace" });
+});
+
+test("a replayed tool without any recoverable input falls back to a named row", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "assistant", messageId: "assistant-noinput", semantics: { transcriptVisibility: "visible" } },
+        parts: [
+          {
+            type: "tool", partId: "tool-noinput", callId: "tool-noinput", tool: "Read",
+            state: { status: "completed", output: "file contents" },
+          },
+        ],
+      },
+    ],
+  });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_noinput" } }, "replay");
+  const item = f.events.find((event) => event.type === "timeline.item" && event.item.id === "tool-noinput").item;
+  assert.deepEqual(item.detail, { type: "plain_text", label: "Read" });
+});
+
 test("resuming with history skip does not fetch or replay the old ZCode transcript", async (t) => {
   const f = await fixture(t, {
     historyMessages: [{ info: { role: "user", messageId: "user-1" }, parts: [{ type: "text", text: "Old prompt" }] }],
