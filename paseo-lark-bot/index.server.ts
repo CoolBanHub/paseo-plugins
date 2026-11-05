@@ -69,7 +69,10 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
           try {
             const payload = await api.agents.ref(agentId).timeline?.refetch({ limit: 30 });
             const text = lastAssistantText(payload?.entries);
-            if (text) return text;
+            if (text) {
+              console.log(`[lark-bot] 时间线兜底取到回复文本（${text.length} 字）`);
+              return text;
+            }
           } catch {
             // Older hosts or missing permissions degrade to the plain notice.
           }
