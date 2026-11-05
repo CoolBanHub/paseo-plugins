@@ -1,0 +1,7 @@
+{
+  "id": "lark-bot",
+  "name": "飞书机器人",
+  "requirements": {
+    "paseo": ">=0.11.4"
+  }
+}
