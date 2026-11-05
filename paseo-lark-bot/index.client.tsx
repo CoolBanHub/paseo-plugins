@@ -7,7 +7,7 @@ export default function contribute(client: PluginClientContext) {
   return client.addSettingsScreen({
     id: "lark-bot",
     title: "飞书机器人",
-    icon: "message-circle",
+    icon: "MessageCircle",
     Component: BotSettingsScreen,
   });
 }
