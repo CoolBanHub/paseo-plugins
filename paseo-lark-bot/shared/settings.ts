@@ -55,6 +55,8 @@ export const botValuesSchema = z.object({
   maxReplyChars: z.number().int().min(200).max(30_000).default(4000),
   /** Reply with a hint when an unconfigured chat @-mentions the bot. */
   notifyUnmatched: z.boolean().default(false),
+  /** Ack each received message so senders see it was picked up. */
+  ackOnReceive: z.boolean().default(true),
   chats: z.array(chatBindingSchema).default([]),
 });
 

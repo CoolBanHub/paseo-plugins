@@ -23,6 +23,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
     sessionIdleMinutes: 30,
     maxReplyChars: 4000,
     notifyUnmatched: false,
+    ackOnReceive: false,
     chats: [
       {
         chatId: "oc_group",
@@ -155,6 +156,19 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.replies.length, 1);
     assert.ok(h.replies[0].text.includes("没有读到文字内容"));
+  });
+
+  it("acks received messages when ackOnReceive is enabled", async () => {
+    const h = makeHarness(baseValues({ ackOnReceive: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    assert.equal(h.replies.length >= 1, true);
+    assert.ok(h.replies[0].text.includes("收到"), "first reply must be the ack");
+    assert.equal(h.replies[0].messageId, "om_1");
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "处理结果答复"));
+    await flush();
+    const last = h.replies[h.replies.length - 1];
+    assert.ok(last.text.includes("处理结果答复"));
   });
 
   it("notifies the chat about permission requests for its own agents only", async () => {

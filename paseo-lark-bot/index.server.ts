@@ -20,11 +20,36 @@ let consumerCli: string | null = null;
 /** AppId confirmed written into lark-cli during this plugin lifetime. */
 let appliedAppId: string | null = null;
 let currentAppIdCache: string | null = null;
+/** provider → provider/<default-model>, filled lazily per daemon lifetime. */
+const providerModelCache = new Map<string, string>();
+
+/**
+ * Daemons since 0.15 reject bare provider ids in agents.create(); resolve
+ * `dsh` to `dsh/<default-model>` using the provider snapshot. Older hosts
+ * without the providers slice keep the input unchanged.
+ */
+async function resolveProviderModel(provider: string): Promise<string> {
+  if (provider.includes("/")) return provider;
+  const cached = providerModelCache.get(provider);
+  if (cached) return cached;
+  if (!paseo?.providers) return provider;
+  try {
+    const snapshot = await paseo.providers.waitForReady({ timeoutMs: 5_000 });
+    const entry = snapshot.entries.find((candidate) => candidate.provider === provider);
+    const model = entry?.models?.find((candidate) => candidate.isDefault)?.id ?? entry?.models?.[0]?.id;
+    if (!model) return provider;
+    const full = provider + "/" + model;
+    providerModelCache.set(provider, full);
+    return full;
+  } catch {
+    return provider;
+  }
+}
 
 function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotValues>): Dispatcher {
   paseo = api;
   if (!dispatcher) {
-    dispatcher = createDispatcher({ paseo: api, readValues });
+    dispatcher = createDispatcher({ paseo: api, readValues, resolveProvider: resolveProviderModel });
   }
   return dispatcher;
 }

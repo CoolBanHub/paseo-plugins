@@ -400,6 +400,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           value={draft.notifyUnmatched}
           onChange={(value) => patchDraft({ notifyUnmatched: value })}
         />
+        <ToggleRow
+          label="收到消息先确认"
+          hint="收到 @ 消息立即回复一条「收到，正在处理」，处理完成后再回结果"
+          value={draft.ackOnReceive}
+          onChange={(value) => patchDraft({ ackOnReceive: value })}
+        />
         <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
         <TextInput
           value={String(draft.sessionIdleMinutes)}

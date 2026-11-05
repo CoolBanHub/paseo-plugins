@@ -14,6 +14,7 @@
 ```
 
 - 事件订阅走 lark-cli 的长连接模式，插件只需本机能跑 lark-cli 并访问 `open.feishu.cn`，无需公网地址。
+- 绑定里可写裸 provider id（如 `dsh`），创建会话时自动补全为 `provider/默认模型`（新版 Paseo 要求 `provider/model` 格式）。
 - 回复统一由 `agent.turn_ended` 驱动：权限批准后的继续执行、超过 10 分钟仍在跑的轮次，完成后都会回到原话题。
 - 群聊需要 @ 机器人；单聊（p2p）直接发消息即触发；只处理 text / post 消息，其他类型忽略。
 - 其他机器人 @ 本机器人也会响应（支持群内 agent 协作）；插件自身发出的消息不会再触发自己。
@@ -39,6 +40,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 | `sessionIdleMinutes` | `30` | 话题空闲多少分钟后该话题新建智能体会话（0 表示一直复用） |
 | `maxReplyChars` | `4000` | 回复超过该长度截断并提示打开 Paseo 查看 |
 | `notifyUnmatched` | `false` | 未绑定的会话 @ 机器人时是否回复配置提示 |
+| `ackOnReceive` | `true` | 收到 @ 消息立即回复一条「收到，正在处理」确认 |
 | `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`（可带 `/model`）、`cwd`、`systemPrompt`、`replyFormat` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。

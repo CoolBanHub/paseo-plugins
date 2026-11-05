@@ -18,6 +18,8 @@ export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"
 export interface DispatcherOptions {
   paseo: SessionPaseoApi;
   readValues: () => Promise<BotValues>;
+  /** Normalizes bare provider ids to provider/model for agents.create(). */
+  resolveProvider?: (provider: string) => Promise<string>;
   resolveCli?: (explicit: string) => string | null;
   readOpenId?: (cliPath: string) => Promise<string | null>;
   reply?: (options: {
@@ -32,6 +34,7 @@ export interface DispatcherOptions {
 
 const UNMATCHED_KEEP = 20;
 const UNMATCHED_HINT = "这个会话还没有绑定 provider，请先在 Paseo 的「飞书机器人」设置里配置。";
+const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 
 /**
@@ -63,6 +66,7 @@ export function createDispatcher(options: DispatcherOptions) {
     appId: "",
     appSecret: "",
     larkCliPath: "",
+    ackOnReceive: true,
     replyInThread: true,
     sessionIdleMinutes: 30,
     maxReplyChars: 4000,
@@ -73,6 +77,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const sessions = createSessionRegistry({
     paseo: options.paseo,
     getIdleMs: () => valuesCache.sessionIdleMinutes * 60_000,
+    resolveProvider: options.resolveProvider,
     callbacks: {
       onReply: (chatId, messageId, outcome) => {
         void deliver(chatId, messageId, buildReplyText(outcome));
@@ -135,6 +140,9 @@ export function createDispatcher(options: DispatcherOptions) {
       // One agent session per Feishu thread: replies inside a topic share
       // context, while each fresh @-mention starts an independent topic.
       const topicKey = event.root_id || event.message_id;
+      if (values.ackOnReceive) {
+        await send(cliPath, event.message_id, ACK_TEXT, values, "text");
+      }
       sessions.enqueue(topicKey, event.chat_id, event.message_id, decision.prompt, decision.binding);
     } catch (error) {
       log("处理消息失败", error instanceof Error ? error.message : String(error));

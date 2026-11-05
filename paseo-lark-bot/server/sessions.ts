@@ -25,6 +25,14 @@ export interface SessionPaseoApi {
     }): Promise<SessionAgentHandle>;
     ref(id: string): SessionAgentHandle;
   };
+  /** Optional slice used to normalize bare provider ids to provider/model. */
+  providers?: {
+    waitForReady(options?: { timeoutMs?: number }): Promise<SessionProviderSnapshot>;
+  };
+}
+
+export interface SessionProviderSnapshot {
+  entries: { provider: string; models?: { id: string; isDefault?: boolean }[] }[];
 }
 
 export interface ChatSessionStatus {
@@ -88,8 +96,15 @@ export function createSessionRegistry(options: {
   paseo: SessionPaseoApi;
   callbacks: SessionCallbacks;
   getIdleMs: () => number;
+  /**
+   * Newer daemons reject bare provider ids: normalize `dsh` to
+   * `dsh/<default-model>` before agents.create(). Returning the input
+   * unchanged lets older hosts keep working.
+   */
+  resolveProvider?: (provider: string) => Promise<string>;
   now?: () => number;
 }) {
+  const resolveProvider = options.resolveProvider ?? (async (provider: string) => provider);
   const now = options.now ?? Date.now;
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
@@ -234,7 +249,7 @@ export function createSessionRegistry(options: {
     if (state.agentId) agentToTopic.delete(state.agentId);
     const handle = await options.paseo.agents.create({
       config: {
-        provider: item.binding.provider,
+        provider: await resolveProvider(item.binding.provider),
         ...(item.binding.systemPrompt ? { systemPrompt: item.binding.systemPrompt } : {}),
       },
       cwd: item.binding.cwd || homedir(),
