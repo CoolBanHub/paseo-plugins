@@ -214,6 +214,30 @@ describe("createDispatcher", () => {
     assert.equal(h.created[0].prompt, "【话题主题】现在的构建失败原因是什么\n\n【本次消息】你查一下");
   });
 
+  it("carries the whole thread conversation, mentioned or not", async () => {
+    const h = makeHarness();
+    // Root message without any mention — recorded but ignored for processing.
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", content: "现在的构建失败原因是什么", mentions: [] }),
+    );
+    // In-thread follow-up without a mention.
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_mid", root_id: "om_root", content: "只看最新一次构建", mentions: [] }),
+    );
+    await flush();
+    assert.deepEqual(h.created, [], "unmentioned messages must not spawn agents");
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 你查一下" }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("现在的构建失败原因"), "root text expected: " + prompt);
+    assert.ok(prompt.includes("只看最新一次构建"), "in-thread context expected: " + prompt);
+    assert.ok(prompt.includes("你查一下"));
+  });
+
   it("stays silent on permission requests unless notifyPermission is enabled", async () => {
     const h = makeHarness();
     await h.dispatch.handleMessageEvent(groupEvent());

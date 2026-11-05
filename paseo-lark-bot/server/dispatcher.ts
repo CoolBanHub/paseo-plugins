@@ -8,7 +8,7 @@ import {
   formatPermissionNotice,
   formatTurnOutcome,
 } from "./format.ts";
-import { routeMessage } from "./router.ts";
+import { routeMessage, extractPrompt } from "./router.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
 import type { BotValues, ReplyFormat } from "../shared/settings.ts";
 
@@ -35,6 +35,8 @@ export interface DispatcherOptions {
 }
 
 const UNMATCHED_KEEP = 20;
+/** Text-like types worth recording as thread context. */
+const HANDLED_MESSAGE_TYPES_FOR_HISTORY = new Set(["text", "post"]);
 const UNMATCHED_HINT = "这个会话还没有绑定 provider，请先在 Paseo 的「飞书机器人」设置里配置。";
 const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
@@ -64,6 +66,14 @@ export function createDispatcher(options: DispatcherOptions) {
   const unmatchedRecent = new Map<string, { chatId: string; chatType: string; lastSeenAt: number }>();
   // Thread roots rarely change; cache their text to avoid repeated mgets.
   const threadRootCache = new Map<string, string | null>();
+  /**
+   * Every group message the event stream delivers lands here — including
+   * messages that do not mention the bot — so later @-mentions inside the
+   * thread can be answered with the full conversation as context. Bounded
+   * per topic; lost on daemon restart (the root fallback covers the topic
+   * subject via the messages-mget API).
+   */
+  const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
 
   // The idle window is read through a getter so settings edits apply without
   // rebuilding the registry.
@@ -121,9 +131,24 @@ export function createDispatcher(options: DispatcherOptions) {
     return cliPath;
   }
 
+  function recordHistory(event: LarkMessageEvent): void {
+    if (event.chat_type !== "group") return;
+    if (!HANDLED_MESSAGE_TYPES_FOR_HISTORY.has(event.message_type)) return;
+    const key = event.root_id || event.message_id;
+    const text = extractPrompt(event);
+    if (!text) return;
+    const entries = topicHistory.get(key) ?? [];
+    // The bot's own acks carry no context value; skip them.
+    if (event.sender_type === "bot" && text.startsWith(ACK_TEXT.slice(0, 2))) return;
+    entries.push({ senderType: event.sender_type, text, messageId: event.message_id });
+    if (entries.length > 50) entries.splice(0, entries.length - 50);
+    topicHistory.set(key, entries);
+  }
+
   async function handleMessageEvent(event: LarkMessageEvent): Promise<void> {
     try {
       latestSeen.set(event.chat_id, event.message_id);
+      recordHistory(event);
       const values = await currentValues();
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
@@ -157,30 +182,51 @@ export function createDispatcher(options: DispatcherOptions) {
   }
 
   /**
-   * A reply inside a thread usually refers to the thread's topic ("你查一下"
-   * → the root message), so prepend the root text as context. Root lookups
-   * are cached; failures degrade to the bare reply text.
+   * A reply inside a thread usually refers to earlier messages ("你查一下"
+   * → the thread topic), so prepend the recorded thread conversation as
+   * context: every message seen in this thread (mentioned or not) plus the
+   * root text fetched from the API when the in-memory history misses it.
    */
   async function withThreadContext(cliPath: string, event: LarkMessageEvent, prompt: string): Promise<string> {
     if (!event.root_id) return prompt;
-    let rootText: string | null;
-    if (threadRootCache.has(event.root_id)) {
-      rootText = threadRootCache.get(event.root_id) ?? null;
-    } else {
-      try {
-        rootText = await readThreadRoot(cliPath, event.root_id);
-      } catch (error) {
-        log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
-        rootText = null;
-      }
-      threadRootCache.set(event.root_id, rootText);
-      if (threadRootCache.size > 100) {
-        const oldest = threadRootCache.keys().next().value;
-        if (oldest) threadRootCache.delete(oldest);
+    const history = (topicHistory.get(event.root_id) ?? []).filter(
+      (entry) => entry.messageId !== event.message_id,
+    );
+    let rootText: string | null = null;
+    const rootInHistory = history.length > 0 && history[0]?.messageId === event.root_id;
+    if (!rootInHistory) {
+      if (threadRootCache.has(event.root_id)) {
+        rootText = threadRootCache.get(event.root_id) ?? null;
+      } else {
+        try {
+          rootText = await readThreadRoot(cliPath, event.root_id);
+        } catch (error) {
+          log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
+          rootText = null;
+        }
+        threadRootCache.set(event.root_id, rootText);
+        if (threadRootCache.size > 100) {
+          const oldest = threadRootCache.keys().next().value;
+          if (oldest) threadRootCache.delete(oldest);
+        }
       }
     }
-    if (!rootText || rootText === prompt) return prompt;
-    return "【话题主题】" + rootText + "\n\n【本次消息】" + prompt;
+    const lines: string[] = [];
+    if (rootText && rootText !== prompt) lines.push("【话题主题】" + rootText);
+    const prior = rootInHistory ? history : history.filter((entry) => entry.messageId !== event.root_id);
+    if (prior.length > 1 || (prior.length === 1 && !rootText)) {
+      const transcript = prior
+        .map((entry) => (entry.senderType === "bot" ? "机器人: " : "成员: ") + clipContext(entry.text))
+        .join("\n");
+      if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
+    }
+    if (lines.length === 0) return prompt;
+    return lines.join("\n\n") + "\n\n【本次消息】" + prompt;
+  }
+
+  function clipContext(text: string, limit = 400): string {
+    const flat = text.trim();
+    return flat.length > limit ? flat.slice(0, limit - 1) + "…" : flat;
   }
 
   function rememberUnmatched(event: LarkMessageEvent): void {
