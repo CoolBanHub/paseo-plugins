@@ -1,6 +1,6 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { LarkMessageEvent } from "./lark-events.ts";
-import { readBotOpenId, readMessageText, replyMessage, resolveLarkCli } from "./lark.ts";
+import { readBotOpenId, readMessageDetail, replyMessage, resolveLarkCli, type MessageDetail } from "./lark.ts";
 import {
   appendFooter,
   clipReply,
@@ -30,13 +30,23 @@ export interface DispatcherOptions {
     replyInThread: boolean;
   }) => Promise<string | null>;
   /** Injectable thread-root lookup for tests. */
-  readThreadRoot?: (cliPath: string, messageId: string) => Promise<string | null>;
+  /** Injectable thread-root lookup for tests; may also learn sender names. */
+  readThreadRootDetail?: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;
   log?: (message: string, detail?: unknown) => void;
 }
 
 const UNMATCHED_KEEP = 20;
-/** Text-like types worth recording as thread context. */
-const HANDLED_MESSAGE_TYPES_FOR_HISTORY = new Set(["text", "post"]);
+/** Chinese labels for non-text message types in thread context. */
+const MEDIA_LABELS: Record<string, string> = {
+  image: "图片",
+  media: "视频",
+  file: "文件",
+  audio: "语音",
+  sticker: "表情",
+  share_chat: "群名片",
+  share_user: "名片",
+  system: "系统消息",
+};
 const UNMATCHED_HINT = "这个会话还没有绑定 provider，请先在 Paseo 的「飞书机器人」设置里配置。";
 const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
@@ -51,7 +61,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const resolveCli = options.resolveCli || ((explicit: string) => resolveLarkCli(explicit));
   const readOpenId = options.readOpenId || readBotOpenId;
   const reply = options.reply || replyMessage;
-  const readThreadRoot = options.readThreadRoot || readMessageText;
+  const readThreadRootDetail = options.readThreadRootDetail || readMessageDetail;
   const log =
     options.log ||
     ((message: string, detail?: unknown) => {
@@ -65,7 +75,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const latestSeen = new Map<string, string>();
   const unmatchedRecent = new Map<string, { chatId: string; chatType: string; lastSeenAt: number }>();
   // Thread roots rarely change; cache their text to avoid repeated mgets.
-  const threadRootCache = new Map<string, string | null>();
+  const threadRootCache = new Map<string, MessageDetail | null>();
   /**
    * Every group message the event stream delivers lands here — including
    * messages that do not mention the bot — so later @-mentions inside the
@@ -74,6 +84,13 @@ export function createDispatcher(options: DispatcherOptions) {
    * subject via the messages-mget API).
    */
   const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
+  /**
+   * Stable per-sender labels for the transcript: real names when known
+   * (thread-root lookups carry them), otherwise 成员A/成员B/… assigned by
+   * first appearance.
+   */
+  const senderLabels = new Map<string, string>();
+  let memberCounter = 0;
 
   // The idle window is read through a getter so settings edits apply without
   // rebuilding the registry.
@@ -131,16 +148,40 @@ export function createDispatcher(options: DispatcherOptions) {
     return cliPath;
   }
 
+  function labelFor(senderId: string, senderType: string): string {
+    if (senderType === "bot") return "机器人";
+    let label = senderLabels.get(senderId);
+    if (!label) {
+      memberCounter += 1;
+      label = "成员" + String.fromCharCode(64 + Math.min(memberCounter, 26));
+      senderLabels.set(senderId, label);
+    }
+    return label;
+  }
+
+  function historyText(event: LarkMessageEvent): string {
+    if (event.message_type === "text" || event.message_type === "post") {
+      return extractPrompt(event);
+    }
+    const label = MEDIA_LABELS[event.message_type];
+    if (!label) return "";
+    const detail = extractPrompt(event).slice(0, 80);
+    return "[" + label + (detail ? "：" + detail : "") + "]";
+  }
+
   function recordHistory(event: LarkMessageEvent): void {
     if (event.chat_type !== "group") return;
-    if (!HANDLED_MESSAGE_TYPES_FOR_HISTORY.has(event.message_type)) return;
     const key = event.root_id || event.message_id;
-    const text = extractPrompt(event);
+    const text = historyText(event);
     if (!text) return;
     const entries = topicHistory.get(key) ?? [];
     // The bot's own acks carry no context value; skip them.
     if (event.sender_type === "bot" && text.startsWith(ACK_TEXT.slice(0, 2))) return;
-    entries.push({ senderType: event.sender_type, text, messageId: event.message_id });
+    entries.push({
+      senderType: labelFor(event.sender_id, event.sender_type),
+      text,
+      messageId: event.message_id,
+    });
     if (entries.length > 50) entries.splice(0, entries.length - 50);
     topicHistory.set(key, entries);
   }
@@ -195,29 +236,34 @@ export function createDispatcher(options: DispatcherOptions) {
     let rootText: string | null = null;
     const rootInHistory = history.length > 0 && history[0]?.messageId === event.root_id;
     if (!rootInHistory) {
+      let detail: MessageDetail | null;
       if (threadRootCache.has(event.root_id)) {
-        rootText = threadRootCache.get(event.root_id) ?? null;
+        detail = threadRootCache.get(event.root_id) ?? null;
       } else {
         try {
-          rootText = await readThreadRoot(cliPath, event.root_id);
+          detail = await readThreadRootDetail(cliPath, event.root_id);
         } catch (error) {
           log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
-          rootText = null;
+          detail = null;
         }
-        threadRootCache.set(event.root_id, rootText);
+        threadRootCache.set(event.root_id, detail);
         if (threadRootCache.size > 100) {
           const oldest = threadRootCache.keys().next().value;
           if (oldest) threadRootCache.delete(oldest);
         }
       }
+      if (detail?.senderOpenId && detail.senderName) {
+        // A real name beats the provisional 成员A/B label.
+        senderLabels.set(detail.senderOpenId, detail.senderName);
+      }
+      rootText = detail?.text ?? null;
     }
     const lines: string[] = [];
     if (rootText && rootText !== prompt) lines.push("【话题主题】" + rootText);
     const prior = rootInHistory ? history : history.filter((entry) => entry.messageId !== event.root_id);
     if (prior.length > 1 || (prior.length === 1 && !rootText)) {
-      const transcript = prior
-        .map((entry) => (entry.senderType === "bot" ? "机器人: " : "成员: ") + clipContext(entry.text))
-        .join("\n");
+      // senderType carries the stable per-sender label (机器人 / 成员A / 真名).
+      const transcript = prior.map((entry) => entry.senderType + ": " + clipContext(entry.text)).join("\n");
       if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
     }
     if (lines.length === 0) return prompt;

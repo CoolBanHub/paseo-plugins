@@ -196,13 +196,15 @@ describe("createDispatcher", () => {
 
   it("prepends the thread root as context for in-thread replies", async () => {
     const h = makeHarness();
-    const roots = new Map<string, string>([["om_root", "现在的构建失败原因是什么"]]);
     const dispatch = createDispatcher({
       paseo: h.paseoRef,
       readValues: async () => baseValues(),
       resolveCli: () => "/fake/lark-cli",
       readOpenId: async () => BOT,
-      readThreadRoot: async (_cli, id) => roots.get(id) ?? null,
+      readThreadRootDetail: async (_cli, id) =>
+        id === "om_root"
+          ? { text: "现在的构建失败原因是什么", senderOpenId: "ou_user", senderName: "张三" }
+          : null,
       reply: async (options) => {
         h.replies.push({ messageId: options.messageId, text: options.text, format: options.format, replyInThread: options.replyInThread });
         return null;
@@ -212,6 +214,32 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.created.length, 1);
     assert.equal(h.created[0].prompt, "【话题主题】现在的构建失败原因是什么\n\n【本次消息】你查一下");
+  });
+
+  it("labels members distinctly and marks media with placeholders", async () => {
+    const h = makeHarness();
+    // Two different humans chat in the topic, one drops an image.
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", sender_id: "ou_a", content: "看看这个报错", mentions: [] }),
+    );
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_img",
+        root_id: "om_root",
+        sender_id: "ou_b",
+        message_type: "image",
+        content: "",
+        mentions: [],
+      }),
+    );
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 什么情况" }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("成员A: 看看这个报错"), prompt);
+    assert.ok(prompt.includes("成员B: [图片]"), prompt);
   });
 
   it("carries the whole thread conversation, mentioned or not", async () => {
@@ -225,7 +253,7 @@ describe("createDispatcher", () => {
       groupEvent({ message_id: "om_mid", root_id: "om_root", content: "只看最新一次构建", mentions: [] }),
     );
     await flush();
-    assert.deepEqual(h.created, [], "unmentioned messages must not spawn agents");
+    assert.equal(h.created.length, 0, "unmentioned messages must not spawn agents");
 
     await h.dispatch.handleMessageEvent(
       groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 你查一下" }),

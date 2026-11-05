@@ -204,8 +204,15 @@ async function runWithStdin(cliPath: string, args: string[], stdinData: string):
   await done;
 }
 
-/** Fetch the pre-rendered text of a single message (thread roots). */
-export async function readMessageText(cliPath: string, messageId: string): Promise<string | null> {
+/** A single message with its sender, used for thread-root context. */
+export interface MessageDetail {
+  text: string | null;
+  senderOpenId: string | null;
+  senderName: string | null;
+}
+
+/** Fetch one message (thread roots) with its pre-rendered text and sender. */
+export async function readMessageDetail(cliPath: string, messageId: string): Promise<MessageDetail | null> {
   const payload = await runCli(
     cliPath,
     ["im", "+messages-mget", "--message-id", messageId, "--as", "bot", "--format", "json"],
@@ -215,7 +222,13 @@ export async function readMessageText(cliPath: string, messageId: string): Promi
   const first = Array.isArray(items) ? items[0] : null;
   if (!first || typeof first !== "object") return null;
   const record = first as Record<string, unknown>;
-  return typeof record.content === "string" && record.content.trim() ? record.content.trim() : null;
+  const content = record.content;
+  const sender = record.sender as { id?: unknown; name?: unknown } | undefined;
+  return {
+    text: typeof content === "string" && content.trim() ? content.trim() : null,
+    senderOpenId: typeof sender?.id === "string" ? sender.id : null,
+    senderName: typeof sender?.name === "string" && sender.name ? sender.name : null,
+  };
 }
 
 export interface LarkChat {
