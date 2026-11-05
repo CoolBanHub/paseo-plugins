@@ -49,7 +49,24 @@ async function resolveProviderModel(provider: string): Promise<string> {
 function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotValues>): Dispatcher {
   paseo = api;
   if (!dispatcher) {
-    dispatcher = createDispatcher({ paseo: api, readValues, resolveProvider: resolveProviderModel });
+    dispatcher = createDispatcher({
+      paseo: api,
+      readValues,
+      resolveProvider: resolveProviderModel,
+      fetchLastReply: async (agentId: string) => {
+        try {
+          const payload = await api.agents.ref(agentId).timeline?.refetch({ limit: 30 });
+          const entries = payload?.entries ?? [];
+          for (let index = entries.length - 1; index >= 0; index -= 1) {
+            const entry = entries[index];
+            if (entry?.type === "assistant_message" && entry.text?.trim()) return entry.text.trim();
+          }
+        } catch {
+          // Older hosts or missing permissions degrade to the plain notice.
+        }
+        return null;
+      },
+    });
   }
   return dispatcher;
 }

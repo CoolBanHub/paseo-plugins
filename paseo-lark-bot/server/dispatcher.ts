@@ -30,6 +30,8 @@ export interface DispatcherOptions {
   readValues: () => Promise<BotValues>;
   /** Normalizes bare provider ids to provider/model for agents.create(). */
   resolveProvider?: (provider: string) => Promise<string>;
+  /** Fallback reply lookup when turn_ended carries no assistant text. */
+  fetchLastReply?: (agentId: string) => Promise<string | null>;
   resolveCli?: (explicit: string) => string | null;
   readOpenId?: (cliPath: string) => Promise<string | null>;
   reply?: (options: {
@@ -133,6 +135,7 @@ export function createDispatcher(options: DispatcherOptions) {
     paseo: options.paseo,
     getIdleMs: () => valuesCache.sessionIdleMinutes * 60_000,
     resolveProvider: options.resolveProvider,
+    fetchLastReply: options.fetchLastReply,
     callbacks: {
       onReply: (chatId, messageId, outcome) => {
         void deliver(chatId, messageId, buildReplyText(outcome));
@@ -377,7 +380,7 @@ export function createDispatcher(options: DispatcherOptions) {
         break;
       }
     }
-    sessions.handleTurnEnded(event.agent.id, {
+    void sessions.handleTurnEnded(event.agent.id, {
       outcome: event.outcome.kind,
       lastText,
       lastError: event.outcome.kind === "failed" ? event.outcome.error.message : null,
@@ -416,7 +419,7 @@ export function createDispatcher(options: DispatcherOptions) {
       return formatTurnOutcome(outcome.outcome, outcome.lastError);
     }
     const text = condenseReply(outcome.lastText ?? "");
-    if (!text) return "本轮处理完成（没有文本回复）。打开 Paseo 查看时间线。";
+    if (!text) return "本轮已完成，但没有可复述的文本结果（可能只有工具操作）。";
     return text;
   }
 

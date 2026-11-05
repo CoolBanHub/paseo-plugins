@@ -19,6 +19,11 @@ export interface SessionRunResult {
   lastMessage: string | null;
 }
 
+/** Minimal timeline slice for fallback reply lookups. */
+export interface SessionTimelineHandle {
+  refetch(options?: { limit?: number }): Promise<{ entries?: { type?: string; text?: string }[] }>;
+}
+
 export interface SessionPaseoApi {
   agents: {
     create(options: {
@@ -29,7 +34,7 @@ export interface SessionPaseoApi {
       prompt?: string;
       images?: SessionImage[];
     }): Promise<SessionAgentHandle>;
-    ref(id: string): SessionAgentHandle;
+    ref(id: string): SessionAgentHandle & { timeline?: SessionTimelineHandle };
   };
   /** Optional slice used to normalize bare provider ids to provider/model. */
   providers?: {
@@ -76,6 +81,8 @@ interface TopicState {
   busySince: number | null;
   lastActivityAt: number;
   lastSeenMessageId: string | null;
+  /** run()'s lastMessage for the most recent idle turn, a reply fallback. */
+  lastRunText: string | null;
 }
 
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -109,9 +116,15 @@ export function createSessionRegistry(options: {
    * unchanged lets older hosts keep working.
    */
   resolveProvider?: (provider: string) => Promise<string>;
+  /**
+   * Fallback when turn_ended carries no assistant text: refetch the agent
+   * timeline and pull the latest reply from there.
+   */
+  fetchLastReply?: (agentId: string) => Promise<string | null>;
   now?: () => number;
 }) {
   const resolveProvider = options.resolveProvider ?? (async (provider: string) => provider);
+  const fetchLastReply = options.fetchLastReply ?? (async () => null);
   const now = options.now ?? Date.now;
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
@@ -129,6 +142,7 @@ export function createSessionRegistry(options: {
         busySince: null,
         lastActivityAt: 0,
         lastSeenMessageId: null,
+        lastRunText: null,
       };
       topics.set(topicKey, state);
     }
@@ -231,6 +245,7 @@ export function createSessionRegistry(options: {
       }
       // idle: the turn finished. turn_ended normally arrived already and
       // released the queue; if it is still in flight the next drain runs on it.
+      state.lastRunText = result.lastMessage?.trim() || null;
       setBusy(state, false);
       drain(topicKey);
     } catch (error) {
@@ -275,12 +290,25 @@ export function createSessionRegistry(options: {
    * turn_ended is the authoritative reply signal: it also covers turns that
    * finished after a permission was resolved or after run() timed out.
    */
-  function handleTurnEnded(agentId: string, outcome: TurnOutcome): void {
+  async function handleTurnEnded(agentId: string, outcome: TurnOutcome): Promise<void> {
     const topicKey = agentToTopic.get(agentId);
     if (!topicKey) return;
     const state = topics.get(topicKey);
     if (!state) return;
     const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
+
+    // turn_ended timelines occasionally miss the final assistant text
+    // (provider-specific projections, permission-continued turns). Try the
+    // run() result, then refetch the timeline before giving up.
+    if (!outcome.lastText && outcome.outcome === "completed") {
+      if (state.lastRunText) {
+        outcome = { ...outcome, lastText: state.lastRunText };
+      } else {
+        const fetched = await fetchLastReply(agentId).catch(() => null);
+        if (fetched) outcome = { ...outcome, lastText: fetched };
+      }
+    }
+    state.lastRunText = null;
     setBusy(state, false);
     if (target) {
       options.callbacks.onReply(state.chatId, target, outcome);

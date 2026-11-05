@@ -294,3 +294,66 @@ describe("createSessionRegistry", () => {
     assert.equal(h.replies[0]?.messageId, "om_1");
   });
 });
+
+describe("reply fallbacks", () => {
+  it("uses run()'s lastMessage when the turn_ended timeline has no text", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    h.registry.handleTurnEnded("agent-1", completed("第一轮答复"));
+    await flush();
+
+    // Second turn: run resolves idle with a lastMessage the timeline lacks.
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    h.finishRun({ status: "idle", error: null, lastMessage: "run 拿到的答复" });
+    await flush();
+    h.registry.handleTurnEnded("agent-1", { outcome: "completed", lastText: null, lastError: null });
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.lastText, "run 拿到的答复");
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_2");
+  });
+
+  it("refetches the timeline when both the event and run() lack text", async () => {
+    const replies: ReplyCall[] = [];
+    let fetched = false;
+    const paseo: import("../server/sessions.ts").SessionPaseoApi = {
+      agents: {
+        create: async () => ({
+          id: "agent-9",
+          send: async () => {},
+          run: async () => ({ status: "timeout", error: null, lastMessage: null }),
+          timeline: {
+            refetch: async () => {
+              fetched = true;
+              return { entries: [{ type: "assistant_message", text: "时间线兜底的答复" }] };
+            },
+          },
+        }),
+        ref: () => {
+          throw new Error("unused");
+        },
+      },
+    };
+    const registry = createSessionRegistry({
+      paseo,
+      getIdleMs: () => 30 * 60_000,
+      // Injected the way index.server.ts wires it; the registry only calls it.
+      fetchLastReply: async () => {
+        fetched = true;
+        return "时间线兜底的答复";
+      },
+      callbacks: {
+        onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
+        onNotice: () => {},
+      },
+    });
+    // create-driven first turn, then the turn ends without any timeline text.
+    registry.enqueue("om_t", "oc_group", "om_t", "看看结果", binding);
+    await flush();
+    registry.handleTurnEnded("agent-9", { outcome: "completed", lastText: null, lastError: null });
+    await flush();
+    assert.equal(fetched, true);
+    assert.equal(replies[0]?.outcome.lastText, "时间线兜底的答复");
+  });
+});
