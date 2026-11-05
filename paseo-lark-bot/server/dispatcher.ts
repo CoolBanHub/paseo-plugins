@@ -283,18 +283,27 @@ export function createDispatcher(options: DispatcherOptions) {
         }
         return;
       }
-      if (!decision.prompt) {
-        await send(cliPath, event.message_id, EMPTY_PROMPT_HINT, values, "text");
-        return;
-      }
       // One agent session per Feishu thread: replies inside a topic share
       // context, while each fresh @-mention starts an independent topic.
       const topicKey = event.root_id || event.message_id;
+      const images = (topicImages.get(topicKey) ?? []).slice(-MAX_IMAGES_PER_TURN);
+
+      // A bare @-mention means "go handle the thread": proceed whenever the
+      // thread carries any context (topic subject, history, or images) and
+      // only ask for text when there is truly nothing to work on.
+      let instruction = decision.prompt;
+      if (!instruction) {
+        const probe = await withThreadContext(cliPath, event, "");
+        if (!probe.hasContext && images.length === 0) {
+          await send(cliPath, event.message_id, EMPTY_PROMPT_HINT, values, "text");
+          return;
+        }
+        instruction = "请查看并处理上方话题内容。";
+      }
       if (values.ackOnReceive) {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
-      const prompt = await withThreadContext(cliPath, event, decision.prompt);
-      const images = (topicImages.get(topicKey) ?? []).slice(-MAX_IMAGES_PER_TURN);
+      const { text: prompt } = await withThreadContext(cliPath, event, instruction);
       const finalPrompt =
         images.length > 0
           ? prompt + "\n\n【附图】本消息附加 " + images.length + " 张图片（含视频关键帧），请结合图片内容回答。"
@@ -311,8 +320,12 @@ export function createDispatcher(options: DispatcherOptions) {
    * context: every message seen in this thread (mentioned or not) plus the
    * root text fetched from the API when the in-memory history misses it.
    */
-  async function withThreadContext(cliPath: string, event: LarkMessageEvent, prompt: string): Promise<string> {
-    if (!event.root_id) return prompt;
+  async function withThreadContext(
+    cliPath: string,
+    event: LarkMessageEvent,
+    prompt: string,
+  ): Promise<{ text: string; hasContext: boolean }> {
+    if (!event.root_id) return { text: prompt, hasContext: false };
     const history = (topicHistory.get(event.root_id) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
     );
@@ -349,8 +362,9 @@ export function createDispatcher(options: DispatcherOptions) {
       const transcript = prior.map((entry) => entry.senderType + ": " + clipContext(entry.text)).join("\n");
       if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
     }
-    if (lines.length === 0) return prompt;
-    return lines.join("\n\n") + "\n\n【本次消息】" + prompt;
+    if (lines.length === 0) return { text: prompt, hasContext: false };
+    const text = lines.join("\n\n") + (prompt ? "\n\n【本次消息】" + prompt : "");
+    return { text, hasContext: true };
   }
 
   function clipContext(text: string, limit = 400): string {

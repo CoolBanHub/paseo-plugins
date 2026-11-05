@@ -236,6 +236,7 @@ describe("createDispatcher", () => {
       groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 什么情况" }),
     );
     await flush();
+    console.log("DEBUG created:", h.created.length, "replies:", JSON.stringify(h.replies.map(r => r.text.slice(0, 24))));
     assert.equal(h.created.length, 1);
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("成员A: 看看这个报错"), prompt);
@@ -259,6 +260,7 @@ describe("createDispatcher", () => {
       groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 你查一下" }),
     );
     await flush();
+    console.log("DEBUG created:", h.created.length, "replies:", JSON.stringify(h.replies.map(r => r.text.slice(0, 24))));
     assert.equal(h.created.length, 1);
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("现在的构建失败原因"), "root text expected: " + prompt);
@@ -371,5 +373,52 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.replies.length, 1);
     assert.ok(h.replies[0].text.includes("provider 超时"));
+  });
+});
+
+describe("bare mentions", () => {
+  it("processes the thread context when the mention carries no text", async () => {
+    const h = makeHarness(baseValues({ ackOnReceive: true }));
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues({ ackOnReceive: true }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) => (id === "om_img" ? { image_key: "img_v3_abc" } : null),
+      download: async () => ({ bytes: Buffer.from("fake-jpeg"), extension: ".jpg" }),
+      extractFrames: async () => [],
+      reply: async (options) => {
+        h.replies.push({ messageId: options.messageId, text: options.text, format: options.format, replyInThread: options.replyInThread });
+        return null;
+      },
+    });
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", sender_id: "ou_a", content: "看看这个报错", mentions: [] }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_img", root_id: "om_root", sender_id: "ou_b", message_type: "image", content: "", mentions: [] }),
+    );
+    await flush();
+    // Bare @ inside the thread must spawn an agent working on the context.
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_bare", root_id: "om_root", sender_id: "ou_a", content: "@测试机器人" }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("请查看并处理上方话题内容"), prompt);
+    assert.ok(prompt.includes("看看这个报错"), prompt);
+    const images = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(images?.length, 1, "thread image should be attached");
+    assert.ok(h.replies.some((reply) => reply.text.startsWith("✅")), "ack expected");
+  });
+
+  it("still asks for text when a fresh topic has nothing to work on", async () => {
+    const h = makeHarness(baseValues({ ackOnReceive: true }));
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_solo", content: "@测试机器人" }));
+    await flush();
+    assert.equal(h.created.length, 0);
+    assert.equal(h.replies.length, 1);
+    assert.ok(h.replies[0].text.includes("没有读到文字内容"));
   });
 });
