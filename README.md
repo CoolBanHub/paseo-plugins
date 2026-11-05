@@ -10,7 +10,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 | [`paseo-git/`](paseo-git/) | `git-manager` | IDEA 风格的 Git 面板：左侧分支 / 标签 / Worktree 树，右侧提交图谱（车道着色、合并斜线、徽章）与提交详情，筛选条（分支 / 作者 / 日期 / 路径 / 文本），fetch / pull，以及可配置的网络代理设置 | `git` 在 PATH 上 |
 | [`paseo-zcode/`](paseo-zcode/) | `zcode` | 通过本地 `zcode app-server --stdio` 协议把 ZCode（GLM）接入 Paseo，会话与桌面端共享；附带智谱 Coding Plan 配额的用量展示 | macOS + ZCode 桌面端（`zcode login`） |
 | [`paseo-lark-notify/`](paseo-lark-notify/) | `lark-notify` | 把「需要你确认」与「会话结束」通过 `lark-cli` 以机器人身份私聊发到飞书，覆盖 Paseo 内所有 provider | `lark-cli`（已登录，机器人可私聊） |
-| [`paseo-lark-bot/`](paseo-lark-bot/) | `lark-bot` | 飞书群机器人接入 Paseo：按会话绑定 provider，群里 @ 机器人（或单聊直发）即由对应智能体处理并以话题回复返回；权限请求通知到群、在 Paseo 内处理 | `lark-cli`（长连接事件订阅 + 机器人入群，详见 OVERVIEW） |
+| [`paseo-lark-bot/`](paseo-lark-bot/) | `lark-bot` | 飞书群机器人接入 Paseo：按会话绑定 provider，群里 @ 机器人（或单聊直发）即由对应智能体处理并以话题回复返回；权限请求默认只在 Paseo 内处理，可选用通知到群 | `lark-cli`（长连接事件订阅 + 机器人入群，详见 OVERVIEW） |
 | [`paseo-claude-models/`](paseo-claude-models/) | `claude-models` | 把自有 API Key 的模型（DeepSeek、GLM、Kimi、通义千问及任意 Anthropic / OpenAI 兼容端点）注入 Claude provider 的模型选择器：会话经内置本机代理桥按所选模型路由到对应厂商，Anthropic 协议直通、OpenAI Chat 协议自动转换 | 各厂商 API Key（或自建 vLLM / Ollama 等端点）、Claude provider 可用 |
 
 每个插件目录内都有各自的 `OVERVIEW.md`，详细说明架构、能力边界、环境要求与已知限制。
@@ -43,7 +43,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 每个插件是独立的 npm 包，在各自目录内安装依赖并开发：
 
 ```bash
-cd paseo-dsh   # 或 paseo-git / paseo-zcode / paseo-lark-notify / paseo-claude-models
+cd paseo-dsh   # 或 paseo-git / paseo-zcode / paseo-lark-notify / paseo-lark-bot / paseo-claude-models
 npm install
 npm test          # 回归测试（git 插件使用临时目录内的真实 git 仓库作为 fixture）
 npm run typecheck # TypeScript 检查
@@ -58,6 +58,7 @@ npm run typecheck # TypeScript 检查
 修改插件后，在 Paseo 中执行 `paseo plugin reload <插件ID>` 重新加载：
 
 - `dsh` / `git-manager` / `lark-notify`：直接 reload 即可；
+- `lark-bot`：reload 会重启事件监听并中断所有进行中的轮次等待，不影响 Paseo 里已有的智能体会话；
 - `claude-models`：reload 会重启本机代理桥（自动恢复端口与路由），建议避开正在流式输出的自定义模型会话；
 - `zcode`：reload 会断开所有进行中的 ZCode 会话，建议使用 `npm run reload:check` 检查存活智能体、`npm run reload` 安全重载（有智能体运行时拒绝重载）。
 
@@ -70,6 +71,7 @@ paseo-plugins/
 ├── paseo-claude-models/ # 自定义模型注入插件（claude-models）
 ├── paseo-dsh/    # dsh (DeepSeek) provider 插件
 ├── paseo-git/    # Git 管理面板插件（git-manager）
+├── paseo-lark-bot/    # 飞书群机器人插件（lark-bot）
 ├── paseo-lark-notify/ # 飞书私聊通知插件（lark-notify）
 └── paseo-zcode/  # ZCode (GLM) provider 插件
 ```
