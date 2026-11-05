@@ -107,7 +107,7 @@ async function flush(): Promise<void> {
 describe("createSessionRegistry", () => {
   it("starts the first turn through agents.create(prompt) without run()", async () => {
     const h = makeHarness();
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     assert.equal(h.created.length, 1);
     assert.equal(h.created[0].prompt, "第一条");
@@ -118,7 +118,7 @@ describe("createSessionRegistry", () => {
 
   it("replies via turn_ended and reuses the agent for the next message", async () => {
     const h = makeHarness();
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
 
@@ -126,7 +126,7 @@ describe("createSessionRegistry", () => {
     await flush();
     assert.deepEqual(h.replies, [{ chatId: "oc_group", messageId: "om_1", outcome: completed("第一轮答复") }]);
 
-    h.registry.enqueue("oc_group", "om_2", "第二条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
     await flush();
     assert.equal(h.created.length, 1, "agent should be reused");
     assert.deepEqual(h.runCalls, [{ agentId: agent.id, text: "第二条" }]);
@@ -139,11 +139,11 @@ describe("createSessionRegistry", () => {
 
   it("queues messages while a turn is running", async () => {
     const h = makeHarness();
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
 
-    h.registry.enqueue("oc_group", "om_2", "第二条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
     await flush();
     assert.equal(h.runCalls.length, 0, "second message must wait for the first turn");
     assert.equal(h.registry.status()[0].queued, 1);
@@ -155,36 +155,36 @@ describe("createSessionRegistry", () => {
 
   it("replies with failure and rebuilds when run() errors", async () => {
     const h = makeHarness();
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
     h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
     await flush();
 
-    h.registry.enqueue("oc_group", "om_2", "第二条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
     await flush();
     h.finishRun({ status: "error", error: "provider 崩溃", lastMessage: null });
     await flush();
     assert.equal(h.replies[h.replies.length - 1]?.outcome.outcome, "failed");
     assert.equal(h.registry.ownsAgent(agent.id), false, "broken agent is forgotten");
 
-    h.registry.enqueue("oc_group", "om_3", "第三条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_3", "第三条", binding);
     await flush();
     assert.equal(h.created.length, 2, "a fresh agent is created after the failure");
   });
 
   it("holds the queue on permission and timeout, then releases on turn_ended", async () => {
     const h = makeHarness();
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
     h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
     await flush();
 
-    h.registry.enqueue("oc_group", "om_2", "需要权限的操作", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_2", "需要权限的操作", binding);
     await flush();
     h.finishRun({ status: "permission", error: null, lastMessage: null });
-    h.registry.enqueue("oc_group", "om_3", "排队消息", binding);
+    h.registry.enqueue("om_1", "oc_group", "om_3", "排队消息", binding);
     await flush();
     assert.deepEqual(h.runCalls.map((call) => call.text), ["需要权限的操作"]);
     assert.equal(h.registry.status()[0].busy, true);
@@ -233,21 +233,59 @@ describe("createSessionRegistry", () => {
       },
     });
 
-    registry.enqueue("oc_group", "om_1", "第一条", binding);
+    registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     registry.handleTurnEnded("agent-1", completed("第一轮答复"));
     await flush();
 
     clock += 31 * 60_000;
-    registry.enqueue("oc_group", "om_2", "第二天的问题", binding);
+    registry.enqueue("om_1", "oc_group", "om_2", "第二天的问题", binding);
     await flush();
     assert.equal(created, 2, "idle expiry must start a new session");
   });
 
+  it("runs independent topics in parallel with separate agents", async () => {
+    const h = makeHarness();
+    // Topic A starts a turn (create-driven, waiting for turn_ended).
+    h.registry.enqueue("om_a", "oc_group", "om_a", "话题A的问题", binding);
+    await flush();
+    assert.equal(h.created.length, 1);
+
+    // Topic B must not wait for topic A's turn.
+    h.registry.enqueue("om_b", "oc_group", "om_b", "话题B的问题", binding);
+    await flush();
+    assert.equal(h.created.length, 2, "each topic gets its own agent");
+
+    h.registry.handleTurnEnded("agent-1", completed("话题A答复"));
+    h.registry.handleTurnEnded("agent-2", completed("话题B答复"));
+    await flush();
+    assert.deepEqual(
+      h.replies.map((reply) => [reply.messageId, reply.outcome.lastText]),
+      [
+        ["om_a", "话题A答复"],
+        ["om_b", "话题B答复"],
+      ],
+    );
+  });
+
+  it("reuses the topic agent for replies inside the same thread", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_root", "oc_group", "om_root", "话题首条", binding);
+    await flush();
+    h.registry.handleTurnEnded("agent-1", completed("首条答复"));
+    await flush();
+
+    // A reply inside the thread carries root_id = om_root.
+    h.registry.enqueue("om_root", "oc_group", "om_reply1", "继续刚才的", binding);
+    await flush();
+    assert.equal(h.created.length, 1, "thread replies reuse the topic agent");
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["继续刚才的"]);
+  });
+
   it("falls back to the latest seen message when the target queue is empty", async () => {
     const h = makeHarness();
-    h.registry.noteMessage("oc_group", "om_seen");
-    h.registry.enqueue("oc_group", "om_1", "第一条", binding);
+    h.registry.noteMessage("om_seen", "oc_group", "om_seen");
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
     // A manual turn from the Paseo client: no pending target, latest is om_1.

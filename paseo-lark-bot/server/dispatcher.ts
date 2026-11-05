@@ -130,7 +130,10 @@ export function createDispatcher(options: DispatcherOptions) {
         await send(cliPath, event.message_id, EMPTY_PROMPT_HINT, values, "text");
         return;
       }
-      sessions.enqueue(event.chat_id, event.message_id, decision.prompt, decision.binding);
+      // One agent session per Feishu thread: replies inside a topic share
+      // context, while each fresh @-mention starts an independent topic.
+      const topicKey = event.root_id || event.message_id;
+      sessions.enqueue(topicKey, event.chat_id, event.message_id, decision.prompt, decision.binding);
     } catch (error) {
       log("处理消息失败", error instanceof Error ? error.message : String(error));
     }

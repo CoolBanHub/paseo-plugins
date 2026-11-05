@@ -29,6 +29,8 @@ export interface SessionPaseoApi {
 
 export interface ChatSessionStatus {
   chatId: string;
+  /** Thread root message id (om_…) the session serves. */
+  topicKey: string;
   agentId: string | null;
   busy: boolean;
   queued: number;
@@ -47,7 +49,8 @@ interface QueueItem {
   binding: ChatBinding;
 }
 
-interface ChatState {
+interface TopicState {
+  chatId: string;
   agentId: string | null;
   handle: SessionAgentHandle | null;
   /** FIFO of trigger message ids awaiting a thread reply. */
@@ -63,6 +66,7 @@ interface ChatState {
 const RUN_TIMEOUT_MS = 10 * 60_000;
 /** If a turn never ends (stuck provider), give up waiting and rebuild. */
 const STUCK_BUSY_MS = 30 * 60_000;
+const TITLE_SNIPPET = 16;
 
 export interface SessionCallbacks {
   /** Send the agent's answer back under the trigger message. */
@@ -73,10 +77,12 @@ export interface SessionCallbacks {
 }
 
 /**
- * Per-chat agent lifecycle and serial queue. Each bound chat owns one agent
- * session (rebuilt after the idle window); messages are applied one turn at a
- * time. Replies are emitted from turn_ended — the single authoritative
- * "turn finished" signal — while run() only drives queue progression.
+ * Per-topic agent lifecycle and serial queue. Every Feishu thread (keyed by
+ * its root message id) owns an independent agent session, so separate topics
+ * in one chat run in parallel without sharing context; messages inside a
+ * topic are applied one turn at a time. Replies are emitted from turn_ended —
+ * the single authoritative "turn finished" signal — while run() only drives
+ * queue progression.
  */
 export function createSessionRegistry(options: {
   paseo: SessionPaseoApi;
@@ -85,13 +91,14 @@ export function createSessionRegistry(options: {
   now?: () => number;
 }) {
   const now = options.now ?? Date.now;
-  const chats = new Map<string, ChatState>();
-  const agentToChat = new Map<string, string>();
+  const topics = new Map<string, TopicState>();
+  const agentToTopic = new Map<string, string>();
 
-  function stateFor(chatId: string): ChatState {
-    let state = chats.get(chatId);
+  function stateFor(topicKey: string, chatId: string): TopicState {
+    let state = topics.get(topicKey);
     if (!state) {
       state = {
+        chatId,
         agentId: null,
         handle: null,
         pendingTargets: [],
@@ -101,48 +108,54 @@ export function createSessionRegistry(options: {
         lastActivityAt: 0,
         lastSeenMessageId: null,
       };
-      chats.set(chatId, state);
+      topics.set(topicKey, state);
     }
     return state;
   }
 
-  /** Register the newest message seen for a chat (fallback reply target). */
-  function noteMessage(chatId: string, messageId: string): void {
-    const state = stateFor(chatId);
+  /** Register the newest message seen for a topic (fallback reply target). */
+  function noteMessage(topicKey: string, chatId: string, messageId: string): void {
+    const state = stateFor(topicKey, chatId);
     state.lastSeenMessageId = messageId;
   }
 
-  /** Queue a prompt for a bound chat; the queue drains one turn at a time. */
-  function enqueue(chatId: string, messageId: string, prompt: string, binding: ChatBinding): void {
-    const state = stateFor(chatId);
+  /** Queue a prompt for a topic; the queue drains one turn at a time. */
+  function enqueue(
+    topicKey: string,
+    chatId: string,
+    messageId: string,
+    prompt: string,
+    binding: ChatBinding,
+  ): void {
+    const state = stateFor(topicKey, chatId);
     // lastActivityAt stays at the previous turn's end here so ensureAgent can
     // measure the real idle window; drain() refreshes it once a turn starts.
     state.lastSeenMessageId = messageId;
     if (state.busy && state.busySince !== null && now() - state.busySince > STUCK_BUSY_MS) {
       // The previous turn looks stuck; drop the session and start over.
-      options.callbacks.log?.(`chat ${chatId} busy for too long; rebuilding session`);
-      resetChat(chatId);
+      options.callbacks.log?.(`topic ${topicKey} busy for too long; rebuilding session`);
+      resetTopic(topicKey);
     }
     state.queue.push({ messageId, prompt, binding });
-    drain(chatId);
+    drain(topicKey);
   }
 
-  function setBusy(state: ChatState, busy: boolean): void {
+  function setBusy(state: TopicState, busy: boolean): void {
     state.busy = busy;
     state.busySince = busy ? now() : null;
   }
 
-  function resetChat(chatId: string): void {
-    const state = chats.get(chatId);
+  function resetTopic(topicKey: string): void {
+    const state = topics.get(topicKey);
     if (!state) return;
-    if (state.agentId) agentToChat.delete(state.agentId);
+    if (state.agentId) agentToTopic.delete(state.agentId);
     state.agentId = null;
     state.handle = null;
     setBusy(state, false);
   }
 
-  async function drain(chatId: string): Promise<void> {
-    const state = stateFor(chatId);
+  async function drain(topicKey: string): Promise<void> {
+    const state = stateFor(topicKey, "");
     if (state.busy) return;
     const item = state.queue.shift();
     if (!item) return;
@@ -153,9 +166,9 @@ export function createSessionRegistry(options: {
       // which already starts the first turn — running it again would duplicate
       // the message. lastActivityAt refreshes only after the idle check so the
       // window measures the real gap since the previous turn.
-      const { handle, created } = await ensureAgent(chatId, item);
+      const { handle, created } = await ensureAgent(topicKey, item);
       state.lastActivityAt = now();
-      agentToChat.set(handle.id, chatId);
+      agentToTopic.set(handle.id, topicKey);
       state.pendingTargets.push(item.messageId);
       if (created) {
         // The first turn is driven by create(); wait for turn_ended.
@@ -166,15 +179,15 @@ export function createSessionRegistry(options: {
         // The turn failed before any turn_ended reply can be expected.
         const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
         if (target) {
-          options.callbacks.onReply(chatId, target, {
+          options.callbacks.onReply(state.chatId, target, {
             outcome: "failed",
             lastText: null,
             lastError: result.error ?? "智能体执行出错",
           });
         }
         // A failed turn leaves the session in an unknown state; rebuild.
-        resetChat(chatId);
-        drain(chatId);
+        resetTopic(topicKey);
+        drain(topicKey);
         return;
       }
       if (result.status === "timeout") {
@@ -182,7 +195,7 @@ export function createSessionRegistry(options: {
         const target = state.lastSeenMessageId;
         if (target) {
           options.callbacks.onNotice(
-            chatId,
+            state.chatId,
             target,
             "仍在处理中（已超过 10 分钟）。本轮完成后结果会回到本话题。",
           );
@@ -196,37 +209,37 @@ export function createSessionRegistry(options: {
       // idle: the turn finished. turn_ended normally arrived already and
       // released the queue; if it is still in flight the next drain runs on it.
       setBusy(state, false);
-      drain(chatId);
+      drain(topicKey);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      options.callbacks.log?.(`chat ${chatId} turn failed: ${message}`);
+      options.callbacks.log?.(`topic ${topicKey} turn failed: ${message}`);
       const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
       if (target) {
-        options.callbacks.onReply(chatId, target, { outcome: "failed", lastText: null, lastError: message });
+        options.callbacks.onReply(state.chatId, target, { outcome: "failed", lastText: null, lastError: message });
       }
-      resetChat(chatId);
-      drain(chatId);
+      resetTopic(topicKey);
+      drain(topicKey);
     }
   }
 
   async function ensureAgent(
-    chatId: string,
+    topicKey: string,
     item: QueueItem,
   ): Promise<{ handle: SessionAgentHandle; created: boolean }> {
-    const state = stateFor(chatId);
+    const state = stateFor(topicKey, "");
     const idleMs = options.getIdleMs();
     const expired = idleMs > 0 && now() - state.lastActivityAt > idleMs;
     if (state.handle && !expired) return { handle: state.handle, created: false };
 
-    if (state.agentId) agentToChat.delete(state.agentId);
+    if (state.agentId) agentToTopic.delete(state.agentId);
     const handle = await options.paseo.agents.create({
       config: {
         provider: item.binding.provider,
         ...(item.binding.systemPrompt ? { systemPrompt: item.binding.systemPrompt } : {}),
       },
       cwd: item.binding.cwd || homedir(),
-      title: `飞书 · ${item.binding.chatName || chatId}`,
-      labels: { "lark-bot-chat": chatId },
+      title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
+      labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
     });
     state.agentId = handle.id;
@@ -239,31 +252,33 @@ export function createSessionRegistry(options: {
    * finished after a permission was resolved or after run() timed out.
    */
   function handleTurnEnded(agentId: string, outcome: TurnOutcome): void {
-    const chatId = agentToChat.get(agentId);
-    if (!chatId) return;
-    const state = chats.get(chatId);
+    const topicKey = agentToTopic.get(agentId);
+    if (!topicKey) return;
+    const state = topics.get(topicKey);
     if (!state) return;
     const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
     setBusy(state, false);
     if (target) {
-      options.callbacks.onReply(chatId, target, outcome);
+      options.callbacks.onReply(state.chatId, target, outcome);
     }
     state.lastActivityAt = now();
-    drain(chatId);
+    drain(topicKey);
   }
 
   /** Permission requests only surface in the chat; resolution happens in Paseo. */
   function ownsAgent(agentId: string): boolean {
-    return agentToChat.has(agentId);
+    return agentToTopic.has(agentId);
   }
 
   function chatIdForAgent(agentId: string): string | null {
-    return agentToChat.get(agentId) ?? null;
+    const topicKey = agentToTopic.get(agentId);
+    return topicKey ? (topics.get(topicKey)?.chatId ?? null) : null;
   }
 
   function status(): ChatSessionStatus[] {
-    return [...chats.entries()].map(([chatId, state]) => ({
-      chatId,
+    return [...topics.entries()].map(([topicKey, state]) => ({
+      chatId: state.chatId,
+      topicKey,
       agentId: state.agentId,
       busy: state.busy,
       queued: state.queue.length,

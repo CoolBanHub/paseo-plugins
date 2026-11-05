@@ -26,7 +26,7 @@ interface StatusState {
   lastError: string | null;
   cliPath: string | null;
   botOpenId: string | null;
-  sessions: { chatId: string; agentId: string | null; busy: boolean; queued: number }[];
+  sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
   unmatched: { chatId: string; chatType: string; lastSeenAt: number }[];
 }
 
@@ -221,7 +221,10 @@ export function BotSettingsScreen(_props: PluginSurfaceProps) {
           <Text>{status?.cliPath ?? "未找到（请填写路径或安装 lark-cli）"}</Text>
         </SettingsRow>
         {(status?.sessions ?? []).map((session) => (
-          <SettingsRow key={session.chatId} label={boundNames.get(session.chatId) || session.chatId}>
+          <SettingsRow
+            key={session.topicKey}
+            label={`${boundNames.get(session.chatId) || session.chatId} · 话题 ${session.topicKey.slice(-8)}`}
+          >
             <Text>
               {session.busy ? "处理中" : "空闲"}
               {session.queued > 0 ? ` · 排队 ${session.queued} 条` : ""}

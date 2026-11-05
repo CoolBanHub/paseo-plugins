@@ -33,6 +33,7 @@ export const larkBotStatusRpc = defineRpc({
     sessions: z.array(
       z.object({
         chatId: z.string(),
+        topicKey: z.string(),
         agentId: z.string().nullable(),
         busy: z.boolean(),
         queued: z.number(),

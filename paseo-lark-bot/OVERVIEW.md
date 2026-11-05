@@ -8,7 +8,7 @@
 飞书（WebSocket 事件订阅，经 lark-cli）
   └→ lark-cli event consume im.message.receive_v1（插件管理的长驻子进程，NDJSON 流）
        └→ 路由：chat_id → 绑定的 provider / cwd / systemPrompt / 回复格式
-            └→ 每个会话一个智能体会话（串行队列，空闲超时后重建）
+            └→ 每个话题（thread）一个智能体会话：话题内共享上下文串行处理，不同话题并行互不干扰
                  └→ agent.turn_ended 统一回复：lark-cli im +messages-reply 挂回原消息话题
 权限请求 → 只通知到群（打开 Paseo 处理），批准后轮次继续，完成结果仍回到原话题
 ```
@@ -35,7 +35,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 设置里的「飞书机�
 | --- | --- | --- |
 | `larkCliPath` | `""` | lark-cli 绝对路径；空表示自动发现（PATH → nvm → Homebrew → /usr/local） |
 | `replyInThread` | `true` | 回复进被 @ 消息的话题；关闭则回复到消息流 |
-| `sessionIdleMinutes` | `30` | 会话空闲多少分钟后新建智能体会话（0 表示一直复用） |
+| `sessionIdleMinutes` | `30` | 话题空闲多少分钟后该话题新建智能体会话（0 表示一直复用） |
 | `maxReplyChars` | `4000` | 回复超过该长度截断并提示打开 Paseo 查看 |
 | `notifyUnmatched` | `false` | 未绑定的会话 @ 机器人时是否回复配置提示 |
 | `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`（可带 `/model`）、`cwd`、`systemPrompt`、`replyFormat` |
@@ -46,11 +46,11 @@ host 级设置（`lark_bot`，version 1），在 Paseo 设置里的「飞书机�
 
 ## 行为细节
 
-- 每个会话的消息串行处理：上一轮未结束时新消息排队（排队状态在设置界面可见）；一轮卡死超过 30 分钟后自动重建会话；
+- 会话按话题隔离：群里新 @ 机器人的消息开启新话题、新建智能体；在某条消息的话题内继续回复（root 消息相同）则复用该话题的智能体，上下文连续。同一话题内串行处理（上一轮未结束时新消息排队，排队状态在设置界面可见），不同话题并行；一轮卡死超过 30 分钟后自动重建该话题的会话；
 - 处理中发起权限请求时，群里收到「🔐 智能体需要确认」通知，请在 Paseo 客户端里批准 / 拒绝，处理完成后结果自动回到原话题；
 - 回复内容为该轮最后一条助手消息；中英文混排时会剔除混在答案前的英文推理句（同 lark-notify）；无文本回复时提示打开 Paseo 查看时间线；
 - 事件子进程异常退出后按指数退避自动重启（1s → 60s 封顶）；发送失败只写插件日志（`paseo plugin logs lark-bot`）；
-- 创建的智能体会话标题为「飞书 · 会话名」，带 `lark-bot-chat` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。
+- 创建的智能体会话标题为「飞书 · 会话名 · 任务摘要」，带 `lark-bot-chat` / `lark-bot-topic` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。
 
 ## 开发与验证
 
