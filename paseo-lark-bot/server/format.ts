@@ -1,29 +1,41 @@
 const DEFAULT_REPLY_LIMIT = 4000;
 
-function cjkRatio(value: string): number {
-  const cjk = (value.match(/[\u4e00-\u9fff]/g) || []).length;
-  const latin = (value.match(/[A-Za-z]/g) || []).length;
-  if (cjk + latin === 0) return 0;
-  return cjk / (cjk + latin);
-}
+const CJK = /[\u4e00-\u9fff]/;
 
 /**
  * DeepSeek-style providers sometimes fold English reasoning into the final
- * message. When a reply mixes scripts, keep the CJK sentences that carry the
- * actual answer instead of shipping the chain of thought to chat.
+ * message. Keep the structured answer intact: only strip a leading English
+ * prose paragraph when it is immediately followed by Chinese text. Never
+ * collapse whitespace or truncate Chinese sentences — both destroy Markdown,
+ * lists, code fences, and the actual answer.
  */
 export function condenseReply(value: string): string {
-  const flat = value.split(/\s+/).join(" ").trim();
-  if (!flat) return "";
-  if (cjkRatio(flat) > 0) {
-    const sentences = flat
-      .split(/(?<=[。！？!?.])/)
-      .map((sentence) => sentence.trim())
-      .filter(Boolean);
-    const answer = sentences.filter((sentence) => cjkRatio(sentence) >= 0.3);
-    if (answer.length > 0) return answer.slice(-2).join("");
+  const trimmed = value.trim();
+  if (!trimmed || !CJK.test(trimmed)) return trimmed;
+  // Code fences, lists and tables are user output, not reasoning.
+  if (/```/.test(trimmed) || /^\s*(?:[-*+]|\d+\.)\s/m.test(trimmed) || /^\s*\|/m.test(trimmed)) {
+    return trimmed;
   }
-  return flat;
+  const firstCjk = trimmed.search(CJK);
+  if (firstCjk <= 0) return trimmed;
+  const prefix = trimmed.slice(0, firstCjk);
+  // A Markdown heading/link/quote at the start is part of the answer.
+  if (/^\s*(?:#|>|!\[|\*\*|__|`)/.test(prefix)) return trimmed;
+  const boundary = Math.max(
+    prefix.lastIndexOf(". "),
+    prefix.lastIndexOf(".\n"),
+    prefix.lastIndexOf("! "),
+    prefix.lastIndexOf("!\n"),
+    prefix.lastIndexOf("? "),
+    prefix.lastIndexOf("?\n"),
+  );
+  if (boundary < 0) return trimmed;
+  const head = prefix.slice(0, boundary + 1).trim();
+  // Only drop a prose-looking lead-in, and only if it is not itself a heading
+  // or a list item.
+  if (!head || /^[#>*\-|`]/.test(head)) return trimmed;
+  const rest = trimmed.slice(boundary + 1).trimStart();
+  return rest || trimmed;
 }
 
 /**

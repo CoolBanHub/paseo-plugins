@@ -12,6 +12,9 @@ export interface LarkMessageEvent {
   sender_type: "user" | "bot";
   mentions?: ReadonlyArray<{ id: string; key: string; name: string }>;
   root_id?: string;
+  thread_id?: string;
+  reply_to?: string;
+  event_id?: string;
   create_time?: string;
 }
 
@@ -126,16 +129,26 @@ export function createEventConsumer(options: {
       }
     });
 
-    proc.on("error", (error) => {
-      lastError = error.message;
-    });
-    proc.on("exit", (code, signal) => {
+    // Both `error` (spawn ENOENT) and `close` can end the child without an
+    // `exit` event. Route every termination through one guard so the consumer
+    // always retries with backoff.
+    const handleTermination = (detail: string): void => {
       if (proc !== child) return;
       child = null;
       if (stopped) return;
       state = "retrying";
-      if (!lastError) lastError = `lark-cli 事件进程退出（code=${code} signal=${signal}）`;
+      if (!lastError) lastError = detail;
       scheduleRestart();
+    };
+    proc.on("error", (error) => {
+      lastError = error.message;
+      handleTermination(`lark-cli 事件进程启动失败（${error.message}）`);
+    });
+    proc.on("exit", (code, signal) => {
+      handleTermination(`lark-cli 事件进程退出（code=${code} signal=${signal}）`);
+    });
+    proc.on("close", (code, signal) => {
+      handleTermination(`lark-cli 事件进程关闭（code=${code} signal=${signal}）`);
     });
   }
 

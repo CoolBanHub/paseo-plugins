@@ -43,6 +43,7 @@ interface Harness {
   dispatch: ReturnType<typeof createDispatcher>;
   replies: ReplyCall[];
   created: { prompt?: string }[];
+  runCalls: { agentId: string; text: string }[];
   agentId: string;
   paseoRef: import("../server/sessions.ts").SessionPaseoApi;
 }
@@ -50,6 +51,7 @@ interface Harness {
 function makeHarness(values: BotValues = baseValues()): Harness {
   const replies: ReplyCall[] = [];
   const created: { prompt?: string; images?: unknown[] }[] = [];
+  const runCalls: { agentId: string; text: string }[] = [];
   let current: SessionAgentHandle | null = null;
 
   const paseo: SessionPaseoApi = {
@@ -59,7 +61,10 @@ function makeHarness(values: BotValues = baseValues()): Harness {
         current = {
           id: `agent-${created.length}`,
           send: async () => {},
-          run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+          run: async (text) => {
+            runCalls.push({ agentId: current!.id, text });
+            return { status: "idle", error: null, lastMessage: "ok" };
+          },
         };
         return current;
       },
@@ -86,7 +91,7 @@ function makeHarness(values: BotValues = baseValues()): Harness {
     },
   });
 
-  return { dispatch, replies, created, agentId: "agent-1", paseoRef: paseo };
+  return { dispatch, replies, created, runCalls, agentId: "agent-1", paseoRef: paseo };
 }
 
 function groupEvent(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent {
@@ -236,7 +241,6 @@ describe("createDispatcher", () => {
       groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 什么情况" }),
     );
     await flush();
-    console.log("DEBUG created:", h.created.length, "replies:", JSON.stringify(h.replies.map(r => r.text.slice(0, 24))));
     assert.equal(h.created.length, 1);
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("成员A: 看看这个报错"), prompt);
@@ -260,7 +264,6 @@ describe("createDispatcher", () => {
       groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 你查一下" }),
     );
     await flush();
-    console.log("DEBUG created:", h.created.length, "replies:", JSON.stringify(h.replies.map(r => r.text.slice(0, 24))));
     assert.equal(h.created.length, 1);
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("现在的构建失败原因"), "root text expected: " + prompt);
@@ -420,5 +423,116 @@ describe("bare mentions", () => {
     assert.equal(h.created.length, 0);
     assert.equal(h.replies.length, 1);
     assert.ok(h.replies[0].text.includes("没有读到文字内容"));
+  });
+});
+
+describe("p2p and delivery hygiene", () => {
+  const p2pValues = baseValues({
+    chats: [
+      {
+        chatId: "oc_p2p",
+        chatName: "私聊",
+        provider: "claude",
+        cwd: "/tmp/project",
+        systemPrompt: "",
+        replyFormat: "markdown",
+      },
+    ],
+  });
+  const p2pEvent = (id: string, content: string) =>
+    groupEvent({
+      chat_id: "oc_p2p",
+      chat_type: "p2p",
+      content,
+      message_id: id,
+      mentions: [],
+    });
+
+  it("keeps one agent for a p2p conversation", async () => {
+    const h = makeHarness(p2pValues);
+    await h.dispatch.handleMessageEvent(p2pEvent("om_1", "第一条"));
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "答一"));
+    await flush();
+    await h.dispatch.handleMessageEvent(p2pEvent("om_2", "继续"));
+    await flush();
+    assert.equal(h.created.length, 1, "p2p must reuse the chat agent");
+    const prompt = h.runCalls[0]?.text ?? "";
+    assert.ok(prompt.includes("【最近对话】") || prompt.includes("第一条"), prompt);
+  });
+
+  it("ignores duplicate deliveries of the same message_id", async () => {
+    const h = makeHarness();
+    const event = groupEvent({ message_id: "om_same" });
+    await h.dispatch.handleMessageEvent(event);
+    await flush();
+    await h.dispatch.handleMessageEvent(event);
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.dispatch.status().sessions[0]?.queued, 0);
+  });
+
+  it("waits for a slow image ingest before the next @ in the same topic", async () => {
+    const h = makeHarness();
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues(),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async () => ({ image_key: "img_slow" }),
+      download: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { bytes: Buffer.from("late-jpeg"), extension: ".jpg" };
+      },
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    const image = dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_img", root_id: "om_root", message_type: "image", content: "", mentions: [] }),
+    );
+    const mention = dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_mention", root_id: "om_root", content: "@测试机器人 图里是什么" }),
+    );
+    await Promise.all([image, mention]);
+    await flush();
+    assert.equal(h.created.length, 1);
+    const images = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(images?.length, 1, "slow image must be attached to the next turn");
+  });
+
+  it("does not download media in unbound chats", async () => {
+    let downloads = 0;
+    const dispatch = createDispatcher({
+      paseo: makeHarness().paseoRef,
+      readValues: async () => baseValues({ chats: [] }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async () => ({ image_key: "img_x" }),
+      download: async () => {
+        downloads += 1;
+        return { bytes: Buffer.from("x"), extension: ".jpg" };
+      },
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    await dispatch.handleMessageEvent(
+      groupEvent({ chat_id: "oc_unbound", message_type: "image", content: "", mentions: [] }),
+    );
+    await flush();
+    assert.equal(downloads, 0);
+  });
+
+  it("routes permission notices to the agent's own topic", async () => {
+    const h = makeHarness(baseValues({ notifyPermission: true }));
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_a", content: "@测试机器人 话题 A" }));
+    await flush();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_b", content: "话题 B", mentions: [] }));
+    await flush();
+    h.dispatch.handlePermission({
+      agent: { id: h.agentId, workspaceId: null, parentAgentId: null, provider: "claude", cwd: "/tmp", title: null },
+      request: { id: "req", provider: "claude", name: "Bash", kind: "tool", title: "执行命令" },
+    });
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_a");
   });
 });

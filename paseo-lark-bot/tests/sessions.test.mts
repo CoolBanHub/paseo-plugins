@@ -19,7 +19,7 @@ interface Harness {
   registry: ReturnType<typeof createSessionRegistry>;
   replies: ReplyCall[];
   notices: { chatId: string | null; messageId: string; text: string }[];
-  created: { prompt?: string; provider: string }[];
+  created: { prompt?: string; provider: string; cwd: string }[];
   runCalls: { agentId: string; text: string }[];
   agentCounter: number;
   currentAgent: () => SessionAgentHandle;
@@ -48,7 +48,7 @@ function makeHarness(options?: { idleMinutes?: number }): Harness {
     agents: {
       create: async (request) => {
         agentCounter += 1;
-        created.push({ prompt: request.prompt, provider: request.config.provider });
+        created.push({ prompt: request.prompt, provider: request.config.provider, cwd: request.cwd });
         current = {
           id: `agent-${agentCounter}`,
           send: async () => {},
@@ -292,6 +292,98 @@ describe("createSessionRegistry", () => {
     h.registry.handleTurnEnded(agent.id, completed("手动轮完成"));
     await flush();
     assert.equal(h.replies[0]?.messageId, "om_1");
+  });
+
+  it("does not release the queue when run() resolves idle without turn_ended", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    h.finishRun({ status: "idle", error: null, lastMessage: "run 结果" });
+    await flush();
+    h.registry.enqueue("om_1", "oc_group", "om_3", "第三条", binding);
+    await flush();
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["第二条"], "run() idle must not drain the queue");
+
+    h.registry.handleTurnEnded(agent.id, completed("第二轮答复"));
+    await flush();
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["第二条", "第三条"]);
+  });
+
+  it("ignores a stale run() idle after turn_ended already released the queue", async () => {
+    const replies: ReplyCall[] = [];
+    const runResolvers: ((result: SessionRunResult) => void)[] = [];
+    let runCount = 0;
+    const paseo: SessionPaseoApi = {
+      agents: {
+        create: async () => {
+          const handle: SessionAgentHandle = {
+            id: "agent-1",
+            send: async () => {},
+            run: () => {
+              runCount += 1;
+              return new Promise<SessionRunResult>((resolve) => runResolvers.push(resolve));
+            },
+          };
+          return handle;
+        },
+        ref: () => {
+          throw new Error("unused");
+        },
+      },
+    };
+    const registry = createSessionRegistry({
+      paseo,
+      getIdleMs: () => 30 * 60_000,
+      callbacks: {
+        onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
+        onNotice: () => {},
+      },
+    });
+    registry.enqueue("om_1", "oc_group", "om_1", "A", binding);
+    await flush();
+    registry.handleTurnEnded("agent-1", completed("A"));
+    await flush();
+
+    registry.enqueue("om_1", "oc_group", "om_2", "B", binding);
+    await flush();
+    registry.enqueue("om_1", "oc_group", "om_3", "C", binding);
+    await flush();
+    registry.handleTurnEnded("agent-1", completed("B"));
+    await flush();
+    assert.equal(runCount, 2, "C should start after B's turn_ended");
+
+    // B's run() resolves after turn_ended already moved on to C.
+    runResolvers[0]?.({ status: "idle", error: null, lastMessage: "B late" });
+    await flush();
+    assert.equal(runCount, 2, "stale idle must not start another run");
+    assert.equal(registry.status()[0]?.busy, true, "C is still running");
+  });
+
+  it("ignores a duplicate turn_ended for the same turn", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+    h.registry.handleTurnEnded(agent.id, completed("重复的完成事件"));
+    await flush();
+    assert.equal(h.replies.length, 1, "duplicate completion must not reply twice");
+  });
+
+  it("expands a leading ~ in cwd", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, cwd: "~/project" });
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.ok(!h.created[0].cwd.startsWith("~"), h.created[0].cwd);
+    assert.ok(h.created[0].cwd.endsWith("/project"), h.created[0].cwd);
   });
 });
 

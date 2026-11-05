@@ -2,7 +2,7 @@
   "name": "lark-bot",
   "private": true,
   "version": "0.1.0",
-  "description": "Feishu/Lark group bot bridging @-mentions to Paseo providers with thread replies",
+  "description": "Feishu group bot bridging @-mentions to Paseo providers with thread replies (China region)",
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",

@@ -41,7 +41,9 @@ export const botValuesSchema = z.object({
    * Feishu app credentials. When both are set the plugin validates them
    * against the tenant_access_token endpoint and writes them into lark-cli
    * (non-interactive config init). Empty values keep lark-cli's existing
-   * keychain configuration. Stored in plain text by design.
+   * keychain configuration. Stored in plain text by design for local-only use:
+   * the user explicitly does not want encryption here. Changing only the
+   * secret for the same App ID is detected and written as well.
    */
   appId: z.string().default(""),
   appSecret: z.string().default(""),

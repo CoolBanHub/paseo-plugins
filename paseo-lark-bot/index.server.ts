@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { larkBotChatsRpc, larkBotProvidersRpc, larkBotStatusRpc } from "./shared/contracts.ts";
-import { createEventConsumer, type EventConsumer } from "./server/lark-events.ts";
+import { createEventConsumer, type EventConsumer, type LarkMessageEvent } from "./server/lark-events.ts";
 import { applyAppCredentials, listChats, readCurrentAppId, resolveLarkCli } from "./server/lark.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
+import { lastAssistantText } from "./server/timeline.ts";
 import { DEFAULT_BOT_VALUES, larkBotSettings, type BotValues } from "./shared/settings.ts";
 
 /**
@@ -17,11 +19,18 @@ let paseo: SessionPaseoApi | null = null;
 let dispatcher: Dispatcher | null = null;
 let consumer: EventConsumer | null = null;
 let consumerCli: string | null = null;
-/** AppId confirmed written into lark-cli during this plugin lifetime. */
-let appliedAppId: string | null = null;
+/** appId + secret fingerprint confirmed in this plugin lifetime. */
+let appliedCredentialKey: string | null = null;
 let currentAppIdCache: string | null = null;
+/** Events that arrived before the first PaseoApi handle; replayed on capture. */
+const pendingEvents: LarkMessageEvent[] = [];
+const MAX_PENDING_EVENTS = 50;
 /** provider → provider/<default-model>, filled lazily per daemon lifetime. */
 const providerModelCache = new Map<string, string>();
+
+function credentialFingerprint(appId: string, appSecret: string): string {
+  return createHash("sha256").update(appId).update("\0").update(appSecret).digest("hex");
+}
 
 /**
  * Daemons since 0.15 reject bare provider ids in agents.create(); resolve
@@ -56,17 +65,18 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
       fetchLastReply: async (agentId: string) => {
         try {
           const payload = await api.agents.ref(agentId).timeline?.refetch({ limit: 30 });
-          const entries = payload?.entries ?? [];
-          for (let index = entries.length - 1; index >= 0; index -= 1) {
-            const entry = entries[index];
-            if (entry?.type === "assistant_message" && entry.text?.trim()) return entry.text.trim();
-          }
+          const text = lastAssistantText(payload?.entries);
+          if (text) return text;
         } catch {
           // Older hosts or missing permissions degrade to the plain notice.
         }
         return null;
       },
     });
+  }
+  if (pendingEvents.length > 0) {
+    const replay = pendingEvents.splice(0);
+    for (const event of replay) void dispatcher.handleMessageEvent(event);
   }
   return dispatcher;
 }
@@ -88,31 +98,45 @@ export default function contribute(server: PluginServerContext) {
   // never clobber the working keychain config and fall back to it.
   const applyCredentials = async (values: BotValues, cliPath: string | null): Promise<void> => {
     const wanted = values.appId.trim();
-    if (!wanted || !values.appSecret || !cliPath || appliedAppId === wanted) return;
+    if (!wanted || !values.appSecret || !cliPath) return;
+    // Compare the secret too: rotating the secret for the same App ID must
+    // still validate and write. The Secret stays plaintext in host settings by
+    // design (local-only use); only a hash is kept in memory here.
+    const fingerprint = credentialFingerprint(wanted, values.appSecret);
+    if (appliedCredentialKey === fingerprint) return;
     try {
-      const current = await readCurrentAppId(cliPath);
-      currentAppIdCache = current;
-      if (current !== wanted) {
-        await applyAppCredentials({ cliPath, appId: wanted, appSecret: values.appSecret });
-        log("已应用飞书应用凭证 " + wanted);
-        currentAppIdCache = wanted;
-        // The event bus was restarted; force a fresh consumer connection.
-        await consumer?.stop();
-        consumer = null;
-        consumerCli = null;
-      }
-      appliedAppId = wanted;
+      const previous = currentAppIdCache ?? (await readCurrentAppId(cliPath));
+      currentAppIdCache = previous;
+      // Stop our consumer before stopping/restarting the shared event bus.
+      await consumer?.stop();
+      consumer = null;
+      consumerCli = null;
+      await applyAppCredentials({
+        cliPath,
+        appId: wanted,
+        appSecret: values.appSecret,
+        previousAppId: previous,
+      });
+      appliedCredentialKey = fingerprint;
+      currentAppIdCache = wanted;
+      dispatcher?.resetIdentity();
+      log("已应用飞书应用凭证 " + wanted);
     } catch (error) {
       log("应用飞书应用凭证失败，继续使用 lark-cli 现有配置", error instanceof Error ? error.message : String(error));
     }
   };
 
+  let disposed = false;
+  let syncQueue: Promise<void> = Promise.resolve();
+
   // Start or stop the event consumer to match the current bindings; a changed
   // lark-cli path rebuilds it so the child process picks up the new binary.
   const syncConsumer = async (): Promise<void> => {
     const values = await readValues();
+    if (disposed) return;
     const cliPath = resolveLarkCli(values.larkCliPath);
     await applyCredentials(values, cliPath);
+    if (disposed) return;
     if (values.chats.length === 0) {
       await consumer?.stop();
       consumer = null;
@@ -125,19 +149,37 @@ export default function contribute(server: PluginServerContext) {
       return;
     }
     await consumer?.stop();
+    if (disposed) return;
     consumerCli = cliPath;
-    consumer = createEventConsumer({
-      cliPath,
-      onEvent: (event) => {
-        if (dispatcher) void dispatcher.handleMessageEvent(event);
-      },
-    });
+    consumer = createEventConsumer({ cliPath, onEvent: deliverEvent });
     consumer.start();
   };
 
-  void syncConsumer();
+  /** Serialize settings saves so concurrent syncs cannot leak a consumer. */
+  const requestSync = (): void => {
+    syncQueue = syncQueue
+      .then(async () => {
+        if (!disposed) await syncConsumer();
+      })
+      .catch((error) => {
+        log("同步事件监听失败", error instanceof Error ? error.message : String(error));
+      });
+  };
+
+  const deliverEvent = (event: LarkMessageEvent): void => {
+    if (dispatcher) {
+      void dispatcher.handleMessageEvent(event);
+      return;
+    }
+    // The daemon may restart the plugin before any hook/RPC hands us a
+    // PaseoApi. Buffer a bounded window instead of silently dropping messages.
+    if (pendingEvents.length >= MAX_PENDING_EVENTS) pendingEvents.shift();
+    pendingEvents.push(event);
+  };
+
+  requestSync();
   const offSettings = settings.subscribe(() => {
-    void syncConsumer();
+    requestSync();
   });
 
   const capture = (api: unknown): void => {
@@ -203,16 +245,19 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return async () => {
+    disposed = true;
     offTurnStarted();
     offTurnEnded();
     offPermission();
     offSettings();
+    await syncQueue.catch(() => undefined);
     dispatcher = null;
     paseo = null;
     await consumer?.stop();
     consumer = null;
     consumerCli = null;
-    appliedAppId = null;
+    pendingEvents.length = 0;
+    appliedCredentialKey = null;
     currentAppIdCache = null;
   };
 }

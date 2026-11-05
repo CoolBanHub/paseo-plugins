@@ -20,8 +20,23 @@ describe("condenseReply", () => {
     assert.equal(condenseReply("All checks passed."), "All checks passed.");
   });
 
-  it("collapses whitespace", () => {
-    assert.equal(condenseReply("hello   world"), "hello world");
+  it("preserves whitespace when there is no reasoning to strip", () => {
+    assert.equal(condenseReply("hello   world"), "hello   world");
+  });
+
+  it("keeps all Chinese sentences and multi-line Markdown", () => {
+    const reply = "# 结果\n\n第一句。第二句。第三句。\n\n- 改动 A\n- 改动 B";
+    assert.equal(condenseReply(reply), reply);
+  });
+
+  it("keeps fenced code blocks untouched", () => {
+    const reply = "修复完成。\n\n```ts\nconst a = 1;\n```";
+    assert.equal(condenseReply(reply), reply);
+  });
+
+  it("strips only the leading English prose", () => {
+    const reply = condenseReply("I checked the logs. 原因是配置缺失。已修复。");
+    assert.equal(reply, "原因是配置缺失。已修复。");
   });
 });
 

@@ -41,12 +41,11 @@ export interface DispatcherOptions {
     format: ReplyFormat;
     replyInThread: boolean;
   }) => Promise<string | null>;
-  /** Injectable thread-root lookup for tests. */
   /** Injectable thread-root lookup for tests; may also learn sender names. */
   readThreadRootDetail?: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;
   /** Injectable media pipeline for tests. */
   readRaw?: (cliPath: string, messageId: string) => Promise<Record<string, unknown> | null>;
-  download?: (options: { cliPath: string; messageId: string; fileKey: string; type: "image" | "file" }) => Promise<{ bytes: Buffer; extension: string }>;
+  download?: (options: { cliPath: string; messageId: string; fileKey: string; type: "image" | "file"; maxBytes?: number }) => Promise<{ bytes: Buffer; extension: string }>;
   extractFrames?: (videoPath: string, ffmpeg: string, maxFrames?: number) => Promise<Buffer[]>;
   log?: (message: string, detail?: unknown) => void;
 }
@@ -55,6 +54,9 @@ const UNMATCHED_KEEP = 20;
 /** Images attached per turn, and cached per topic, respectively. */
 const MAX_IMAGES_PER_TURN = 4;
 const MAX_TOPIC_IMAGES = 8;
+/** Bound in-memory topic state for long-running daemons and busy tenants. */
+const MAX_TOPIC_HISTORY = 500;
+const MAX_TOPIC_IMAGE_TOPICS = 50;
 /** Chinese labels for non-text message types in thread context. */
 const MEDIA_LABELS: Record<string, string> = {
   image: "图片",
@@ -95,6 +97,12 @@ export function createDispatcher(options: DispatcherOptions) {
   let warnedMissingCli = false;
   // Latest inbound message per chat: fallback reply target for notices.
   const latestSeen = new Map<string, string>();
+  // Event delivery is at-least-once; message_id is the documented dedup key.
+  const seenMessageIds = new Set<string>();
+  const seenMessageOrder: string[] = [];
+  // Serialize preprocessing per topic so a slow root lookup cannot let a later
+  // message overtake an earlier one.
+  const topicChains = new Map<string, Promise<void>>();
   const unmatchedRecent = new Map<string, { chatId: string; chatType: string; lastSeenAt: number }>();
   // Thread roots rarely change; cache their text to avoid repeated mgets.
   const threadRootCache = new Map<string, MessageDetail | null>();
@@ -152,6 +160,27 @@ export function createDispatcher(options: DispatcherOptions) {
     return valuesCache;
   }
 
+  /** Returns false when this message was already delivered. Bounded LRU. */
+  function firstDelivery(messageId: string): boolean {
+    if (!messageId || seenMessageIds.has(messageId)) return false;
+    seenMessageIds.add(messageId);
+    seenMessageOrder.push(messageId);
+    if (seenMessageOrder.length > 1_000) {
+      const oldest = seenMessageOrder.shift();
+      if (oldest) seenMessageIds.delete(oldest);
+    }
+    return true;
+  }
+
+  /**
+   * A p2p chat is one continuous conversation; a group thread is keyed by its
+   * root (falling back to thread/reply ids), and a fresh @ starts its own key.
+   */
+  function topicKeyFor(event: LarkMessageEvent): string {
+    if (event.chat_type === "p2p") return event.chat_id;
+    return event.root_id || event.thread_id || event.reply_to || event.message_id;
+  }
+
   async function ensureBotOpenId(cliPath: string): Promise<string | null> {
     if (openIdLoaded) return cachedBotOpenId;
     try {
@@ -162,6 +191,12 @@ export function createDispatcher(options: DispatcherOptions) {
       log("读取机器人 open_id 失败", error instanceof Error ? error.message : String(error));
     }
     return cachedBotOpenId;
+  }
+
+  /** Credentials/app switch changed the bot identity; re-read it. */
+  function resetIdentity(): void {
+    cachedBotOpenId = null;
+    openIdLoaded = false;
   }
 
   function cliPathFor(values: BotValues): string | null {
@@ -180,6 +215,10 @@ export function createDispatcher(options: DispatcherOptions) {
       memberCounter += 1;
       label = "成员" + String.fromCharCode(64 + Math.min(memberCounter, 26));
       senderLabels.set(senderId, label);
+      if (senderLabels.size > 500) {
+        const oldest = senderLabels.keys().next().value;
+        if (oldest) senderLabels.delete(oldest);
+      }
     }
     return label;
   }
@@ -194,61 +233,123 @@ export function createDispatcher(options: DispatcherOptions) {
     return "[" + label + (detail ? "：" + detail : "") + "]";
   }
 
+  /** Recursively collect image keys from a raw post payload. */
+  function collectImageKeys(value: unknown, output: Set<string>, depth = 0): void {
+    if (depth > 8 || !value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) collectImageKeys(item, output, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (typeof record.image_key === "string" && record.image_key.startsWith("img_")) {
+      output.add(record.image_key);
+    }
+    for (const item of Object.values(record)) collectImageKeys(item, output, depth + 1);
+  }
+
+  function cacheImages(key: string, buffers: { bytes: Buffer; mime: string }[]): void {
+    const images = topicImages.get(key) ?? [];
+    for (const buffer of buffers) {
+      const attachment = toImageAttachment(buffer.bytes, buffer.mime);
+      if (attachment) images.push(attachment);
+    }
+    if (images.length > MAX_TOPIC_IMAGES) images.splice(0, images.length - MAX_TOPIC_IMAGES);
+    topicImages.set(key, images);
+    pruneMap(topicImages, MAX_TOPIC_IMAGE_TOPICS, key);
+  }
+
   /**
-   * Download media posted in a topic: images as-is, videos as extracted
-   * frames. Everything is cached per topic so the next @-mention in the
-   * thread carries it to the provider. Failures degrade to placeholders.
+   * Download media posted in a topic: images (including images embedded in a
+   * post) as-is, videos as extracted frames. Everything is cached per topic so
+   * the next @-mention in the thread carries it to the provider. Failures
+   * degrade to placeholders.
    */
   async function ingestMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
     if (event.chat_type !== "group") return;
     const kind =
       event.message_type === "image" ? "image" : event.message_type === "media" ? "video" : null;
-    if (!kind) return;
-    const key = event.root_id || event.message_id;
+    if (!kind && event.message_type !== "post") return;
+    const key = topicKeyFor(event);
     try {
       const raw = await readRaw(cliPath, event.message_id);
       if (!raw) return;
-      const fileKey =
-        typeof raw.image_key === "string" && kind === "image" ? raw.image_key : typeof raw.file_key === "string" ? raw.file_key : null;
-      if (!fileKey) return;
-      const resource = await download({
-        cliPath,
-        messageId: event.message_id,
-        fileKey,
-        type: kind === "image" ? "image" : "file",
-      });
-      const buffers: { bytes: Buffer; mime: string }[] = [];
-      if (kind === "image") {
-        buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
+      let imageKeys: string[] = [];
+      if (event.message_type === "post") {
+        const keys = new Set<string>();
+        collectImageKeys(raw, keys);
+        imageKeys = [...keys];
       } else {
+        const fileKey =
+          typeof raw.image_key === "string" && kind === "image"
+            ? raw.image_key
+            : typeof raw.file_key === "string"
+              ? raw.file_key
+              : null;
+        if (!fileKey) return;
+        if (kind === "image") {
+          const resource = await download({
+            cliPath,
+            messageId: event.message_id,
+            fileKey,
+            type: "image",
+            maxBytes: 5 * 1024 * 1024,
+          });
+          cacheImages(key, [
+            { bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" },
+          ]);
+          return;
+        }
+        const resource = await download({
+          cliPath,
+          messageId: event.message_id,
+          fileKey,
+          type: "file",
+          maxBytes: 50 * 1024 * 1024,
+        });
         const ffmpeg = resolveFfmpeg();
         if (!ffmpeg) return;
         const dir = mkdtempSync(join(tmpdir(), "lark-bot-video-"));
         try {
           const videoPath = join(dir, "video" + resource.extension);
           writeFileSync(videoPath, resource.bytes);
+          const buffers: { bytes: Buffer; mime: string }[] = [];
           for (const frame of await extractFrames(videoPath, ffmpeg, 3)) {
             buffers.push({ bytes: frame, mime: "image/jpeg" });
           }
+          cacheImages(key, buffers);
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
+        return;
       }
-      const images = topicImages.get(key) ?? [];
-      for (const buffer of buffers) {
-        const attachment = toImageAttachment(buffer.bytes, buffer.mime);
-        if (attachment) images.push(attachment);
+
+      const buffers: { bytes: Buffer; mime: string }[] = [];
+      for (const fileKey of imageKeys.slice(0, MAX_IMAGES_PER_TURN)) {
+        const resource = await download({
+          cliPath,
+          messageId: event.message_id,
+          fileKey,
+          type: "image",
+          maxBytes: 5 * 1024 * 1024,
+        });
+        buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
       }
-      if (images.length > MAX_TOPIC_IMAGES) images.splice(0, images.length - MAX_TOPIC_IMAGES);
-      topicImages.set(key, images);
+      cacheImages(key, buffers);
     } catch (error) {
       log("处理话题媒体失败", error instanceof Error ? error.message : String(error));
     }
   }
 
+  function pruneMap<T>(map: Map<string, T>, max: number, keep: string): void {
+    while (map.size > max) {
+      const oldest = map.keys().next().value;
+      if (!oldest || oldest === keep) break;
+      map.delete(oldest);
+    }
+  }
+
   function recordHistory(event: LarkMessageEvent): void {
-    if (event.chat_type !== "group") return;
-    const key = event.root_id || event.message_id;
+    const key = topicKeyFor(event);
     const text = historyText(event);
     if (!text) return;
     const entries = topicHistory.get(key) ?? [];
@@ -261,31 +362,67 @@ export function createDispatcher(options: DispatcherOptions) {
     });
     if (entries.length > 50) entries.splice(0, entries.length - 50);
     topicHistory.set(key, entries);
+    pruneMap(topicHistory, MAX_TOPIC_HISTORY, key);
   }
 
   async function handleMessageEvent(event: LarkMessageEvent): Promise<void> {
+    if (!firstDelivery(event.message_id)) return;
+    const key = topicKeyFor(event);
+    const previous = topicChains.get(key) ?? Promise.resolve();
+    const next = previous.then(
+      () => processMessageEvent(event),
+      () => processMessageEvent(event),
+    );
+    topicChains.set(key, next);
+    try {
+      await next;
+    } finally {
+      if (topicChains.get(key) === next) topicChains.delete(key);
+    }
+  }
+
+  async function processMessageEvent(event: LarkMessageEvent): Promise<void> {
     try {
       latestSeen.set(event.chat_id, event.message_id);
-      recordHistory(event);
+      if (latestSeen.size > 500) {
+        const oldest = latestSeen.keys().next().value;
+        if (oldest) latestSeen.delete(oldest);
+      }
       const values = await currentValues();
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
       const botOpenId = await ensureBotOpenId(cliPath);
       if (event.chat_type === "group" && !botOpenId) return;
 
-      void ingestMedia(cliPath, event);
+      // Only chats with a binding may be recorded or downloaded. Unbound chats
+      // get at most the configured "not configured" hint.
+      const binding = values.chats.find((chat) => chat.chatId === event.chat_id) ?? null;
+      if (!binding) {
+        const unmatched = routeMessage(event, values, botOpenId);
+        if (unmatched.reason === "unmatched") {
+          rememberUnmatched(event);
+          if (values.notifyUnmatched) {
+            await send(cliPath, event.message_id, UNMATCHED_HINT, values, "text");
+          }
+        }
+        return;
+      }
+
+      // Record/ingest before routing so unmentioned messages in a bound chat
+      // still contribute thread context; awaiting the download keeps a fast
+      // follow-up @ from reading an empty image cache.
+      recordHistory(event);
+      await ingestMedia(cliPath, event);
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {
         rememberUnmatched(event);
-        if (values.notifyUnmatched) {
-          await send(cliPath, event.message_id, UNMATCHED_HINT, values, "text");
-        }
         return;
       }
       // One agent session per Feishu thread: replies inside a topic share
-      // context, while each fresh @-mention starts an independent topic.
-      const topicKey = event.root_id || event.message_id;
+      // context, while each fresh @-mention starts an independent topic. P2P
+      // has no thread root, so the chat itself is the continuous topic.
+      const topicKey = topicKeyFor(event);
       const images = (topicImages.get(topicKey) ?? []).slice(-MAX_IMAGES_PER_TURN);
 
       // A bare @-mention means "go handle the thread": proceed whenever the
@@ -325,24 +462,37 @@ export function createDispatcher(options: DispatcherOptions) {
     event: LarkMessageEvent,
     prompt: string,
   ): Promise<{ text: string; hasContext: boolean }> {
-    if (!event.root_id) return { text: prompt, hasContext: false };
-    const history = (topicHistory.get(event.root_id) ?? []).filter(
+    const historyKey = topicKeyFor(event);
+    const history = (topicHistory.get(historyKey) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
     );
+    if (event.chat_type === "p2p") {
+      if (history.length === 0) return { text: prompt, hasContext: false };
+      const transcript = history
+        .slice(-20)
+        .map((entry) => entry.senderType + ": " + clipContext(entry.text))
+        .join("\n");
+      return {
+        text: "【最近对话】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
+        hasContext: true,
+      };
+    }
+    const rootId = event.root_id || event.reply_to;
+    if (!rootId) return { text: prompt, hasContext: false };
     let rootText: string | null = null;
-    const rootInHistory = history.length > 0 && history[0]?.messageId === event.root_id;
+    const rootInHistory = history.length > 0 && history[0]?.messageId === rootId;
     if (!rootInHistory) {
       let detail: MessageDetail | null;
-      if (threadRootCache.has(event.root_id)) {
-        detail = threadRootCache.get(event.root_id) ?? null;
+      if (threadRootCache.has(rootId)) {
+        detail = threadRootCache.get(rootId) ?? null;
       } else {
         try {
-          detail = await readThreadRootDetail(cliPath, event.root_id);
+          detail = await readThreadRootDetail(cliPath, rootId);
         } catch (error) {
           log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
           detail = null;
         }
-        threadRootCache.set(event.root_id, detail);
+        threadRootCache.set(rootId, detail);
         if (threadRootCache.size > 100) {
           const oldest = threadRootCache.keys().next().value;
           if (oldest) threadRootCache.delete(oldest);
@@ -356,7 +506,7 @@ export function createDispatcher(options: DispatcherOptions) {
     }
     const lines: string[] = [];
     if (rootText && rootText !== prompt) lines.push("【话题主题】" + rootText);
-    const prior = rootInHistory ? history : history.filter((entry) => entry.messageId !== event.root_id);
+    const prior = rootInHistory ? history : history.filter((entry) => entry.messageId !== rootId);
     if (prior.length > 1 || (prior.length === 1 && !rootText)) {
       // senderType carries the stable per-sender label (机器人 / 成员A / 真名).
       const transcript = prior.map((entry) => entry.senderType + ": " + clipContext(entry.text)).join("\n");
@@ -404,7 +554,9 @@ export function createDispatcher(options: DispatcherOptions) {
   function handlePermission(event: PermissionEvent): void {
     if (!sessions.ownsAgent(event.agent.id)) return;
     const chatId = sessions.chatIdForAgent(event.agent.id);
-    const target = chatId ? latestSeen.get(chatId) : undefined;
+    // Prefer the topic's own trigger/most recent message; the chat-level
+    // latestSeen can belong to a different topic in the same group.
+    const target = sessions.targetForAgent(event.agent.id) ?? (chatId ? latestSeen.get(chatId) : undefined);
     if (!chatId || !target) return;
     const heading = (
       event.request.title || [event.request.kind, event.request.name].filter(Boolean).join(" ")
@@ -465,6 +617,7 @@ export function createDispatcher(options: DispatcherOptions) {
     handleMessageEvent,
     handleTurnEnded,
     handlePermission,
+    resetIdentity,
     status: () => ({
       sessions: sessions.status(),
       unmatched: [...unmatchedRecent.values()],

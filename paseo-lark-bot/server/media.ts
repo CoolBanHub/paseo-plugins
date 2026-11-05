@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { accessSync, constants, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -31,7 +31,9 @@ export async function downloadMessageResource(options: {
   messageId: string;
   fileKey: string;
   type: "image" | "file";
+  maxBytes?: number;
 }): Promise<{ bytes: Buffer; extension: string }> {
+  const maxBytes = options.maxBytes ?? 50 * 1024 * 1024;
   const dir = mkdtempSync(join(tmpdir(), "lark-bot-media-"));
   try {
     const output = join(dir, "resource");
@@ -56,8 +58,13 @@ export async function downloadMessageResource(options: {
     const files = readdirSync(dir).filter((name) => name.startsWith("resource"));
     if (files.length === 0) throw new Error("下载结果为空");
     const name = files[0];
+    const path = join(dir, name);
+    const size = statSync(path).size;
+    if (size > maxBytes) {
+      throw new Error(`下载资源过大（${Math.ceil(size / 1024 / 1024)}MB，上限 ${Math.ceil(maxBytes / 1024 / 1024)}MB）`);
+    }
     return {
-      bytes: readFileSync(join(dir, name)),
+      bytes: readFileSync(path),
       extension: name.slice(name.lastIndexOf(".")) || "",
     };
   } finally {
@@ -65,10 +72,62 @@ export async function downloadMessageResource(options: {
   }
 }
 
+/** Probe the container duration; return null when ffprobe is unavailable. */
+async function probeDurationSeconds(videoPath: string, ffmpeg: string): Promise<number | null> {
+  const ffprobe = ffmpeg.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
+  try {
+    const { stdout } = await execFileAsync(
+      ffprobe,
+      ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath],
+      { timeout: 15_000, maxBuffer: 64 * 1024 },
+    );
+    const seconds = Number(stdout.trim());
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureFrame(ffmpeg: string, videoPath: string, atSeconds: number, output: string): Promise<void> {
+  const child = spawn(
+    ffmpeg,
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-ss",
+      String(atSeconds),
+      "-i",
+      videoPath,
+      "-frames:v",
+      "1",
+      "-vf",
+      "scale=640:-2",
+      "-q:v",
+      "5",
+      output,
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  const done = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("ffmpeg 退出码 " + code))));
+  });
+  const timeout = new Promise<"timeout">((resolve) => {
+    setTimeout(() => resolve("timeout"), FRAME_TIMEOUT_MS).unref?.();
+  });
+  void done.catch(() => undefined);
+  if ((await Promise.race([done.then(() => "done" as const), timeout])) === "timeout") {
+    child.kill("SIGKILL");
+    throw new Error("ffmpeg 抽帧超时");
+  }
+  await done.catch(() => undefined);
+}
+
 /**
- * Pull a handful of evenly-spaced frames from a video as JPEG buffers so
- * vision-capable providers can "see" it. Scaled down to keep prompt sizes
- * sane; failures degrade to zero frames.
+ * Pull evenly-spaced frames across the whole video as JPEG buffers so
+ * vision-capable providers can "see" more than the opening seconds. Scaled
+ * down to keep prompt sizes sane; failures degrade to zero frames.
  */
 export async function extractVideoFrames(
   videoPath: string,
@@ -77,36 +136,14 @@ export async function extractVideoFrames(
 ): Promise<Buffer[]> {
   const dir = mkdtempSync(join(tmpdir(), "lark-bot-frames-"));
   try {
-    const child = spawn(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        videoPath,
-        "-vf",
-        `fps=1/4,scale=640:-2`,
-        "-frames:v",
-        String(maxFrames),
-        "-q:v",
-        "5",
-        join(dir, "frame-%02d.jpg"),
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
+    const duration = await probeDurationSeconds(videoPath, ffmpeg);
+    const fractions = maxFrames === 1 ? [0.5] : [0.15, 0.5, 0.85];
+    const times = duration
+      ? fractions.slice(0, maxFrames).map((fraction) => duration * fraction)
+      : Array.from({ length: maxFrames }, (_, index) => index * 4);
+    await Promise.allSettled(
+      times.map((seconds, index) => captureFrame(ffmpeg, videoPath, seconds, join(dir, `frame-${index}.jpg`))),
     );
-    const done = new Promise<void>((resolve, reject) => {
-      child.on("error", reject);
-      child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("ffmpeg 退出码 " + code))));
-    });
-    const timeout = new Promise<"timeout">((resolve) => {
-      setTimeout(() => resolve("timeout"), FRAME_TIMEOUT_MS).unref?.();
-    });
-    if ((await Promise.race([done.then(() => "done" as const), timeout])) === "timeout") {
-      child.kill("SIGKILL");
-      return [];
-    }
-    await done.catch(() => undefined);
     return readdirSync(dir)
       .filter((name) => name.endsWith(".jpg"))
       .sort()

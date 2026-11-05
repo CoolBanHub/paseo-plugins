@@ -52,7 +52,7 @@ export function resolveLarkCli(
   }
   try {
     const versionsDir = join(home, ".nvm", "versions", "node");
-    for (const version of readdirSync(versionsDir).sort().reverse()) {
+    for (const version of readdirSync(versionsDir).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))) {
       candidates.push(join(versionsDir, version, "bin", "lark-cli"));
     }
   } catch {
@@ -87,7 +87,7 @@ async function runCli(cliPath: string, args: string[], label: string): Promise<L
   const detail = error?.message
     ? error.message + (error.hint ? " — " + error.hint : "")
     : stderr.trim() || stdout.trim();
-  throw new Error(label + "失败：" + detail.slice(0, 400) || label + "失败：lark-cli 无输出");
+  throw new Error((label + "失败：" + (detail || "lark-cli 无输出")).slice(0, 400));
 }
 
 /** The bot's own open_id (ou_…), used to detect @-mentions of this bot. */
@@ -120,14 +120,16 @@ export interface ApplyCredentialsOptions {
   cliPath: string;
   appId: string;
   appSecret: string;
+  /** App ID currently configured in lark-cli, used to stop its event bus. */
+  previousAppId?: string | null;
   /** Injectable for tests. */
-  fetchImpl?: (url: string, init: { method: string; body: string }) => Promise<{
+  fetchImpl?: (url: string, init: { method: string; body: string; signal?: AbortSignal }) => Promise<{
     ok: boolean;
     status: number;
     json(): Promise<unknown>;
   }>;
   runInit?: (cliPath: string, appId: string, secret: string) => Promise<void>;
-  stopEventBus?: (cliPath: string) => Promise<void>;
+  stopEventBus?: (cliPath: string, appId: string | null) => Promise<void>;
 }
 
 interface TokenResponse {
@@ -158,14 +160,25 @@ export async function applyAppCredentials(options: ApplyCredentialsOptions): Pro
     });
   const stopEventBus =
     options.stopEventBus ??
-    (async (cliPath: string) => {
-      await execFileAsync(cliPath, ["event", "stop"], { timeout: CLI_TIMEOUT_MS }).catch(() => undefined);
+    (async (cliPath: string, previousAppId: string | null) => {
+      const args = ["event", "stop"];
+      if (previousAppId) args.push("--app-id", previousAppId);
+      await execFileAsync(cliPath, args, { timeout: CLI_TIMEOUT_MS }).catch(() => undefined);
     });
 
-  const response = await fetchImpl("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-    method: "POST",
-    body: JSON.stringify({ app_id: options.appId, app_secret: options.appSecret }),
-  });
+  const response = await (async () => {
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), CLI_TIMEOUT_MS);
+    try {
+      return await fetchImpl("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+        method: "POST",
+        body: JSON.stringify({ app_id: options.appId, app_secret: options.appSecret }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(abortTimer);
+    }
+  })();
   const payload = (await response.json()) as TokenResponse;
   if (!response.ok || payload.code !== 0) {
     throw new Error(
@@ -173,35 +186,46 @@ export async function applyAppCredentials(options: ApplyCredentialsOptions): Pro
     );
   }
   await runInit(options.cliPath, options.appId, options.appSecret);
-  // The shared event bus daemon keeps tokens in memory; restart it so the
-  // consumer reconnects with the new credentials.
-  await stopEventBus(options.cliPath);
+  // The shared event bus daemon keeps tokens in memory; stop the old app's bus
+  // so the consumer reconnects with the new credentials.
+  await stopEventBus(options.cliPath, options.previousAppId ?? null);
 }
 
-/** execFile cannot feed stdin; spawn and pipe the secret without argv exposure. */
-async function runWithStdin(cliPath: string, args: string[], stdinData: string): Promise<void> {
+/**
+ * execFile cannot feed stdin; spawn and pipe data without exposing it in argv.
+ * Returns stdout so callers such as message replies can parse the JSON result.
+ */
+async function runWithStdin(cliPath: string, args: string[], stdinData: string): Promise<string> {
   const child = spawn(cliPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
   let stderr = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString("utf8");
+  });
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr += chunk.toString("utf8");
   });
-  const done = new Promise<void>((resolve, reject) => {
+  child.stdin?.on("error", () => {
+    // The child may exit before reading stdin; the exit path reports the error.
+  });
+  const done = new Promise<string>((resolve, reject) => {
     child.on("error", reject);
     child.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error("lark-cli config init 失败：" + stderr.trim().slice(0, 300)));
+      if (code === 0) resolve(stdout);
+      else reject(new Error("lark-cli 执行失败：" + stderr.trim().slice(0, 300)));
     });
   });
-  child.stdin?.write(stdinData);
-  child.stdin?.end();
   const timeout = new Promise<"timeout">((resolve) => {
     setTimeout(() => resolve("timeout"), CLI_TIMEOUT_MS).unref?.();
   });
-  if ((await Promise.race([done.then(() => "done" as const), timeout])) === "timeout") {
+  // Avoid an unhandled rejection if the timeout wins and the child exits later.
+  void done.catch(() => undefined);
+  child.stdin?.end(stdinData);
+  if ((await Promise.race([done.then((value) => value), timeout])) === "timeout") {
     child.kill("SIGTERM");
-    throw new Error("lark-cli config init 超时");
+    throw new Error("lark-cli 执行超时");
   }
-  await done;
+  return await done;
 }
 
 /**
@@ -233,7 +257,7 @@ export interface MessageDetail {
 export async function readMessageDetail(cliPath: string, messageId: string): Promise<MessageDetail | null> {
   const payload = await runCli(
     cliPath,
-    ["im", "+messages-mget", "--message-id", messageId, "--as", "bot", "--format", "json"],
+    ["im", "+messages-mget", "--message-ids", messageId, "--as", "bot", "--format", "json"],
     "读取消息",
   );
   const items = (payload.data as { messages?: unknown } | undefined)?.messages;
@@ -294,14 +318,24 @@ export interface ReplyOptions {
 export async function replyMessage(options: ReplyOptions): Promise<string | null> {
   const args = ["im", "+messages-reply", "--message-id", options.messageId, "--as", "bot"];
   if (options.replyInThread) args.push("--reply-in-thread");
+  let stdin: string;
   if (options.format === "markdown") {
-    args.push("--markdown", options.text);
+    // "-" reads the body from stdin, keeping the reply out of `ps` output.
+    args.push("--markdown", "-");
+    stdin = options.text;
   } else if (options.format === "text") {
-    args.push("--text", options.text);
+    args.push("--text", "-");
+    stdin = options.text;
   } else {
-    args.push("--msg-type", "post", "--content", buildPostContent(options.text));
+    args.push("--msg-type", "post", "--content", "-");
+    stdin = buildPostContent(options.text);
   }
-  const payload = await runCli(options.cliPath, args, "回复消息");
+  const stdout = await runWithStdin(options.cliPath, args, stdin);
+  const payload = parseLarkJson(stdout);
+  if (payload?.ok !== true) {
+    const error = payload?.error;
+    throw new Error("回复消息失败：" + (error?.message || stdout.trim() || "lark-cli 无输出").slice(0, 400));
+  }
   const messageId = (payload.data as { message_id?: unknown } | undefined)?.message_id;
   return typeof messageId === "string" ? messageId : null;
 }

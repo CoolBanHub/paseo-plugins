@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseLarkJson, resolveLarkCli } from "../server/lark.ts";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseLarkJson, replyMessage, resolveLarkCli } from "../server/lark.ts";
 
 describe("parseLarkJson", () => {
   it("parses JSON after leading warnings", () => {
@@ -56,6 +59,23 @@ describe("applyAppCredentials", () => {
     assert.equal(initRan, false, "config init must not run for invalid credentials");
   });
 
+  it("stops the previous app's event bus", async () => {
+    const { applyAppCredentials } = await import("../server/lark.ts");
+    let stoppedApp: string | null = null;
+    await applyAppCredentials({
+      cliPath: "/fake/lark-cli",
+      appId: "cli_new",
+      appSecret: "secret",
+      previousAppId: "cli_old",
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ code: 0 }) }),
+      runInit: async () => {},
+      stopEventBus: async (_cliPath, appId) => {
+        stoppedApp = appId;
+      },
+    });
+    assert.equal(stoppedApp, "cli_old");
+  });
+
   it("writes valid credentials and restarts the event bus", async () => {
     const { applyAppCredentials } = await import("../server/lark.ts");
     const calls: { appId: string; secret: string }[] = [];
@@ -78,5 +98,40 @@ describe("applyAppCredentials", () => {
     });
     assert.deepEqual(calls, [{ appId: "cli_good", secret: "secret" }]);
     assert.equal(busStopped, true);
+  });
+});
+
+describe("replyMessage", () => {
+  it("feeds the reply through stdin instead of argv", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-reply-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+let stdin = "";
+process.stdin.on("data", (chunk) => { stdin += chunk; });
+process.stdin.on("end", () => {
+  if (!args.includes("--markdown") || !args.includes("-") || stdin !== "多行回复") {
+    console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv/stdin" } }));
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ ok: true, data: { message_id: "om_x" } }));
+});
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const messageId = await replyMessage({
+        cliPath: cli,
+        messageId: "om_trigger",
+        text: "多行回复",
+        format: "markdown",
+        replyInThread: true,
+      });
+      assert.equal(messageId, "om_x");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

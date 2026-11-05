@@ -184,7 +184,10 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       if (result.status === "saved") {
         setRevision(result.revision);
         const parsed = botValuesSchema.safeParse(result.values ?? {});
-        if (parsed.success) setLoaded(parsed.data);
+        if (parsed.success) {
+          setLoaded(parsed.data);
+          setDraft(parsed.data);
+        }
         toast.show("已保存，机器人设置已生效");
         void refreshStatus();
       } else if (result.status === "conflict") {
@@ -282,21 +285,24 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             </View>
 
             <FieldLabel text="Provider" />
-            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-              {(providers.length > 0
-                ? providers
-                : [{ id: binding.provider || "（刷新拉取列表）", label: binding.provider || "（刷新拉取列表）" }]
-              ).map((provider) => (
-                <ChoicePill
-                  key={provider.id}
-                  label={provider.label}
-                  active={binding.provider === provider.id}
-                  onPress={() => patchBinding(binding.chatId, { provider: provider.id })}
-                />
-              ))}
-            </View>
+            {providers.length > 0 ? (
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                {providers.map((provider) => (
+                  <ChoicePill
+                    key={provider.id}
+                    label={provider.label}
+                    active={binding.provider === provider.id}
+                    onPress={() => patchBinding(binding.chatId, { provider: provider.id })}
+                  />
+                ))}
+              </View>
+            ) : (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                未获取到 provider 列表，请先点顶部「刷新」。
+              </Text>
+            )}
 
-            <FieldLabel text="工作目录（空 = 用户主目录）" />
+            <FieldLabel text="工作目录（空 = 用户主目录；支持 ~/ 开头）" />
             <TextInput
               value={binding.cwd}
               placeholder="~/Workspace/project"
@@ -308,7 +314,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             <FieldLabel text="系统提示（可选，追加在该会话的指令前）" />
             <TextInput
               value={binding.systemPrompt}
-              placeholder="例：你是项目维护的运维助手，用中文回答"
+              placeholder="例：你是项目维护助手，用中文回答"
               placeholderTextColor={colors().foregroundMuted}
               multiline
               onChangeText={(text) => patchBinding(binding.chatId, { systemPrompt: text })}
@@ -347,7 +353,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       <Card>
         <CardTitle
           text="飞书应用凭证"
-          hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（本机明文存储）"
+          hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
         />
         <FieldLabel text="App ID（cli_ 开头）" />
         <TextInput
@@ -373,7 +379,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
         ) : null}
         <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-          已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存，之后这里会一直明文显示这份值。
+          已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存。按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示；请确保本机账户与备份安全。
         </Text>
       </Card>
 
@@ -405,6 +411,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           hint="收到 @ 消息立即回复一条「收到，正在处理」，处理完成后再回结果"
           value={draft.ackOnReceive}
           onChange={(value) => patchDraft({ ackOnReceive: value })}
+        />
+        <ToggleRow
+          label="权限请求通知到群"
+          hint="默认关闭；开启后权限请求会发到话题，仍需在 Paseo 客户端批准"
+          value={draft.notifyPermission}
+          onChange={(value) => patchDraft({ notifyPermission: value })}
         />
         <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
         <TextInput

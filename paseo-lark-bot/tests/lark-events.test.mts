@@ -138,6 +138,15 @@ describe("createEventConsumer", () => {
     assert.equal(h.events.length, 2);
   });
 
+  it("retries when spawn fails without an exit event", () => {
+    const h = makeHarness();
+    h.consumer.start();
+    h.processes[0].emit("error", new Error("spawn lark-cli ENOENT"));
+    assert.equal(h.consumer.status().state, "retrying");
+    assert.equal(h.timers.length, 1);
+    assert.ok(h.consumer.status().lastError?.includes("ENOENT"));
+  });
+
   it("restarts with backoff after an unexpected exit", async () => {
     const h = makeHarness();
     h.consumer.start();

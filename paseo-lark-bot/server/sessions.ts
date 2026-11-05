@@ -1,5 +1,15 @@
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ChatBinding } from "../shared/settings.ts";
+
+/** Expand a leading `~`; empty cwd still means the user's home directory. */
+function resolveCwd(cwd: string): string {
+  const trimmed = cwd.trim();
+  if (!trimmed) return homedir();
+  if (trimmed === "~") return homedir();
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) return join(homedir(), trimmed.slice(2));
+  return trimmed;
+}
 
 /** Minimal structural slice of PaseoApi so tests can inject fakes. */
 export interface SessionImage {
@@ -21,7 +31,9 @@ export interface SessionRunResult {
 
 /** Minimal timeline slice for fallback reply lookups. */
 export interface SessionTimelineHandle {
-  refetch(options?: { limit?: number }): Promise<{ entries?: { type?: string; text?: string }[] }>;
+  refetch(options?: { limit?: number }): Promise<{
+    entries?: { item?: { type?: string; text?: string } }[];
+  }>;
 }
 
 export interface SessionPaseoApi {
@@ -83,11 +95,22 @@ interface TopicState {
   lastSeenMessageId: string | null;
   /** run()'s lastMessage for the most recent idle turn, a reply fallback. */
   lastRunText: string | null;
+  /** Monotonic token of the turn currently owning the topic. */
+  activeTurn: number | null;
+  turnCounter: number;
+  /** Fires if run() returns idle but turn_ended never arrives. */
+  turnFallback: ReturnType<typeof setTimeout> | null;
 }
 
 const RUN_TIMEOUT_MS = 10 * 60_000;
 /** If a turn never ends (stuck provider), give up waiting and rebuild. */
 const STUCK_BUSY_MS = 30 * 60_000;
+/** Give turn_ended a short window after run() resolves before synthesizing it. */
+const DEFAULT_TURN_FALLBACK_MS = 5_000;
+/** Hard cap for queued messages per topic; prevents unbounded group spam. */
+const MAX_QUEUE_PER_TOPIC = 20;
+/** Bound topic state for long-running daemons. */
+const MAX_TOPICS = 500;
 const TITLE_SNIPPET = 16;
 
 export interface SessionCallbacks {
@@ -122,16 +145,30 @@ export function createSessionRegistry(options: {
    */
   fetchLastReply?: (agentId: string) => Promise<string | null>;
   now?: () => number;
+  /** Grace period for a missing turn_ended after run() resolves idle. */
+  turnFallbackMs?: number;
 }) {
   const resolveProvider = options.resolveProvider ?? (async (provider: string) => provider);
   const fetchLastReply = options.fetchLastReply ?? (async () => null);
   const now = options.now ?? Date.now;
+  const turnFallbackMs = options.turnFallbackMs ?? DEFAULT_TURN_FALLBACK_MS;
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
+  /** turn_ended can arrive before agents.create() resolves and maps the id. */
+  const deferredTurnEnds = new Map<string, TurnOutcome>();
 
   function stateFor(topicKey: string, chatId: string): TopicState {
     let state = topics.get(topicKey);
     if (!state) {
+      if (topics.size >= MAX_TOPICS) {
+        for (const [key, candidate] of topics) {
+          if (!candidate.busy && candidate.queue.length === 0) {
+            if (candidate.agentId) agentToTopic.delete(candidate.agentId);
+            topics.delete(key);
+            break;
+          }
+        }
+      }
       state = {
         chatId,
         agentId: null,
@@ -143,6 +180,9 @@ export function createSessionRegistry(options: {
         lastActivityAt: 0,
         lastSeenMessageId: null,
         lastRunText: null,
+        activeTurn: null,
+        turnCounter: 0,
+        turnFallback: null,
       };
       topics.set(topicKey, state);
     }
@@ -168,9 +208,17 @@ export function createSessionRegistry(options: {
     // lastActivityAt stays at the previous turn's end here so ensureAgent can
     // measure the real idle window; drain() refreshes it once a turn starts.
     state.lastSeenMessageId = messageId;
+    if (state.queue.length >= MAX_QUEUE_PER_TOPIC) {
+      options.callbacks.onNotice(state.chatId, messageId, "当前话题排队消息过多，请稍后再试。");
+      return;
+    }
     if (state.busy && state.busySince !== null && now() - state.busySince > STUCK_BUSY_MS) {
       // The previous turn looks stuck; drop the session and start over.
+      const stuckTarget = state.pendingTargets[0] ?? state.lastSeenMessageId;
       options.callbacks.log?.(`topic ${topicKey} busy for too long; rebuilding session`);
+      if (stuckTarget) {
+        options.callbacks.onNotice(state.chatId, stuckTarget, "上一轮处理超时，已重建会话；你的消息会继续排队处理。");
+      }
       resetTopic(topicKey);
     }
     state.queue.push({ messageId, prompt, binding, images });
@@ -180,6 +228,13 @@ export function createSessionRegistry(options: {
   function setBusy(state: TopicState, busy: boolean): void {
     state.busy = busy;
     state.busySince = busy ? now() : null;
+    if (!busy) {
+      state.activeTurn = null;
+      if (state.turnFallback) {
+        clearTimeout(state.turnFallback);
+        state.turnFallback = null;
+      }
+    }
   }
 
   function resetTopic(topicKey: string): void {
@@ -188,6 +243,10 @@ export function createSessionRegistry(options: {
     if (state.agentId) agentToTopic.delete(state.agentId);
     state.agentId = null;
     state.handle = null;
+    // The old turn is abandoned: its pending targets must not be consumed by
+    // the next turn. Keep the queue itself so newly arrived messages survive.
+    state.pendingTargets = [];
+    state.lastRunText = null;
     setBusy(state, false);
   }
 
@@ -197,21 +256,34 @@ export function createSessionRegistry(options: {
     const item = state.queue.shift();
     if (!item) return;
 
+    // Only turn_ended (or the fallback timer) may finish this turn. The run()
+    // promise resolving idle is not authoritative: turn_ended can arrive
+    // before or after it, and releasing on both would drain the queue twice.
+    const turn = ++state.turnCounter;
     setBusy(state, true);
+    state.activeTurn = turn;
     try {
       // ensureAgent() passes the prompt to agents.create() for fresh sessions,
       // which already starts the first turn — running it again would duplicate
       // the message. lastActivityAt refreshes only after the idle check so the
       // window measures the real gap since the previous turn.
       const { handle, created } = await ensureAgent(topicKey, item);
+      if (state.activeTurn !== turn) return;
       state.lastActivityAt = now();
       agentToTopic.set(handle.id, topicKey);
       state.pendingTargets.push(item.messageId);
       if (created) {
-        // The first turn is driven by create(); wait for turn_ended.
+        // The first turn is driven by create(); wait for turn_ended. If the
+        // completion raced ahead of the mapping, replay it now.
+        const deferred = deferredTurnEnds.get(handle.id);
+        if (deferred) {
+          deferredTurnEnds.delete(handle.id);
+          void handleTurnEnded(handle.id, deferred);
+        }
         return;
       }
       const result = await handle.run(item.prompt, { timeoutMs: RUN_TIMEOUT_MS, images: item.images });
+      if (state.activeTurn !== turn) return;
       if (result.status === "error") {
         // The turn failed before any turn_ended reply can be expected.
         const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
@@ -243,12 +315,12 @@ export function createSessionRegistry(options: {
         // Waiting on the user in the Paseo client; turn_ended replies later.
         return;
       }
-      // idle: the turn finished. turn_ended normally arrived already and
-      // released the queue; if it is still in flight the next drain runs on it.
+      // idle: wait briefly for turn_ended. If it never arrives, synthesize the
+      // completion from run()'s lastMessage so the queue is not stuck forever.
       state.lastRunText = result.lastMessage?.trim() || null;
-      setBusy(state, false);
-      drain(topicKey);
+      scheduleTurnFallback(topicKey, turn);
     } catch (error) {
+      if (state.activeTurn !== turn) return;
       const message = error instanceof Error ? error.message : String(error);
       options.callbacks.log?.(`topic ${topicKey} turn failed: ${message}`);
       const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
@@ -258,6 +330,24 @@ export function createSessionRegistry(options: {
       resetTopic(topicKey);
       drain(topicKey);
     }
+  }
+
+  function scheduleTurnFallback(topicKey: string, turn: number): void {
+    const state = topics.get(topicKey);
+    if (!state) return;
+    if (state.turnFallback) clearTimeout(state.turnFallback);
+    const timer = setTimeout(() => {
+      state.turnFallback = null;
+      if (state.activeTurn !== turn || !state.busy || !state.agentId) return;
+      options.callbacks.log?.(`topic ${topicKey} turn_ended missing; using run() result`);
+      void handleTurnEnded(state.agentId, {
+        outcome: "completed",
+        lastText: state.lastRunText,
+        lastError: null,
+      });
+    }, turnFallbackMs);
+    timer.unref?.();
+    state.turnFallback = timer;
   }
 
   async function ensureAgent(
@@ -275,7 +365,7 @@ export function createSessionRegistry(options: {
         provider: await resolveProvider(item.binding.provider),
         ...(item.binding.systemPrompt ? { systemPrompt: item.binding.systemPrompt } : {}),
       },
-      cwd: item.binding.cwd || homedir(),
+      cwd: resolveCwd(item.binding.cwd),
       title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
@@ -292,9 +382,26 @@ export function createSessionRegistry(options: {
    */
   async function handleTurnEnded(agentId: string, outcome: TurnOutcome): Promise<void> {
     const topicKey = agentToTopic.get(agentId);
-    if (!topicKey) return;
+    if (!topicKey) {
+      // create() is still in flight; replay this completion when the id maps.
+      if (deferredTurnEnds.size >= 50) {
+        const oldest = deferredTurnEnds.keys().next().value;
+        if (oldest) deferredTurnEnds.delete(oldest);
+      }
+      deferredTurnEnds.set(agentId, outcome);
+      return;
+    }
     const state = topics.get(topicKey);
-    if (!state) return;
+    // Ignore manual Paseo turns and duplicate/late completions. Only a turn
+    // currently owned by this plugin may release the queue.
+    if (!state || !state.busy || state.activeTurn === null) return;
+    // Capture and clear the token before any await so a late fallback or a
+    // duplicate turn_ended cannot release the next turn as well.
+    state.activeTurn = null;
+    if (state.turnFallback) {
+      clearTimeout(state.turnFallback);
+      state.turnFallback = null;
+    }
     const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
 
     // turn_ended timelines occasionally miss the final assistant text
@@ -327,6 +434,13 @@ export function createSessionRegistry(options: {
     return topicKey ? (topics.get(topicKey)?.chatId ?? null) : null;
   }
 
+  /** Reply target for notices about this agent (its own topic, not the chat). */
+  function targetForAgent(agentId: string): string | null {
+    const topicKey = agentToTopic.get(agentId);
+    const state = topicKey ? topics.get(topicKey) : undefined;
+    return state?.pendingTargets[0] ?? state?.lastSeenMessageId ?? null;
+  }
+
   function status(): ChatSessionStatus[] {
     return [...topics.entries()].map(([topicKey, state]) => ({
       chatId: state.chatId,
@@ -343,6 +457,7 @@ export function createSessionRegistry(options: {
     handleTurnEnded,
     ownsAgent,
     chatIdForAgent,
+    targetForAgent,
     status,
   };
 }
