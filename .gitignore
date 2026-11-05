@@ -17,4 +17,5 @@ artifacts/acceptance/
 .DS_Store
 .idea/
 .vscode/
+.zcode/
 *.swp
