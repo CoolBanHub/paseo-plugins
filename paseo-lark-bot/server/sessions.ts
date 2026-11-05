@@ -234,14 +234,14 @@ export function createSessionRegistry(options: {
     prompt: string,
     binding: ChatBinding,
     images?: SessionImage[],
-  ): void {
+  ): boolean {
     const state = stateFor(topicKey, chatId);
     // lastActivityAt stays at the previous turn's end here so ensureAgent can
     // measure the real idle window; drain() refreshes it once a turn starts.
     state.lastSeenMessageId = messageId;
     if (state.queue.length >= MAX_QUEUE_PER_TOPIC) {
       options.callbacks.onNotice(state.chatId, messageId, "当前话题排队消息过多，请稍后再试。");
-      return;
+      return false;
     }
     if (state.busy && state.busySince !== null && now() - state.busySince > STUCK_BUSY_MS) {
       // The previous turn looks stuck; drop the session and start over.
@@ -254,6 +254,7 @@ export function createSessionRegistry(options: {
     }
     state.queue.push({ messageId, prompt, binding, images });
     drain(topicKey);
+    return true;
   }
 
   function setBusy(state: TopicState, busy: boolean): void {
@@ -470,6 +471,14 @@ export function createSessionRegistry(options: {
     return state?.pendingTargets[0] ?? state?.lastSeenMessageId ?? null;
   }
 
+  /** True when the next message will start a fresh agent (no reusable context). */
+  function needsRebuild(topicKey: string): boolean {
+    const state = topics.get(topicKey);
+    if (!state?.handle) return true;
+    const idleMs = options.getIdleMs();
+    return idleMs > 0 && now() - state.lastActivityAt > idleMs;
+  }
+
   function status(): ChatSessionStatus[] {
     return [...topics.entries()].map(([topicKey, state]) => ({
       chatId: state.chatId,
@@ -487,6 +496,7 @@ export function createSessionRegistry(options: {
     ownsAgent,
     chatIdForAgent,
     targetForAgent,
+    needsRebuild,
     status,
   };
 }

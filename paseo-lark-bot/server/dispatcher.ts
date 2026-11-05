@@ -108,12 +108,13 @@ export function createDispatcher(options: DispatcherOptions) {
   const threadRootCache = new Map<string, MessageDetail | null>();
   /**
    * Every group message the event stream delivers lands here — including
-   * messages that do not mention the bot — so later @-mentions inside the
-   * thread can be answered with the full conversation as context. Bounded
-   * per topic; lost on daemon restart (the root fallback covers the topic
-   * subject via the messages-mget API).
+   * messages that do not mention the bot — so a later @ can be answered with
+   * the messages since the previous trigger. Bounded per topic; lost on
+   * daemon restart (the root fallback covers the topic subject).
    */
   const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
+  /** Last message that actually triggered a bot turn, per topic. */
+  const lastTriggerMessage = new Map<string, string>();
   /** Images collected per topic (downloads of image posts + video frames). */
   const topicImages = new Map<string, SessionImage[]>();
   /**
@@ -445,17 +446,19 @@ export function createDispatcher(options: DispatcherOptions) {
         images.length > 0
           ? prompt + "\n\n【附图】本消息附加 " + images.length + " 张图片（含视频关键帧），请结合图片内容回答。"
           : prompt;
-      sessions.enqueue(topicKey, event.chat_id, event.message_id, finalPrompt, decision.binding, images);
+      if (sessions.enqueue(topicKey, event.chat_id, event.message_id, finalPrompt, decision.binding, images)) {
+        lastTriggerMessage.set(topicKey, event.message_id);
+        pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, topicKey);
+      }
     } catch (error) {
       log("处理消息失败", error instanceof Error ? error.message : String(error));
     }
   }
 
   /**
-   * A reply inside a thread usually refers to earlier messages ("你查一下"
-   * → the thread topic), so prepend the recorded thread conversation as
-   * context: every message seen in this thread (mentioned or not) plus the
-   * root text fetched from the API when the in-memory history misses it.
+   * First @ in a topic gets the root subject plus the recorded history; later
+   * @s only get messages after the previous trigger because the agent already
+   * holds the earlier turns. A rebuilt/expired agent is treated as a first @.
    */
   async function withThreadContext(
     cliPath: string,
@@ -466,22 +469,62 @@ export function createDispatcher(options: DispatcherOptions) {
     const history = (topicHistory.get(historyKey) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
     );
-    if (event.chat_type === "p2p") {
-      if (history.length === 0) return { text: prompt, hasContext: false };
-      const transcript = history
+    // A fresh/expired agent has no prior turns in its own context, so treat
+    // this as the first message and include the topic root/history again.
+    if (sessions.needsRebuild(historyKey)) lastTriggerMessage.delete(historyKey);
+    const previousTrigger = lastTriggerMessage.get(historyKey);
+    const previousIndex = previousTrigger
+      ? history.findIndex((entry) => entry.messageId === previousTrigger)
+      : -1;
+    const incremental = previousTrigger
+      ? previousIndex >= 0
+        ? history.slice(previousIndex + 1)
+        : history
+      : history;
+    const transcriptOf = (entries: typeof history): string =>
+      entries
         .slice(-20)
         .map((entry) => entry.senderType + ": " + clipContext(entry.text))
         .join("\n");
+
+    // p2p has no thread root; one chat is one conversation. Only inject what
+    // arrived since the previous bot turn, because the agent already has the
+    // earlier turns in its own context.
+    if (event.chat_type === "p2p") {
+      if (previousTrigger) {
+        const transcript = transcriptOf(incremental);
+        if (!transcript) return { text: prompt, hasContext: true };
+        return {
+          text: "【上次消息之后】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
+          hasContext: true,
+        };
+      }
+      if (history.length === 0) return { text: prompt, hasContext: false };
       return {
-        text: "【最近对话】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
+        text: "【最近对话】\n" + transcriptOf(history) + (prompt ? "\n\n【本次消息】" + prompt : ""),
         hasContext: true,
       };
     }
+
+    // A second (or later) @ in the same topic must not repeat the topic root
+    // or the whole history. The agent already has those from its previous
+    // turns; only the conversation since the last trigger is new.
+    if (previousTrigger) {
+      const transcript = transcriptOf(incremental);
+      if (!transcript) return { text: prompt, hasContext: true };
+      return {
+        text: "【上次消息之后】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
+        hasContext: true,
+      };
+    }
+
     const rootId = event.root_id || event.reply_to;
     if (!rootId) return { text: prompt, hasContext: false };
     let rootText: string | null = null;
     const rootInHistory = history.length > 0 && history[0]?.messageId === rootId;
-    if (!rootInHistory) {
+    if (rootInHistory) {
+      rootText = history[0]?.text ?? null;
+    } else {
       let detail: MessageDetail | null;
       if (threadRootCache.has(rootId)) {
         detail = threadRootCache.get(rootId) ?? null;
@@ -506,10 +549,9 @@ export function createDispatcher(options: DispatcherOptions) {
     }
     const lines: string[] = [];
     if (rootText && rootText !== prompt) lines.push("【话题主题】" + rootText);
-    const prior = rootInHistory ? history : history.filter((entry) => entry.messageId !== rootId);
-    if (prior.length > 1 || (prior.length === 1 && !rootText)) {
-      // senderType carries the stable per-sender label (机器人 / 成员A / 真名).
-      const transcript = prior.map((entry) => entry.senderType + ": " + clipContext(entry.text)).join("\n");
+    const prior = history.filter((entry) => entry.messageId !== rootId);
+    if (prior.length > 0) {
+      const transcript = transcriptOf(prior);
       if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
     }
     if (lines.length === 0) return { text: prompt, hasContext: false };

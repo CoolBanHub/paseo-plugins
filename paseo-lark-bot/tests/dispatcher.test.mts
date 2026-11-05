@@ -243,7 +243,7 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.created.length, 1);
     const prompt = h.created[0].prompt ?? "";
-    assert.ok(prompt.includes("成员A: 看看这个报错"), prompt);
+    assert.ok(prompt.includes("【话题主题】看看这个报错"), prompt);
     assert.ok(prompt.includes("成员B: [图片]"), prompt);
   });
 
@@ -458,7 +458,7 @@ describe("p2p and delivery hygiene", () => {
     await flush();
     assert.equal(h.created.length, 1, "p2p must reuse the chat agent");
     const prompt = h.runCalls[0]?.text ?? "";
-    assert.ok(prompt.includes("【最近对话】") || prompt.includes("第一条"), prompt);
+    assert.equal(prompt, "继续", "the agent already has the previous p2p turn");
   });
 
   it("ignores duplicate deliveries of the same message_id", async () => {
@@ -470,6 +470,29 @@ describe("p2p and delivery hygiene", () => {
     await flush();
     assert.equal(h.created.length, 1);
     assert.equal(h.dispatch.status().sessions[0]?.queued, 0);
+  });
+
+  it("only adds messages after the previous trigger on a later @", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_root", content: "@测试机器人 第一问" }));
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "答一"));
+    await flush();
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_mid", root_id: "om_root", content: "中间补充", mentions: [] }),
+    );
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_second", root_id: "om_root", content: "@测试机器人 第二问" }),
+    );
+    await flush();
+
+    const prompt = h.runCalls[0]?.text ?? "";
+    assert.ok(prompt.includes("中间补充"), prompt);
+    assert.ok(prompt.includes("第二问"), prompt);
+    assert.ok(!prompt.includes("【话题主题】"), prompt);
+    assert.ok(!prompt.includes("第一问"), prompt);
+    assert.ok(prompt.includes("【上次消息之后】"), prompt);
   });
 
   it("waits for a slow image ingest before the next @ in the same topic", async () => {
