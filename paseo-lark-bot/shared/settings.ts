@@ -1,5 +1,4 @@
 import { defineSettings, settingsRpc } from "@getpaseo/plugin";
-import { homedir } from "node:os";
 import { z } from "zod";
 
 /**
@@ -24,8 +23,12 @@ export const chatBindingSchema = z.object({
   chatName: z.string().default(""),
   /** Paseo provider id, optionally `provider/model`. */
   provider: z.string().min(1),
-  /** Working directory for the agent session. */
-  cwd: z.string().default(homedir()),
+  /**
+   * Working directory for the agent session; empty means the user's home
+   * directory (resolved server-side — this shared bundle cannot import
+   * node:os because the client loads it too).
+   */
+  cwd: z.string().default(""),
   /** Optional extra system prompt prepended for this chat. */
   systemPrompt: z.string().default(""),
   replyFormat: replyFormatSchema.default("markdown"),

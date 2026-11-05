@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import type { ChatBinding } from "../shared/settings.ts";
 
 /** Minimal structural slice of PaseoApi so tests can inject fakes. */
@@ -223,7 +224,7 @@ export function createSessionRegistry(options: {
         provider: item.binding.provider,
         ...(item.binding.systemPrompt ? { systemPrompt: item.binding.systemPrompt } : {}),
       },
-      cwd: item.binding.cwd,
+      cwd: item.binding.cwd || homedir(),
       title: `飞书 · ${item.binding.chatName || chatId}`,
       labels: { "lark-bot-chat": chatId },
       prompt: item.prompt,
