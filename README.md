@@ -10,6 +10,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 | [`paseo-git/`](paseo-git/) | `git-manager` | IDEA 风格的 Git 面板：左侧分支 / 标签 / Worktree 树，右侧提交图谱（车道着色、合并斜线、徽章）与提交详情，筛选条（分支 / 作者 / 日期 / 路径 / 文本），fetch / pull，以及可配置的网络代理设置 | `git` 在 PATH 上 |
 | [`paseo-zcode/`](paseo-zcode/) | `zcode` | 通过本地 `zcode app-server --stdio` 协议把 ZCode（GLM）接入 Paseo，会话与桌面端共享；附带智谱 Coding Plan 配额的用量展示 | macOS + ZCode 桌面端（`zcode login`） |
 | [`paseo-lark-notify/`](paseo-lark-notify/) | `lark-notify` | 把「需要你确认」与「会话结束」通过 `lark-cli` 以机器人身份私聊发到飞书，覆盖 Paseo 内所有 provider | `lark-cli`（已登录，机器人可私聊） |
+| [`paseo-lark-bot/`](paseo-lark-bot/) | `lark-bot` | 飞书群机器人接入 Paseo：按会话绑定 provider，群里 @ 机器人（或单聊直发）即由对应智能体处理并以话题回复返回；权限请求通知到群、在 Paseo 内处理 | `lark-cli`（长连接事件订阅 + 机器人入群，详见 OVERVIEW） |
 | [`paseo-claude-models/`](paseo-claude-models/) | `claude-models` | 把自有 API Key 的模型（DeepSeek、GLM、Kimi、通义千问及任意 Anthropic / OpenAI 兼容端点）注入 Claude provider 的模型选择器：会话经内置本机代理桥按所选模型路由到对应厂商，Anthropic 协议直通、OpenAI Chat 协议自动转换 | 各厂商 API Key（或自建 vLLM / Ollama 等端点）、Claude provider 可用 |
 
 每个插件目录内都有各自的 `OVERVIEW.md`，详细说明架构、能力边界、环境要求与已知限制。
@@ -24,6 +25,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 | [paseo-claude-models/](paseo-claude-models/) | `claude-models` | Claude 自定义模型 | `>=0.11.4` | `0.12.0` | — |
 | [paseo-dsh/](paseo-dsh/) | `dsh` | dsh (DeepSeek) | `>=0.12.0` | `0.12.0` | `>=22.15.0` |
 | [paseo-git/](paseo-git/) | `git-manager` | Git 管理 | `>=0.11.4` | `0.11.4` | — |
+| [paseo-lark-bot/](paseo-lark-bot/) | `lark-bot` | 飞书机器人 | `>=0.11.4` | `0.12.0` | — |
 | [paseo-lark-notify/](paseo-lark-notify/) | `lark-notify` | 飞书通知 | `>=0.11.4` | `0.12.0` | — |
 | [paseo-zcode/](paseo-zcode/) | `zcode` | ZCode（GLM） | `>=0.11.4` | `0.11.4` | — |
 <!-- plugin-requirements:end -->
@@ -32,7 +34,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 
 ## 安装
 
-在 Paseo 中把这些目录作为本地插件添加（Paseo 设置 > Plugins > 添加本地插件，指向对应插件目录），或直接把本仓库克隆到 Paseo 的插件目录。插件 ID 分别为 `dsh`、`git-manager`、`zcode`、`lark-notify`、`claude-models`。
+在 Paseo 中把这些目录作为本地插件添加（Paseo 设置 > Plugins > 添加本地插件，指向对应插件目录），或直接把本仓库克隆到 Paseo 的插件目录。插件 ID 分别为 `dsh`、`git-manager`、`zcode`、`lark-notify`、`lark-bot`、`claude-models`。
 
 ## 开发
 
