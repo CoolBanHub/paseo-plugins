@@ -1,13 +1,23 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { BotSettingsScreen } from "./client/BotSettingsScreen.tsx";
+import { BotCenterSurface } from "./client/BotCenter.tsx";
 
-// The bot runs entirely host-side; the client only contributes the settings
-// screen that binds Feishu chats to Paseo providers.
+// The bot runs entirely host-side; the client contributes a standalone
+// management surface with a sidebar entry, like team-work's admin screens.
 export default function contribute(client: PluginClientContext) {
-  return client.addSettingsScreen({
-    id: "lark-bot",
-    title: "飞书机器人",
-    icon: "MessageCircle",
-    Component: BotSettingsScreen,
-  });
+  const stops = [
+    client.addSurface("lark-bot", BotCenterSurface),
+    client.addSidebarItem({ id: "lark-bot", title: "飞书机器人", icon: "MessageCircle", surface: "lark-bot" }),
+    client.addCommandCenterItem({
+      id: "open-lark-bot",
+      title: "打开飞书机器人",
+      icon: "MessageCircle",
+      context: "global",
+      onSelect({ openSurface }) {
+        openSurface("lark-bot");
+      },
+    }),
+  ];
+  return () => {
+    for (const stop of stops.reverse()) stop();
+  };
 }
