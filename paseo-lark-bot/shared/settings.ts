@@ -57,6 +57,12 @@ export const botValuesSchema = z.object({
   notifyUnmatched: z.boolean().default(false),
   /** Ack each received message so senders see it was picked up. */
   ackOnReceive: z.boolean().default(true),
+  /**
+   * Post permission requests to the chat. Off by default: requests are
+   * resolved in the Paseo client, and the finished answer still returns to
+   * the thread, so the extra notice is noise for most workflows.
+   */
+  notifyPermission: z.boolean().default(false),
   chats: z.array(chatBindingSchema).default([]),
 });
 

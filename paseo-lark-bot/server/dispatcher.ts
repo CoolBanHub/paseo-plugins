@@ -1,6 +1,6 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { LarkMessageEvent } from "./lark-events.ts";
-import { readBotOpenId, replyMessage, resolveLarkCli } from "./lark.ts";
+import { readBotOpenId, readMessageText, replyMessage, resolveLarkCli } from "./lark.ts";
 import {
   appendFooter,
   clipReply,
@@ -29,6 +29,8 @@ export interface DispatcherOptions {
     format: ReplyFormat;
     replyInThread: boolean;
   }) => Promise<string | null>;
+  /** Injectable thread-root lookup for tests. */
+  readThreadRoot?: (cliPath: string, messageId: string) => Promise<string | null>;
   log?: (message: string, detail?: unknown) => void;
 }
 
@@ -47,6 +49,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const resolveCli = options.resolveCli || ((explicit: string) => resolveLarkCli(explicit));
   const readOpenId = options.readOpenId || readBotOpenId;
   const reply = options.reply || replyMessage;
+  const readThreadRoot = options.readThreadRoot || readMessageText;
   const log =
     options.log ||
     ((message: string, detail?: unknown) => {
@@ -59,6 +62,8 @@ export function createDispatcher(options: DispatcherOptions) {
   // Latest inbound message per chat: fallback reply target for notices.
   const latestSeen = new Map<string, string>();
   const unmatchedRecent = new Map<string, { chatId: string; chatType: string; lastSeenAt: number }>();
+  // Thread roots rarely change; cache their text to avoid repeated mgets.
+  const threadRootCache = new Map<string, string | null>();
 
   // The idle window is read through a getter so settings edits apply without
   // rebuilding the registry.
@@ -67,6 +72,7 @@ export function createDispatcher(options: DispatcherOptions) {
     appSecret: "",
     larkCliPath: "",
     ackOnReceive: true,
+    notifyPermission: false,
     replyInThread: true,
     sessionIdleMinutes: 30,
     maxReplyChars: 4000,
@@ -143,10 +149,38 @@ export function createDispatcher(options: DispatcherOptions) {
       if (values.ackOnReceive) {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
-      sessions.enqueue(topicKey, event.chat_id, event.message_id, decision.prompt, decision.binding);
+      const prompt = await withThreadContext(cliPath, event, decision.prompt);
+      sessions.enqueue(topicKey, event.chat_id, event.message_id, prompt, decision.binding);
     } catch (error) {
       log("处理消息失败", error instanceof Error ? error.message : String(error));
     }
+  }
+
+  /**
+   * A reply inside a thread usually refers to the thread's topic ("你查一下"
+   * → the root message), so prepend the root text as context. Root lookups
+   * are cached; failures degrade to the bare reply text.
+   */
+  async function withThreadContext(cliPath: string, event: LarkMessageEvent, prompt: string): Promise<string> {
+    if (!event.root_id) return prompt;
+    let rootText: string | null;
+    if (threadRootCache.has(event.root_id)) {
+      rootText = threadRootCache.get(event.root_id) ?? null;
+    } else {
+      try {
+        rootText = await readThreadRoot(cliPath, event.root_id);
+      } catch (error) {
+        log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
+        rootText = null;
+      }
+      threadRootCache.set(event.root_id, rootText);
+      if (threadRootCache.size > 100) {
+        const oldest = threadRootCache.keys().next().value;
+        if (oldest) threadRootCache.delete(oldest);
+      }
+    }
+    if (!rootText || rootText === prompt) return prompt;
+    return "【话题主题】" + rootText + "\n\n【本次消息】" + prompt;
   }
 
   function rememberUnmatched(event: LarkMessageEvent): void {
@@ -188,6 +222,7 @@ export function createDispatcher(options: DispatcherOptions) {
     ).trim();
     void (async () => {
       const values = await currentValues();
+      if (!values.notifyPermission) return;
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
       await send(

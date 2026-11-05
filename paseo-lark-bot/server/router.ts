@@ -50,8 +50,12 @@ export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpen
 export function extractPrompt(event: LarkMessageEvent): string {
   let text = event.content ?? "";
   for (const mention of event.mentions ?? []) {
-    if (mention.key) {
-      text = text.split(mention.key).join(" ");
+    // The CLI pre-renders mentions two ways: the raw placeholder key
+    // (@_user_N) or the display name (@测试机器人); strip both.
+    for (const form of [mention.key, mention.name ? "@" + mention.name : null]) {
+      if (form) {
+        text = text.split(form).join(" ");
+      }
     }
   }
   // Replaced mentions leave consecutive spaces; collapse horizontal

@@ -109,6 +109,13 @@ describe("extractPrompt", () => {
     assert.equal(prompt, "转给 看看");
   });
 
+  it("strips pre-rendered @name mentions", () => {
+    const prompt = extractPrompt(
+      event({ content: "@测试机器人 帮我看看这个问题" }),
+    );
+    assert.equal(prompt, "帮我看看这个问题");
+  });
+
   it("keeps p2p text as-is", () => {
     const prompt = extractPrompt(event({ content: "  直接提问  ", mentions: undefined }));
     assert.equal(prompt, "直接提问");

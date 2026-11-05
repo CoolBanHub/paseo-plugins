@@ -204,6 +204,20 @@ async function runWithStdin(cliPath: string, args: string[], stdinData: string):
   await done;
 }
 
+/** Fetch the pre-rendered text of a single message (thread roots). */
+export async function readMessageText(cliPath: string, messageId: string): Promise<string | null> {
+  const payload = await runCli(
+    cliPath,
+    ["im", "+messages-mget", "--message-id", messageId, "--as", "bot", "--format", "json"],
+    "读取消息",
+  );
+  const items = (payload.data as { messages?: unknown } | undefined)?.messages;
+  const first = Array.isArray(items) ? items[0] : null;
+  if (!first || typeof first !== "object") return null;
+  const record = first as Record<string, unknown>;
+  return typeof record.content === "string" && record.content.trim() ? record.content.trim() : null;
+}
+
 export interface LarkChat {
   chatId: string;
   name: string;

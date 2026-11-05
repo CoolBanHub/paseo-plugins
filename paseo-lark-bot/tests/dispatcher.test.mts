@@ -24,6 +24,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
     maxReplyChars: 4000,
     notifyUnmatched: false,
     ackOnReceive: false,
+    notifyPermission: false,
     chats: [
       {
         chatId: "oc_group",
@@ -43,6 +44,7 @@ interface Harness {
   replies: ReplyCall[];
   created: { prompt?: string }[];
   agentId: string;
+  paseoRef: import("../server/sessions.ts").SessionPaseoApi;
 }
 
 function makeHarness(values: BotValues = baseValues()): Harness {
@@ -84,7 +86,7 @@ function makeHarness(values: BotValues = baseValues()): Harness {
     },
   });
 
-  return { dispatch, replies, created, agentId: "agent-1" };
+  return { dispatch, replies, created, agentId: "agent-1", paseoRef: paseo };
 }
 
 function groupEvent(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent {
@@ -172,7 +174,7 @@ describe("createDispatcher", () => {
   });
 
   it("notifies the chat about permission requests for its own agents only", async () => {
-    const h = makeHarness();
+    const h = makeHarness(baseValues({ notifyPermission: true }));
     await h.dispatch.handleMessageEvent(groupEvent());
     await flush();
 
@@ -190,6 +192,49 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.replies.length, 1);
     assert.ok(h.replies[0].text.includes("需要确认"));
+  });
+
+  it("prepends the thread root as context for in-thread replies", async () => {
+    const h = makeHarness();
+    const roots = new Map<string, string>([["om_root", "现在的构建失败原因是什么"]]);
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues(),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readThreadRoot: async (_cli, id) => roots.get(id) ?? null,
+      reply: async (options) => {
+        h.replies.push({ messageId: options.messageId, text: options.text, format: options.format, replyInThread: options.replyInThread });
+        return null;
+      },
+    });
+    await dispatch.handleMessageEvent(groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 你查一下" }));
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].prompt, "【话题主题】现在的构建失败原因是什么\n\n【本次消息】你查一下");
+  });
+
+  it("stays silent on permission requests unless notifyPermission is enabled", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+
+    h.dispatch.handlePermission({
+      agent: { id: h.agentId, workspaceId: null, parentAgentId: null, provider: "dsh", cwd: "/tmp", title: null },
+      request: { id: "req-1", provider: "dsh", name: "Question", kind: "question", title: "确认查询对象" },
+    });
+    await flush();
+    assert.equal(h.replies.length, 0, "default must not notify");
+
+    const noisy = makeHarness(baseValues({ notifyPermission: true }));
+    await noisy.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    noisy.dispatch.handlePermission({
+      agent: { id: noisy.agentId, workspaceId: null, parentAgentId: null, provider: "dsh", cwd: "/tmp", title: null },
+      request: { id: "req-2", provider: "dsh", name: "Question", kind: "question", title: "确认查询对象" },
+    });
+    await flush();
+    assert.ok(noisy.replies.some((reply) => reply.text.includes("需要确认")));
   });
 
   it("ignores group messages that do not mention the bot", async () => {

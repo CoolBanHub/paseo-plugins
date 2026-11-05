@@ -41,6 +41,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 | `maxReplyChars` | `4000` | 回复超过该长度截断并提示打开 Paseo 查看 |
 | `notifyUnmatched` | `false` | 未绑定的会话 @ 机器人时是否回复配置提示 |
 | `ackOnReceive` | `true` | 收到 @ 消息立即回复一条「收到，正在处理」确认 |
+| `notifyPermission` | `false` | 权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题 |
 | `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`（可带 `/model`）、`cwd`、`systemPrompt`、`replyFormat` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。
@@ -53,6 +54,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - 处理中发起权限请求时，群里收到「🔐 智能体需要确认」通知，请在 Paseo 客户端里批准 / 拒绝，处理完成后结果自动回到原话题；
 - 回复内容为该轮最后一条助手消息；中英文混排时会剔除混在答案前的英文推理句（同 lark-notify）；无文本回复时提示打开 Paseo 查看时间线；
 - 事件子进程异常退出后按指数退避自动重启（1s → 60s 封顶）；发送失败只写插件日志（`paseo plugin logs lark-bot`）；
+- 话题内的回复会自动携带话题根消息作为上下文（`【话题主题】…【本次消息】…`），所以「你查一下」这类指代能被正确理解；
 - 创建的智能体会话标题为「飞书 · 会话名 · 任务摘要」，带 `lark-bot-chat` / `lark-bot-topic` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。
 
 ## 开发与验证
