@@ -19,7 +19,7 @@ interface Harness {
   registry: ReturnType<typeof createSessionRegistry>;
   replies: ReplyCall[];
   notices: { chatId: string | null; messageId: string; text: string }[];
-  created: { prompt?: string; provider: string; cwd: string }[];
+  created: { prompt?: string; provider: string; cwd: string; config: { thinkingOptionId?: string; featureValues?: Record<string, unknown> } }[];
   runCalls: { agentId: string; text: string }[];
   agentCounter: number;
   currentAgent: () => SessionAgentHandle;
@@ -48,7 +48,7 @@ function makeHarness(options?: { idleMinutes?: number }): Harness {
     agents: {
       create: async (request) => {
         agentCounter += 1;
-        created.push({ prompt: request.prompt, provider: request.config.provider, cwd: request.cwd });
+        created.push({ prompt: request.prompt, provider: request.config.provider, cwd: request.cwd, config: request.config });
         current = {
           id: `agent-${agentCounter}`,
           send: async () => {},
@@ -375,6 +375,26 @@ describe("createSessionRegistry", () => {
     h.registry.handleTurnEnded(agent.id, completed("重复的完成事件"));
     await flush();
     assert.equal(h.replies.length, 1, "duplicate completion must not reply twice");
+  });
+
+  it("creates dsh sessions with max thinking and full access", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, provider: "dsh/deepseek-v4.1-flash" });
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].config.thinkingOptionId, "max");
+    assert.deepEqual(h.created[0].config.featureValues, {
+      paseo_dsh_permission_preset: "danger-full-access",
+    });
+  });
+
+  it("does not force dsh settings on other providers", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, provider: "claude" });
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].config.thinkingOptionId, undefined);
+    assert.equal(h.created[0].config.featureValues, undefined);
   });
 
   it("expands a leading ~ in cwd", async () => {

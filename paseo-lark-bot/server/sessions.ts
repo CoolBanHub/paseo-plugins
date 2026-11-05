@@ -11,6 +11,32 @@ function resolveCwd(cwd: string): string {
   return trimmed;
 }
 
+/**
+ * dsh sessions created by the bot must not stop for interactive approvals:
+ * use the deepest reasoning effort and pre-approve every tool/permission.
+ * Other providers keep their own defaults.
+ */
+function providerCreateConfig(provider: string, systemPrompt: string): {
+  provider: string;
+  systemPrompt?: string;
+  thinkingOptionId?: string;
+  featureValues?: Record<string, unknown>;
+} {
+  const config: {
+    provider: string;
+    systemPrompt?: string;
+    thinkingOptionId?: string;
+    featureValues?: Record<string, unknown>;
+  } = { provider, ...(systemPrompt ? { systemPrompt } : {}) };
+  if (provider === "dsh" || provider.startsWith("dsh/")) {
+    config.thinkingOptionId = "max";
+    config.featureValues = {
+      paseo_dsh_permission_preset: "danger-full-access",
+    };
+  }
+  return config;
+}
+
 /** Minimal structural slice of PaseoApi so tests can inject fakes. */
 export interface SessionImage {
   data: string;
@@ -39,7 +65,12 @@ export interface SessionTimelineHandle {
 export interface SessionPaseoApi {
   agents: {
     create(options: {
-      config: { provider: string; systemPrompt?: string };
+      config: {
+        provider: string;
+        systemPrompt?: string;
+        thinkingOptionId?: string;
+        featureValues?: Record<string, unknown>;
+      };
       cwd: string;
       title?: string;
       labels?: Record<string, string>;
@@ -360,11 +391,9 @@ export function createSessionRegistry(options: {
     if (state.handle && !expired) return { handle: state.handle, created: false };
 
     if (state.agentId) agentToTopic.delete(state.agentId);
+    const provider = await resolveProvider(item.binding.provider);
     const handle = await options.paseo.agents.create({
-      config: {
-        provider: await resolveProvider(item.binding.provider),
-        ...(item.binding.systemPrompt ? { systemPrompt: item.binding.systemPrompt } : {}),
-      },
+      config: providerCreateConfig(provider, item.binding.systemPrompt),
       cwd: resolveCwd(item.binding.cwd),
       title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
