@@ -98,5 +98,5 @@ npm run typecheck
 - 视频抽帧依赖 ffmpeg/ffprobe；没有时退化为占位。图片/视频大小超过上限会跳过。
 - 机器人自己发起的回复不会触发其他会话轮次，但若 post 回复中 @ 了其他机器人，对方 agent 的响应由对方的接入方处理；双向接力可能形成循环。
 - 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）。
-- 当前硬编码飞书中国区端点（`open.feishu.cn`、`--brand feishu`）；国际版 Lark 需要改为 `open.larksuite.com` / `--brand lark`，尚未提供界面开关。
+- 仅支持飞书中国区（`open.feishu.cn`、`--brand feishu`），不计划支持国际版 Lark。
 - daemon 重启后的缓冲上限为 50 条；超过上限或缓冲期间插件始终未拿到 PaseoApi 时，旧消息会丢失。
