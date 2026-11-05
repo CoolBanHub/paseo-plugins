@@ -1,6 +1,16 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { LarkMessageEvent } from "./lark-events.ts";
-import { readBotOpenId, readMessageDetail, replyMessage, resolveLarkCli, type MessageDetail } from "./lark.ts";
+import { readBotOpenId, readMessageDetail, readRawContent, replyMessage, resolveLarkCli, type MessageDetail } from "./lark.ts";
+import {
+  downloadMessageResource,
+  extractVideoFrames,
+  resolveFfmpeg,
+  toImageAttachment,
+} from "./media.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { SessionImage } from "./sessions.ts";
 import {
   appendFooter,
   clipReply,
@@ -32,10 +42,17 @@ export interface DispatcherOptions {
   /** Injectable thread-root lookup for tests. */
   /** Injectable thread-root lookup for tests; may also learn sender names. */
   readThreadRootDetail?: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;
+  /** Injectable media pipeline for tests. */
+  readRaw?: (cliPath: string, messageId: string) => Promise<Record<string, unknown> | null>;
+  download?: (options: { cliPath: string; messageId: string; fileKey: string; type: "image" | "file" }) => Promise<{ bytes: Buffer; extension: string }>;
+  extractFrames?: (videoPath: string, ffmpeg: string, maxFrames?: number) => Promise<Buffer[]>;
   log?: (message: string, detail?: unknown) => void;
 }
 
 const UNMATCHED_KEEP = 20;
+/** Images attached per turn, and cached per topic, respectively. */
+const MAX_IMAGES_PER_TURN = 4;
+const MAX_TOPIC_IMAGES = 8;
 /** Chinese labels for non-text message types in thread context. */
 const MEDIA_LABELS: Record<string, string> = {
   image: "图片",
@@ -62,6 +79,9 @@ export function createDispatcher(options: DispatcherOptions) {
   const readOpenId = options.readOpenId || readBotOpenId;
   const reply = options.reply || replyMessage;
   const readThreadRootDetail = options.readThreadRootDetail || readMessageDetail;
+  const readRaw = options.readRaw || readRawContent;
+  const download = options.download || downloadMessageResource;
+  const extractFrames = options.extractFrames || extractVideoFrames;
   const log =
     options.log ||
     ((message: string, detail?: unknown) => {
@@ -84,6 +104,8 @@ export function createDispatcher(options: DispatcherOptions) {
    * subject via the messages-mget API).
    */
   const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
+  /** Images collected per topic (downloads of image posts + video frames). */
+  const topicImages = new Map<string, SessionImage[]>();
   /**
    * Stable per-sender labels for the transcript: real names when known
    * (thread-root lookups carry them), otherwise 成员A/成员B/… assigned by
@@ -169,6 +191,58 @@ export function createDispatcher(options: DispatcherOptions) {
     return "[" + label + (detail ? "：" + detail : "") + "]";
   }
 
+  /**
+   * Download media posted in a topic: images as-is, videos as extracted
+   * frames. Everything is cached per topic so the next @-mention in the
+   * thread carries it to the provider. Failures degrade to placeholders.
+   */
+  async function ingestMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
+    if (event.chat_type !== "group") return;
+    const kind =
+      event.message_type === "image" ? "image" : event.message_type === "media" ? "video" : null;
+    if (!kind) return;
+    const key = event.root_id || event.message_id;
+    try {
+      const raw = await readRaw(cliPath, event.message_id);
+      if (!raw) return;
+      const fileKey =
+        typeof raw.image_key === "string" && kind === "image" ? raw.image_key : typeof raw.file_key === "string" ? raw.file_key : null;
+      if (!fileKey) return;
+      const resource = await download({
+        cliPath,
+        messageId: event.message_id,
+        fileKey,
+        type: kind === "image" ? "image" : "file",
+      });
+      const buffers: { bytes: Buffer; mime: string }[] = [];
+      if (kind === "image") {
+        buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
+      } else {
+        const ffmpeg = resolveFfmpeg();
+        if (!ffmpeg) return;
+        const dir = mkdtempSync(join(tmpdir(), "lark-bot-video-"));
+        try {
+          const videoPath = join(dir, "video" + resource.extension);
+          writeFileSync(videoPath, resource.bytes);
+          for (const frame of await extractFrames(videoPath, ffmpeg, 3)) {
+            buffers.push({ bytes: frame, mime: "image/jpeg" });
+          }
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+      const images = topicImages.get(key) ?? [];
+      for (const buffer of buffers) {
+        const attachment = toImageAttachment(buffer.bytes, buffer.mime);
+        if (attachment) images.push(attachment);
+      }
+      if (images.length > MAX_TOPIC_IMAGES) images.splice(0, images.length - MAX_TOPIC_IMAGES);
+      topicImages.set(key, images);
+    } catch (error) {
+      log("处理话题媒体失败", error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function recordHistory(event: LarkMessageEvent): void {
     if (event.chat_type !== "group") return;
     const key = event.root_id || event.message_id;
@@ -196,6 +270,7 @@ export function createDispatcher(options: DispatcherOptions) {
       const botOpenId = await ensureBotOpenId(cliPath);
       if (event.chat_type === "group" && !botOpenId) return;
 
+      void ingestMedia(cliPath, event);
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {
@@ -216,7 +291,12 @@ export function createDispatcher(options: DispatcherOptions) {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
       const prompt = await withThreadContext(cliPath, event, decision.prompt);
-      sessions.enqueue(topicKey, event.chat_id, event.message_id, prompt, decision.binding);
+      const images = (topicImages.get(topicKey) ?? []).slice(-MAX_IMAGES_PER_TURN);
+      const finalPrompt =
+        images.length > 0
+          ? prompt + "\n\n【附图】本消息附加 " + images.length + " 张图片（含视频关键帧），请结合图片内容回答。"
+          : prompt;
+      sessions.enqueue(topicKey, event.chat_id, event.message_id, finalPrompt, decision.binding, images);
     } catch (error) {
       log("处理消息失败", error instanceof Error ? error.message : String(error));
     }

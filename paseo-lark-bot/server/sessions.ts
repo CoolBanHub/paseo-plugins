@@ -2,10 +2,15 @@ import { homedir } from "node:os";
 import type { ChatBinding } from "../shared/settings.ts";
 
 /** Minimal structural slice of PaseoApi so tests can inject fakes. */
+export interface SessionImage {
+  data: string;
+  mimeType: string;
+}
+
 export interface SessionAgentHandle {
   readonly id: string;
   send(text: string): Promise<void>;
-  run(text: string, options?: { timeoutMs?: number }): Promise<SessionRunResult>;
+  run(text: string, options?: { timeoutMs?: number; images?: SessionImage[] }): Promise<SessionRunResult>;
 }
 
 export interface SessionRunResult {
@@ -22,6 +27,7 @@ export interface SessionPaseoApi {
       title?: string;
       labels?: Record<string, string>;
       prompt?: string;
+      images?: SessionImage[];
     }): Promise<SessionAgentHandle>;
     ref(id: string): SessionAgentHandle;
   };
@@ -55,6 +61,7 @@ interface QueueItem {
   messageId: string;
   prompt: string;
   binding: ChatBinding;
+  images?: SessionImage[];
 }
 
 interface TopicState {
@@ -141,6 +148,7 @@ export function createSessionRegistry(options: {
     messageId: string,
     prompt: string,
     binding: ChatBinding,
+    images?: SessionImage[],
   ): void {
     const state = stateFor(topicKey, chatId);
     // lastActivityAt stays at the previous turn's end here so ensureAgent can
@@ -151,7 +159,7 @@ export function createSessionRegistry(options: {
       options.callbacks.log?.(`topic ${topicKey} busy for too long; rebuilding session`);
       resetTopic(topicKey);
     }
-    state.queue.push({ messageId, prompt, binding });
+    state.queue.push({ messageId, prompt, binding, images });
     drain(topicKey);
   }
 
@@ -189,7 +197,7 @@ export function createSessionRegistry(options: {
         // The first turn is driven by create(); wait for turn_ended.
         return;
       }
-      const result = await handle.run(item.prompt, { timeoutMs: RUN_TIMEOUT_MS });
+      const result = await handle.run(item.prompt, { timeoutMs: RUN_TIMEOUT_MS, images: item.images });
       if (result.status === "error") {
         // The turn failed before any turn_ended reply can be expected.
         const target = state.pendingTargets.shift() ?? state.lastSeenMessageId;
@@ -256,6 +264,7 @@ export function createSessionRegistry(options: {
       title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
+      images: item.images,
     });
     state.agentId = handle.id;
     state.handle = handle;

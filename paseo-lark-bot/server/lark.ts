@@ -204,6 +204,24 @@ async function runWithStdin(cliPath: string, args: string[], stdinData: string):
   await done;
 }
 
+/**
+ * Raw message body as JSON (text: {"text":…}, image: {"image_key":…},
+ * media/file: {"file_key":…}) — the pre-rendered content loses these keys.
+ */
+export async function readRawContent(cliPath: string, messageId: string): Promise<Record<string, unknown> | null> {
+  const payload = await runCli(cliPath, ["api", "GET", "/open-apis/im/v1/messages/" + messageId, "--as", "bot"], "读取原始消息");
+  const items = (payload.data as { items?: unknown[] } | undefined)?.items;
+  const first = Array.isArray(items) ? items[0] : null;
+  if (!first || typeof first !== "object") return null;
+  const body = (first as { body?: { content?: unknown } }).body;
+  if (typeof body?.content !== "string") return null;
+  try {
+    return JSON.parse(body.content) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 /** A single message with its sender, used for thread-root context. */
 export interface MessageDetail {
   text: string | null;

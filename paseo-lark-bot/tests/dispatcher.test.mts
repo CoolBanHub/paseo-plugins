@@ -49,13 +49,13 @@ interface Harness {
 
 function makeHarness(values: BotValues = baseValues()): Harness {
   const replies: ReplyCall[] = [];
-  const created: { prompt?: string }[] = [];
+  const created: { prompt?: string; images?: unknown[] }[] = [];
   let current: SessionAgentHandle | null = null;
 
   const paseo: SessionPaseoApi = {
     agents: {
       create: async (request) => {
-        created.push({ prompt: request.prompt });
+        created.push({ prompt: request.prompt, images: request.images });
         current = {
           id: `agent-${created.length}`,
           send: async () => {},
@@ -264,6 +264,69 @@ describe("createDispatcher", () => {
     assert.ok(prompt.includes("现在的构建失败原因"), "root text expected: " + prompt);
     assert.ok(prompt.includes("只看最新一次构建"), "in-thread context expected: " + prompt);
     assert.ok(prompt.includes("你查一下"));
+  });
+
+  it("downloads topic images and attaches them to the next mention", async () => {
+    const h = makeHarness();
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues(),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) =>
+        id === "om_img" ? { image_key: "img_v3_abc" } : null,
+      download: async ({ fileKey }) => ({ bytes: Buffer.from("fake-jpeg-" + fileKey), extension: ".jpg" }),
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    // Realistic order: root first, then the image reply inside the thread.
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", sender_id: "ou_a", content: "看看这个报错", mentions: [] }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_img", root_id: "om_root", sender_id: "ou_b", message_type: "image", content: "", mentions: [] }),
+    );
+    await flush();
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 图里什么情况" }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const createdImages = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(createdImages?.length, 1);
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("【附图】"), prompt);
+    assert.ok(prompt.includes("成员B: [图片]"), prompt);
+  });
+
+  it("turns videos into extracted frames", async () => {
+    const h = makeHarness();
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues(),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) =>
+        id === "om_vid" ? { file_key: "file_v3_def" } : null,
+      download: async () => ({ bytes: Buffer.from("fake-mp4"), extension: ".mp4" }),
+      extractFrames: async () => [Buffer.from("f1"), Buffer.from("f2")],
+      reply: async () => null,
+    });
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", sender_id: "ou_a", content: "看这个录屏", mentions: [] }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_vid", root_id: "om_root", sender_id: "ou_b", message_type: "media", content: "", mentions: [] }),
+    );
+    await flush();
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 视频里什么操作" }),
+    );
+    await flush();
+    const createdImages = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(createdImages?.length, 2, "two extracted frames expected");
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("【附图】"), prompt);
   });
 
   it("stays silent on permission requests unless notifyPermission is enabled", async () => {
