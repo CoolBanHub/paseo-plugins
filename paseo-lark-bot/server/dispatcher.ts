@@ -60,6 +60,8 @@ export function createDispatcher(options: DispatcherOptions) {
   // The idle window is read through a getter so settings edits apply without
   // rebuilding the registry.
   let valuesCache: BotValues = {
+    appId: "",
+    appSecret: "",
     larkCliPath: "",
     replyInThread: true,
     sessionIdleMinutes: 30,

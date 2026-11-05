@@ -44,6 +44,7 @@ interface StatusState {
   consumerState: string;
   lastError: string | null;
   cliPath: string | null;
+  currentAppId: string | null;
   botOpenId: string | null;
   sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
   unmatched: { chatId: string; chatType: string; lastSeenAt: number }[];
@@ -239,7 +240,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       <Card>
         <CardTitle text="运行状态" />
         <InfoRow label="事件监听" value={consumer ? consumer.text + (status?.lastError ? `（${status.lastError}）` : "") : "未知"} />
-        <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在下方填写路径）"} muted={false} />
+        <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在下方填写路径）"} muted={!status?.cliPath} />
+        <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
         <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
         {(status?.sessions ?? []).length === 0 ? (
           <Text style={{ color: colors().foregroundMuted, fontSize: 13, marginTop: 6 }}>暂无进行中的话题会话。</Text>
@@ -339,6 +341,37 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             ))}
           </View>
         )}
+      </Card>
+
+      {/* App credentials */}
+      <Card>
+        <CardTitle
+          text="飞书应用凭证"
+          hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（本机明文存储）"
+        />
+        <FieldLabel text="App ID（cli_ 开头）" />
+        <TextInput
+          value={draft.appId}
+          placeholder="cli_xxxxxxxx"
+          placeholderTextColor={colors().foregroundMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={(text) => patchDraft({ appId: text })}
+          style={inputStyle()}
+        />
+        <FieldLabel text="App Secret（明文显示）" />
+        <TextInput
+          value={draft.appSecret}
+          placeholder="与 App ID 一起填写才生效"
+          placeholderTextColor={colors().foregroundMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={(text) => patchDraft({ appSecret: text })}
+          style={inputStyle()}
+        />
+        {status?.currentAppId ? (
+          <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
+        ) : null}
       </Card>
 
       {/* Global options */}
@@ -554,6 +587,8 @@ function PrimaryButton({
 function normalize(values: BotValues): BotValues {
   return {
     ...values,
+    appId: values.appId.trim(),
+    appSecret: values.appSecret.trim(),
     larkCliPath: values.larkCliPath.trim(),
     chats: values.chats.map((chat) => ({
       ...chat,

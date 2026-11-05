@@ -21,7 +21,7 @@
 ## 前置条件
 
 - Paseo ≥ 0.11.4；
-- 已安装 lark-cli 并完成应用凭证配置（`lark-cli config init`，凭证存于系统钥匙串）；
+- 已安装 lark-cli；应用凭证二选一：在插件界面直接填写 App ID / App Secret（保存时自动验证并写入 lark-cli），或沿用 `lark-cli config init` 已配置的凭证；
 - 飞书开发者后台（该 appId）：
   - 事件订阅切换为**长连接**方式，并添加事件 `im.message.receive_v1`（接收消息）；
   - 权限至少包含：`im:message:send_as_bot`（以机器人身份回复）、`im:message.p2p_msg:readonly`（接收单聊消息）、`im:message.group_at_msg:readonly`（接收群里被 @ 的消息）、`im:message.group_at_msg.include_bot:readonly`（接收群里其他机器人 @ 本机器人的消息）、`application:bot.basic_info:read`（读取机器人信息）；
@@ -33,6 +33,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
+| `appId` / `appSecret` | `""` | 飞书应用凭证。两者都填写并保存后，插件先向飞书验证有效性（无效则拒绝写入、沿用现有配置），再非交互写入 lark-cli 并重启事件总线。留空沿用 lark-cli 已有配置。本机明文存储 |
 | `larkCliPath` | `""` | lark-cli 绝对路径；空表示自动发现（PATH → nvm → Homebrew → /usr/local） |
 | `replyInThread` | `true` | 回复进被 @ 消息的话题；关闭则回复到消息流 |
 | `sessionIdleMinutes` | `30` | 话题空闲多少分钟后该话题新建智能体会话（0 表示一直复用） |

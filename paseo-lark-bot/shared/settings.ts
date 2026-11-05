@@ -37,6 +37,14 @@ export const chatBindingSchema = z.object({
 export type ChatBinding = z.output<typeof chatBindingSchema>;
 
 export const botValuesSchema = z.object({
+  /**
+   * Feishu app credentials. When both are set the plugin validates them
+   * against the tenant_access_token endpoint and writes them into lark-cli
+   * (non-interactive config init). Empty values keep lark-cli's existing
+   * keychain configuration. Stored in plain text by design.
+   */
+  appId: z.string().default(""),
+  appSecret: z.string().default(""),
   /** Explicit lark-cli binary path; empty means auto-discovery. */
   larkCliPath: z.string().default(""),
   /** Reply inside the source message's thread instead of the main stream. */

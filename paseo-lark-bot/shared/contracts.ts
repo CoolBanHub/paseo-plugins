@@ -29,6 +29,7 @@ export const larkBotStatusRpc = defineRpc({
     consumerState: z.enum(["stopped", "starting", "ready", "retrying"]),
     lastError: z.string().nullable(),
     cliPath: z.string().nullable(),
+    currentAppId: z.string().nullable(),
     botOpenId: z.string().nullable(),
     sessions: z.array(
       z.object({

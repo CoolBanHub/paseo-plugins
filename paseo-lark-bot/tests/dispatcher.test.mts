@@ -16,6 +16,8 @@ interface ReplyCall {
 
 function baseValues(overrides: Partial<BotValues> = {}): BotValues {
   return {
+    appId: "",
+    appSecret: "",
     larkCliPath: "",
     replyInThread: true,
     sessionIdleMinutes: 30,

@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { accessSync, constants, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -95,6 +95,113 @@ export async function readBotOpenId(cliPath: string): Promise<string | null> {
   const payload = await runCli(cliPath, ["api", "GET", "/open-apis/bot/v3/info", "--as", "bot"], "读取机器人信息");
   const openId = (payload.data as { open_id?: unknown } | undefined)?.open_id;
   return typeof openId === "string" && openId.startsWith("ou_") ? openId : null;
+}
+
+/**
+ * The appId lark-cli currently uses. `config show` prints the config object
+ * at the top level (no ok/data envelope), so it is parsed separately.
+ */
+export async function readCurrentAppId(cliPath: string): Promise<string | null> {
+  const { stdout } = await execFileAsync(cliPath, ["config", "show"], {
+    timeout: CLI_TIMEOUT_MS,
+    maxBuffer: CLI_MAX_BUFFER,
+  });
+  const start = stdout.indexOf("{");
+  if (start < 0) return null;
+  try {
+    const parsed = JSON.parse(stdout.slice(start)) as { appId?: unknown };
+    return typeof parsed.appId === "string" && parsed.appId ? parsed.appId : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ApplyCredentialsOptions {
+  cliPath: string;
+  appId: string;
+  appSecret: string;
+  /** Injectable for tests. */
+  fetchImpl?: (url: string, init: { method: string; body: string }) => Promise<{
+    ok: boolean;
+    status: number;
+    json(): Promise<unknown>;
+  }>;
+  runInit?: (cliPath: string, appId: string, secret: string) => Promise<void>;
+  stopEventBus?: (cliPath: string) => Promise<void>;
+}
+
+interface TokenResponse {
+  code?: number;
+  msg?: string;
+}
+
+/**
+ * Apply user-configured app credentials: validate them against the public
+ * tenant_access_token endpoint first (so a bad secret never overwrites a
+ * working lark-cli config), then write them into lark-cli non-interactively
+ * and restart the event bus so it picks up the new identity.
+ */
+export async function applyAppCredentials(options: ApplyCredentialsOptions): Promise<void> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const runInit =
+    options.runInit ??
+    (async (cliPath: string, appId: string, secret: string) => {
+      await runWithStdin(cliPath, [
+        "config",
+        "init",
+        "--app-id",
+        appId,
+        "--app-secret-stdin",
+        "--brand",
+        "feishu",
+      ], secret);
+    });
+  const stopEventBus =
+    options.stopEventBus ??
+    (async (cliPath: string) => {
+      await execFileAsync(cliPath, ["event", "stop"], { timeout: CLI_TIMEOUT_MS }).catch(() => undefined);
+    });
+
+  const response = await fetchImpl("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+    method: "POST",
+    body: JSON.stringify({ app_id: options.appId, app_secret: options.appSecret }),
+  });
+  const payload = (await response.json()) as TokenResponse;
+  if (!response.ok || payload.code !== 0) {
+    throw new Error(
+      `飞书应用凭证无效（${payload.msg ?? "HTTP " + response.status}），未写入 lark-cli，请检查 App ID / App Secret`,
+    );
+  }
+  await runInit(options.cliPath, options.appId, options.appSecret);
+  // The shared event bus daemon keeps tokens in memory; restart it so the
+  // consumer reconnects with the new credentials.
+  await stopEventBus(options.cliPath);
+}
+
+/** execFile cannot feed stdin; spawn and pipe the secret without argv exposure. */
+async function runWithStdin(cliPath: string, args: string[], stdinData: string): Promise<void> {
+  const child = spawn(cliPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+  });
+  const done = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("lark-cli config init 失败：" + stderr.trim().slice(0, 300)));
+    });
+  });
+  child.stdin?.write(stdinData);
+  child.stdin?.end();
+  const timeout = new Promise<"timeout">((resolve) => {
+    setTimeout(() => resolve("timeout"), CLI_TIMEOUT_MS).unref?.();
+  });
+  if ((await Promise.race([done.then(() => "done" as const), timeout])) === "timeout") {
+    child.kill("SIGTERM");
+    throw new Error("lark-cli config init 超时");
+  }
+  await done;
 }
 
 export interface LarkChat {
