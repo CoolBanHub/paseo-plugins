@@ -63,12 +63,17 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
       readValues,
       resolveProvider: resolveProviderModel,
       fetchLastReply: async (agentId: string) => {
-        try {
-          const payload = await api.agents.ref(agentId).timeline?.refetch({ limit: 30 });
-          const text = lastAssistantText(payload?.entries);
-          if (text) return text;
-        } catch {
-          // Older hosts or missing permissions degrade to the plain notice.
+        // The turn_ended projection can lag the persisted timeline by a few
+        // hundred milliseconds; retry briefly before giving up.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const payload = await api.agents.ref(agentId).timeline?.refetch({ limit: 30 });
+            const text = lastAssistantText(payload?.entries);
+            if (text) return text;
+          } catch {
+            // Older hosts or missing permissions degrade to the plain notice.
+          }
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 300));
         }
         return null;
       },
