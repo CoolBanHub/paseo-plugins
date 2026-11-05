@@ -372,6 +372,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         {status?.currentAppId ? (
           <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
         ) : null}
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存，之后这里会一直明文显示这份值。
+        </Text>
       </Card>
 
       {/* Global options */}
