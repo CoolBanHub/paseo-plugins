@@ -159,9 +159,12 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   `dsh-error-present.ts` for the code table) as timeline error rows, with
   max-tokens and blocked endings as warning notices.
 - Every assistant step reports its token accounting: the `usage` snapshot on
-  `assistant/message` becomes a compact info notice (输入/缓存读/缓存写/输出).
-  Context-window pressure continues to arrive through dsh's own native
-  `usage_update`.
+  `assistant/message` becomes a compact info notice (输入/缓存读/缓存写/输出),
+  plus the step's decode speed (`速度 186 tok/s`). The bridge derives the speed
+  from the first streamed token and the committed message time, matching dsh's
+  own `sessionStats` decode figure; steps without a recorded stream timing
+  simply omit it. Context-window pressure continues to arrive through dsh's
+  own native `usage_update`.
 - Long generations stream: dsh's ACP bridge only projects the settled
   assistant message, so the bridge plugin mirrors `agent/assistant-stream`
   frames and the connector renders one updating 生成中… row per attempt once

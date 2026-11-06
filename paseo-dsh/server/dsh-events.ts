@@ -103,6 +103,19 @@ function formatCount(value: number): string {
   return value >= 1000 ? `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}k` : String(value);
 }
 
+/**
+ * Decode throughput for one step: reported output tokens over the time from
+ * the first streamed token to the committed assistant message. This mirrors
+ * dsh's sessionStats decode figure, so a step that only reports usage without
+ * a stream timing simply omits the speed.
+ */
+function formatDecodeSpeed(outputTokens: number | undefined, decodeMs: number | undefined): string | undefined {
+  if (outputTokens === undefined || outputTokens <= 0 || decodeMs === undefined || decodeMs <= 0) return undefined;
+  const tps = outputTokens / (decodeMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return undefined;
+  return `${tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10} tok/s`;
+}
+
 /** Per-step token accounting from `assistant/message` usage snapshots. */
 function usageUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
   const usage = object(data.usage);
@@ -111,11 +124,14 @@ function usageUpdate(sessionId: string, data: Record<string, unknown>): AcpVendo
   const output = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
   const cacheRead = typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined;
   const cacheWrite = typeof usage.cacheWriteTokens === "number" ? usage.cacheWriteTokens : undefined;
+  const decodeMs = typeof data.decodeMs === "number" ? data.decodeMs : undefined;
   const parts: string[] = [];
   if (input !== undefined) parts.push(`输入 ${formatCount(input)}`);
   if (cacheRead !== undefined) parts.push(`缓存读 ${formatCount(cacheRead)}`);
   if (cacheWrite !== undefined) parts.push(`缓存写 ${formatCount(cacheWrite)}`);
   if (output !== undefined) parts.push(`输出 ${formatCount(output)}`);
+  const speed = formatDecodeSpeed(output, decodeMs);
+  if (speed) parts.push(`速度 ${speed}`);
   if (!parts.length) return [];
   const turn = typeof data.turn === "number" ? data.turn : undefined;
   const step = typeof data.step === "number" ? data.step : undefined;

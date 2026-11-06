@@ -269,7 +269,19 @@ test("the bridge mirrors usage, turn ends, revert points and stream previews", a
   });
   fake.emit("session/event", { header: { id: "session-2" } }, {
     type: "assistant/message",
-    data: { turn: 3, step: 1, message: { content: [] }, usage: { inputTokens: 10, outputTokens: 5 } },
+    time: 12_000,
+    data: {
+      turn: 3,
+      step: 1,
+      message: { content: [] },
+      usage: { inputTokens: 10, outputTokens: 5 },
+      stream: [
+        { type: "chunk", time: 9_000, chunk: { type: "block-start", index: 0, blockType: "reasoning" } },
+        // Packed runs reconstruct the first non-empty member's time from time0/dt.
+        { type: "reasoning-chunks", time0: 10_000, index: 0, dt: [500], texts: ["", "hi"] },
+        { type: "chunk", time: 11_000, chunk: { type: "text-delta", text: "ok" } },
+      ],
+    },
   });
   fake.emit("session/event", { header: { id: "session-2" } }, {
     type: "turn/end",
@@ -292,7 +304,12 @@ test("the bridge mirrors usage, turn ends, revert points and stream previews", a
   const revertPoint = events.find((event) => event.kind === "revert-point");
   assert.deepEqual(revertPoint?.data, { messageId: "user-11", seq: 11, text: "Fix it" });
   const usage = events.find((event) => event.kind === "usage");
-  assert.deepEqual(usage?.data, { turn: 3, step: 1, usage: { inputTokens: 10, outputTokens: 5 } });
+  assert.deepEqual(usage?.data, {
+    turn: 3,
+    step: 1,
+    usage: { inputTokens: 10, outputTokens: 5 },
+    decodeMs: 1_500,
+  });
   const turnEnd = events.find((event) => event.kind === "turn-end");
   assert.deepEqual(turnEnd?.data, { turn: 3, reason: { kind: "error", error: { code: "QUOTA", message: "quota text" } } });
 
@@ -309,6 +326,63 @@ test("the bridge mirrors usage, turn ends, revert points and stream previews", a
 
   delete process.env.DSH_STREAM_REVEAL_MS;
   delete process.env.DSH_STREAM_INTERVAL_MS;
+});
+
+test("the bridge derives decode timing from every assistant stream shape", async () => {
+  const decodeEvents = join(home, "bridge-decode-events.jsonl");
+  writeFileSync(decodeEvents, "");
+  const previousEventFile = process.env.DSH_EVENT_FILE;
+  process.env.DSH_EVENT_FILE = decodeEvents;
+  try {
+    const bridgePath = await generatedBridgePath();
+    const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
+      apply(ctx: unknown): void;
+    };
+    const fake = fakeContext();
+    bridge.apply(fake.ctx);
+    const agent = { session: { id: "session-decode", header: { id: "session-decode" } }, ctx: {} };
+    await (fake.handlers("agent/created")[0] as (arg: unknown) => Promise<void>)({ agent });
+
+    const emitMessage = (step: number, time: number, stream?: unknown[]) => {
+      fake.emit("session/event", { header: { id: "session-decode" } }, {
+        type: "assistant/message",
+        time,
+        data: {
+          turn: 1,
+          step,
+          message: { content: [] },
+          usage: { outputTokens: 10 },
+          ...(stream ? { stream } : {}),
+        },
+      });
+    };
+    // An empty delta is not a token; the next non-empty delta starts the clock.
+    emitMessage(1, 8_000, [
+      { type: "chunk", time: 5_000, chunk: { type: "text-delta", text: "" } },
+      { type: "chunk", time: 6_000, chunk: { type: "text-delta", text: "x" } },
+    ]);
+    emitMessage(2, 8_000, [
+      { type: "chunk", time: 5_000, chunk: { type: "reasoning-delta", text: "think" } },
+    ]);
+    // A named tool-call run starts at its first member.
+    emitMessage(3, 8_000, [
+      { type: "tool-call-chunks", name: "bash", args: ["x"], time0: 3_000, dt: [1_000] },
+    ]);
+    // An unnamed run starts at its first non-empty argument.
+    emitMessage(4, 8_000, [
+      { type: "tool-call-chunks", args: ["", "abc"], time0: 3_000, dt: [1_000] },
+    ]);
+    emitMessage(5, 8_000);
+
+    const usages = readFileSync(decodeEvents, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { kind?: string; data?: { decodeMs?: number } })
+      .filter((event) => event.kind === "usage");
+    assert.deepEqual(usages.map((event) => event.data?.decodeMs), [2_000, 3_000, 5_000, 4_000, undefined]);
+  } finally {
+    process.env.DSH_EVENT_FILE = previousEventFile;
+  }
 });
 
 test("the bridge checkpoints write/edit calls and records file receipts", async () => {

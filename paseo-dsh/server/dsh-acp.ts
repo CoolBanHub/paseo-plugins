@@ -266,6 +266,44 @@ function parseArgs(value) {
   }
 }
 
+// First token time of one compact assistant stream, mirroring dsh's
+// assistantStreamFirstTokenTime: text, reasoning and tool-call deltas count,
+// and packed runs reconstruct each member's time from time0/dt. The connector
+// uses it together with the committed assistant/message time to derive the
+// step's decode duration.
+function streamFirstTokenTime(stream) {
+  if (!Array.isArray(stream)) return undefined;
+  for (const record of stream) {
+    if (!record || typeof record !== "object") continue;
+    if (record.type === "chunk") {
+      const chunk = record.chunk;
+      if (!chunk || typeof chunk !== "object") continue;
+      const delta = chunk.type === "text-delta" || chunk.type === "reasoning-delta"
+        ? typeof chunk.text === "string" && chunk.text !== ""
+        : chunk.type === "tool-call-delta"
+          && ((typeof chunk.argumentsDelta === "string" && chunk.argumentsDelta !== "") || chunk.name !== undefined);
+      if (delta && typeof record.time === "number") return record.time;
+      continue;
+    }
+    const fragments = record.type === "tool-call-chunks"
+      ? record.args
+      : record.type === "text-chunks" || record.type === "reasoning-chunks"
+        ? record.texts
+        : undefined;
+    if (!Array.isArray(fragments)) continue;
+    if (record.type === "tool-call-chunks" && record.name !== undefined && typeof record.time0 === "number") {
+      return record.time0;
+    }
+    const dt = Array.isArray(record.dt) ? record.dt : [];
+    let time = record.time0;
+    for (let index = 0; index < fragments.length; index += 1) {
+      if (index > 0) time += typeof dt[index - 1] === "number" ? dt[index - 1] : 0;
+      if (fragments[index] !== "") return typeof time === "number" ? time : undefined;
+    }
+  }
+  return undefined;
+}
+
 function selectedPermissions() {
   if (!controlFile) return {};
   const parsed = readJson(controlFile);
@@ -456,10 +494,16 @@ function eventMirror(ctx) {
       }
       if (event.type === "assistant/message") {
         if (data.usage && typeof data.usage === "object") {
+          const firstToken = streamFirstTokenTime(data.stream);
+          const endTime = typeof event.time === "number" ? event.time : undefined;
+          const decodeMs = firstToken !== undefined && endTime !== undefined
+            ? Math.max(0, endTime - firstToken)
+            : undefined;
           appendEvent("usage", sessionId, {
             turn: data.turn,
             step: data.step,
             usage: data.usage,
+            ...(decodeMs !== undefined ? { decodeMs } : {}),
           });
         }
         return;

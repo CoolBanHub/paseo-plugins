@@ -172,17 +172,30 @@ test("failed turns map their stable error code to a Chinese error row", () => {
   assert.equal((maxTokens[0] as { notice?: { title?: string } })?.notice?.title, "达到输出上限");
 });
 
-test("usage snapshots become compact info notices", () => {
+test("usage snapshots become compact info notices with decode speed", () => {
   const updates = map("usage", {
     turn: 2,
     step: 1,
     usage: { inputTokens: 1200, outputTokens: 800, cacheReadTokens: 45000, cacheWriteTokens: 500 },
+    decodeMs: 4300,
   });
   const notice = updates[0];
   assert.equal((notice as { notice?: { title?: string } })?.notice?.title, "Token 用量");
-  assert.match((notice as { notice?: { description?: string } }).notice?.description ?? "", /输入 1\.2k/);
-  assert.match((notice as { notice?: { description?: string } }).notice?.description ?? "", /输出 800/);
+  const description = (notice as { notice?: { description?: string } }).notice?.description ?? "";
+  assert.match(description, /输入 1\.2k/);
+  assert.match(description, /输出 800/);
+  assert.match(description, /速度 186 tok\/s/);
   assert.equal(map("usage", { usage: {} }).length, 0);
+});
+
+test("decode speed needs a positive output count and decode duration", () => {
+  const description = (data: Record<string, unknown>) =>
+    (map("usage", data)[0] as { notice?: { description?: string } })?.notice?.description ?? "";
+  assert.doesNotMatch(description({ usage: { outputTokens: 800 }, decodeMs: 0 }), /tok\/s/);
+  assert.doesNotMatch(description({ usage: { outputTokens: 0 }, decodeMs: 4000 }), /tok\/s/);
+  assert.doesNotMatch(description({ usage: { outputTokens: 800 } }), /tok\/s/);
+  // Under ten tokens per second keeps one decimal, like dsh's own formatter.
+  assert.match(description({ usage: { outputTokens: 38 }, decodeMs: 4000 }), /速度 9\.5 tok\/s/);
 });
 
 test("stream preview rows update one stable id and settle compactly", () => {
