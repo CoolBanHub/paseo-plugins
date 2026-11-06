@@ -54,7 +54,13 @@ local ZCode sessions are listed in Paseo's session picker.
 ## Capabilities and limits
 
 - Prompting, interrupting, model / mode / thinking-level switching, permission
-  prompts, usage accounting per turn.
+  prompts, usage accounting per turn. When the turn completes, a compact
+  `Token 用量` notification appends the turn's generation speed
+  (`速度 186 tok/s`) alongside input / cache-read / output counts. The speed is
+  output tokens over the summed first-content → stream-finish time of the
+  turn's model requests, the same decode-only definition ZCode's own
+  `tokensPerSecond` uses; requests that produce only tool calls contribute no
+  decode time, and a turn without content timing omits the notice.
 - ZCode's generic `AskUserQuestion` flow uses Paseo's native question form.
   The plugin answers `interaction/requestUserInput` as a `question`
   permission, maps Paseo's form answers back to ZCode's

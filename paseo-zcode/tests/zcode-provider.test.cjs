@@ -1380,6 +1380,100 @@ test("goal state and context usage surface on open and update", async (t) => {
   assert.match(f.goalItems().at(-1).item.detail.text, /目标已清除/);
 });
 
+test("turn.completed reports decode speed from model stream timing", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-speed", timestamp: 900 });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 1_000,
+    payload: { kind: "start", assistantMessageId: "assistant-1" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 1_100,
+    payload: { kind: "reasoning_start", assistantMessageId: "assistant-1" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 1_200,
+    payload: { kind: "reasoning_delta", assistantMessageId: "assistant-1", delta: "thinking" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 2_100,
+    payload: { kind: "finish", assistantMessageId: "assistant-1" },
+  });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-speed", timestamp: 2_200,
+    payload: {
+      response: "done",
+      resultType: "success",
+      usage: { inputTokens: 1200, outputTokens: 100, cacheReadTokens: 45000, cacheWriteTokens: 0 },
+    },
+  });
+
+  const notice = f.notifications().find((event) => event.item.id.includes(":usage:"));
+  assert.ok(notice, "a usage notice was emitted");
+  assert.match(notice.item.message, /Token 用量：输入 1\.2k · 缓存读 45k · 输出 100 · 速度 100 tok\/s/);
+  assert.equal(f.events.filter((event) => event.type === "session.usage").at(-1).usage.outputTokens, 100);
+});
+
+test("decode speed aggregates every model request and skips tool-only requests", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  // Two content requests: 500ms + 1000ms of decode time.
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_000, payload: { kind: "start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_100, payload: { kind: "text_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_600, payload: { kind: "finish" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_700, payload: { kind: "start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_800, payload: { kind: "reasoning_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 2_800, payload: { kind: "finish" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-multi", timestamp: 2_900,
+    payload: { response: "done", resultType: "success", usage: { outputTokens: 150 } },
+  });
+  assert.match(f.notifications().at(-1).item.message, /速度 100 tok\/s/);
+
+  // A tool-only request has no content boundary and contributes no decode time.
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-only", timestamp: 3_000, payload: { kind: "start" } });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-tool-only", timestamp: 3_100,
+    payload: { kind: "tool_call", toolCallId: "tool-1", toolName: "bash", input: {} },
+  });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-only", timestamp: 3_800, payload: { kind: "finish" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-tool-only", timestamp: 3_900,
+    payload: { response: "done", resultType: "success", usage: { outputTokens: 38 } },
+  });
+  assert.ok(!f.notifications().some((event) => event.item.id.includes(":usage:turn-tool-only")));
+
+  // Under ten tokens per second keeps one decimal, like the dsh provider.
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 4_000, payload: { kind: "start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 4_100, payload: { kind: "text_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 8_100, payload: { kind: "finish" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-slow", timestamp: 8_200,
+    payload: { response: "done", resultType: "success", usage: { outputTokens: 38 } },
+  });
+  assert.match(f.notifications().at(-1).item.message, /速度 9\.5 tok\/s/);
+
+  // A resumed stream may omit the start marker; the first delta still opens
+  // the decode window.
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-delta-only", timestamp: 9_000,
+    payload: { kind: "text_delta", delta: "x" },
+  });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-delta-only", timestamp: 10_000, payload: { kind: "finish" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-delta-only", timestamp: 10_100,
+    payload: { response: "done", resultType: "success", usage: { outputTokens: 10 } },
+  });
+  assert.match(f.notifications().at(-1).item.message, /速度 10 tok\/s/);
+});
+
 test("compaction state updates render loading and completed rows", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });

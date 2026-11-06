@@ -290,6 +290,10 @@ interface TurnState {
   reasoning: string;
   assistantMessageId?: string;
   emittedAssistant: Set<string>;
+  /** First text/reasoning event of the model request currently streaming. */
+  firstContentAt?: number;
+  /** Summed first-content → finish time across this turn's model requests. */
+  decodeMs: number;
   tools: Map<string, {
     name: string;
     input?: Record<string, unknown>;
@@ -805,6 +809,55 @@ function formatUsage(result: Record<string, unknown>): string {
     .join("\n");
 }
 
+function formatTokenCount(value: number): string {
+  if (value < 1000) return String(value);
+  const scaled = value / 1000;
+  return `${scaled >= 100 ? Math.round(scaled) : Math.round(scaled * 10) / 10}k`;
+}
+
+/**
+ * Generation throughput for one turn: ZCode reports aggregate output tokens in
+ * `turn.completed`, while the plugin accumulates each model request's
+ * first-content → finish time. This is the same decode-only definition ZCode's
+ * own `tokensPerSecond` debug figure uses (`durationMs - timeToFirstContentMs`).
+ */
+function formatGenerationSpeed(outputTokens: number | undefined, decodeMs: number): string | undefined {
+  if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
+  const tps = outputTokens / (decodeMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return undefined;
+  return `${tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10} tok/s`;
+}
+
+/** One compact per-turn token accounting row, including the decode speed. */
+function emitTurnUsage(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  turn: TurnState,
+  usage: Record<string, unknown>,
+): void {
+  const output = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
+  const speed = formatGenerationSpeed(output, turn.decodeMs);
+  if (!speed) return;
+  const parts: string[] = [];
+  if (typeof usage.inputTokens === "number") parts.push(`输入 ${formatTokenCount(usage.inputTokens)}`);
+  if (typeof usage.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(usage.cacheReadTokens)}`);
+  if (typeof usage.cacheWriteTokens === "number" && usage.cacheWriteTokens > 0) {
+    parts.push(`缓存写 ${formatTokenCount(usage.cacheWriteTokens)}`);
+  }
+  if (output !== undefined) parts.push(`输出 ${formatTokenCount(output)}`);
+  parts.push(`速度 ${speed}`);
+  emit({
+    type: "timeline.item",
+    sessionId: state.paseoSessionId,
+    item: {
+      type: "notification",
+      id: `zcode:${state.paseoSessionId}:usage:${turn.turnId}`,
+      level: "info",
+      message: `Token 用量：${parts.join(" · ")}`,
+    },
+  });
+}
+
 function historyOutput(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? undefined : JSON.stringify(value);
@@ -1170,7 +1223,15 @@ export function createZcodeProvider(): ProviderRegistration {
       const turnFor = (state: SessionState, turnId: string): TurnState => {
         let turn = state.turns.get(turnId);
         if (!turn) {
-          turn = { turnId, started: false, text: "", reasoning: "", emittedAssistant: new Set(), tools: new Map() };
+          turn = {
+            turnId,
+            started: false,
+            text: "",
+            reasoning: "",
+            emittedAssistant: new Set(),
+            decodeMs: 0,
+            tools: new Map(),
+          };
           state.turns.set(turnId, turn);
         }
         return turn;
@@ -1475,6 +1536,22 @@ export function createZcodeProvider(): ProviderRegistration {
             if (!turn) break;
             const kind = payload.kind;
             if (typeof payload.assistantMessageId === "string") turn.assistantMessageId = payload.assistantMessageId;
+            if (kind === "start") {
+              turn.firstContentAt = undefined;
+            } else if (kind === "text_start" || kind === "reasoning_start") {
+              if (turn.firstContentAt === undefined) turn.firstContentAt = event.timestamp;
+            } else if (kind === "finish") {
+              if (turn.firstContentAt !== undefined) {
+                turn.decodeMs += Math.max(0, event.timestamp - turn.firstContentAt);
+                turn.firstContentAt = undefined;
+              }
+            } else if (kind === "error") {
+              turn.firstContentAt = undefined;
+            } else if ((kind === "text_delta" || kind === "reasoning_delta") && turn.firstContentAt === undefined) {
+              // Streams resumed from a replay may omit the start marker; the
+              // first visible delta is then the earliest content boundary.
+              turn.firstContentAt = event.timestamp;
+            }
             if (kind === "reasoning_delta" && typeof payload.delta === "string") {
               turn.reasoning += payload.delta;
             } else if (kind === "text_delta" && typeof payload.delta === "string") {
@@ -1687,6 +1764,7 @@ export function createZcodeProvider(): ProviderRegistration {
                 contextWindowUsedTokens: state.contextUsed,
               },
             });
+            emitTurnUsage(emit, state, turn, usage);
             state.turns.delete(event.turnId);
             if (state.goalActive) scheduleGoalRefresh(state);
             scheduleSubagentSync(state, subagentSyncTiming.settledMs);
