@@ -728,3 +728,21 @@ async function commitAll(dir: string, message: string): Promise<string> {
   await git(dir, "commit", "-q", "-m", message);
   return (await git(dir, "rev-parse", "HEAD")).trim();
 }
+
+test("gitCheckout 与 gitCommit 拒绝会被 git 当作选项的值", async () => {
+  await withFixtureRepo(async (repo) => {
+    const optionInjection = ["--output=/tmp/evil", "--upload-pack=x", "-uall"];
+    for (const bad of optionInjection) {
+      const result = await gitCheckout(testRun, repo.root, bad);
+      assert.equal(result.ok, false, `${bad} must be rejected`);
+      assert.match(result.error ?? "", /无效的检出目标/);
+    }
+    // 合法目标不受影响：分支与 ref 表达式仍然放行。
+    assert.equal((await gitCheckout(testRun, repo.root, "main")).ok, true);
+    const detail = await gitCommit(testRun, repo.root, "--help");
+    assert.equal(detail.ok, false);
+    assert.match(detail.error ?? "", /无效的提交哈希/);
+    const headHash = (await testRun(["rev-parse", "HEAD"], repo.root)).trim();
+    assert.equal((await gitCommit(testRun, repo.root, headHash)).ok, true);
+  });
+});

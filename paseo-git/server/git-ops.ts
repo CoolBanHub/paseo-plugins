@@ -96,6 +96,21 @@ export function isValidRefName(name: string): boolean {
   return /^(?!-)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/.test(name);
 }
 
+/**
+ * A checkout/commit target must be a plain object name: a full or abbreviated
+ * hex object id, or a ref expression the same character class allows. Values
+ * starting with "-" would be parsed as git options by the child process
+ * (e.g. `--output=...` can write files), so they are rejected outright.
+ */
+export function isValidRevision(revision: string): boolean {
+  return revision.length > 0 && revision.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._/+@-]*$/.test(revision);
+}
+
+/** A full or abbreviated commit hash. */
+export function isValidCommitHash(hash: string): boolean {
+  return /^[0-9a-fA-F]{4,64}$/.test(hash);
+}
+
 export function describeError(err: unknown): string {
   const stderr = (err as { stderr?: unknown }).stderr;
   if (typeof stderr === "string" && stderr.trim().length > 0) {
@@ -430,6 +445,9 @@ export async function gitCommit(run: GitRun, cwd: string, hash: string): Promise
     totalAdditions: 0,
     totalDeletions: 0,
   });
+  if (!isValidCommitHash(hash)) {
+    return failed(`无效的提交哈希：${hash.slice(0, 80)}`);
+  }
   let root: string;
   try {
     root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
@@ -786,6 +804,9 @@ export async function gitWorktreePrune(run: GitRun, cwd: string): Promise<Action
 // ---------------------------------------------------------------------------
 
 export async function gitCheckout(run: GitRun, cwd: string, ref: string): Promise<ActionResult> {
+  if (!isValidRevision(ref)) {
+    return { ok: false, error: `无效的检出目标：${ref.slice(0, 80)}`, message: null };
+  }
   try {
     const root = (await runChecked(run, ["rev-parse", "--show-toplevel"], cwd)).trim();
     await runChecked(run, ["checkout", ref], root, 30_000);
