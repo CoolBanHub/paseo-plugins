@@ -13,7 +13,7 @@ import {
 } from "./widgets";
 
 /**
- * Standalone management screen (sidebar entry "自定义模型"): provider list on
+ * Standalone management screen (sidebar entry "Claude 模型管理"): provider list on
  * the left, the selected provider's editor on the right. Narrow windows stack
  * the two panes and navigate between them with a back button. Toggling a
  * provider's switch saves immediately (models join/leave the Claude picker);
@@ -157,7 +157,7 @@ export function ModelsScreen(props: PluginSurfaceProps) {
       }}
     >
       <View style={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 10, gap: 4 }}>
-        <Text style={{ fontSize: 18, fontWeight: "700", color: colors().foreground }}>自定义模型</Text>
+        <Text style={{ fontSize: 18, fontWeight: "700", color: colors().foreground }}>Claude 模型管理</Text>
         <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
           把自有 API Key 的模型（DeepSeek、GLM、Kimi 等）加入 Claude 的模型选择器
         </Text>

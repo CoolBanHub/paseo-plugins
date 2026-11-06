@@ -11,7 +11,7 @@ function SidebarEntry({ currentScreen, openScreen }: PluginSidebarItemProps) {
   return (
     <SidebarRow
       icon="Boxes"
-      label="自定义模型"
+      label="Claude 模型管理"
       active={currentScreen?.screenId === SCREEN_ID}
       onPress={() => openScreen({ screenId: SCREEN_ID })}
     />
@@ -20,11 +20,11 @@ function SidebarEntry({ currentScreen, openScreen }: PluginSidebarItemProps) {
 
 export default function contribute(client: PluginClientContext) {
   const stops = [
-    client.addScreen({ id: SCREEN_ID, title: "自定义模型", Component: ModelsScreen }),
-    client.addSidebarHeaderItem({ id: SCREEN_ID, title: "自定义模型", Component: SidebarEntry }),
+    client.addScreen({ id: SCREEN_ID, title: "Claude 模型管理", Component: ModelsScreen }),
+    client.addSidebarHeaderItem({ id: SCREEN_ID, title: "Claude 模型管理", Component: SidebarEntry }),
     client.addCommandCenterItem({
       id: "open-claude-models",
-      title: "打开自定义模型",
+      title: "打开 Claude 模型管理",
       icon: "Boxes",
       context: "global",
       onSelect({ openScreen }) {
