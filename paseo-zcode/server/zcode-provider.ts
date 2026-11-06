@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { zcodeFailurePresentation } from "./zcode-error-present";
 import { homedir, } from "node:os";
 import { join } from "node:path";
 import {
@@ -983,6 +984,32 @@ export function createZcodeProvider(): ProviderRegistration {
       mkdirSync(bridgeDir, { recursive: true });
 
       const client = new ZcodeProtocolClient({ cliPath, nodePath: resolveNodePath(), cwd: bridgeDir, onLog: log });
+      // An app-server crash used to leave subscribed sessions "ready" with a
+      // dead event stream: turns never ended and Paseo hung. Fail loudly
+      // instead — the session closes in Paseo and reopening resumes it.
+      client.onProcessExit((info) => {
+        const spawnError = info.spawnError ? `（${info.spawnError.message}）` : "";
+        for (const state of sessions.values()) {
+          if (!state.ready || state.closed || state.child) continue;
+          state.ready = false;
+          state.pendingClientMessageId = undefined;
+          for (const [turnId, turn] of state.turns) {
+            if (!turn.started) continue;
+            emit({
+              type: "session.turn",
+              sessionId: state.paseoSessionId,
+              turnId,
+              state: "failed",
+              error: { message: `zcode app-server 意外退出${spawnError}，本轮已中止` },
+            });
+          }
+          emit({
+            type: "session.runtime_failed",
+            sessionId: state.paseoSessionId,
+            error: { message: `zcode app-server 意外退出${spawnError}；重新打开会话可继续` },
+          });
+        }
+      });
       const taskIndex = new ZcodeTaskIndex(cliPath);
       let catalogCache: CatalogCache | undefined;
       // Keyed by zcode session id for event lookup.
@@ -990,6 +1017,21 @@ export function createZcodeProvider(): ProviderRegistration {
       // Paseo session id -> zcode session id for input handling.
       const zcodeIdFor = new Map<string, string>();
       const permissions = new Map<string, PendingPermission>();
+      // Permissions that are never answered must not accumulate forever; at
+      // capacity the oldest entries (and their pending-id index rows) go.
+      const rememberPermission = (permissionId: string, entry: PendingPermission) => {
+        permissions.set(permissionId, entry);
+        if (permissions.size > 256) {
+          const oldest = permissions.keys().next().value;
+          if (oldest !== undefined) {
+            const dropped = permissions.get(oldest);
+            permissions.delete(oldest);
+            if (dropped?.logicalId && pendingPermissionIds.get(dropped.logicalId) === oldest) {
+              pendingPermissionIds.delete(dropped.logicalId);
+            }
+          }
+        }
+      };
       const pendingPermissionIds = new Map<string, string>();
       const accountProviders: AccountProvider[] = readAccountProviders();
       let accountProvidersRegistered = false;
@@ -1026,7 +1068,11 @@ export function createZcodeProvider(): ProviderRegistration {
       let queued: ProviderEvent[] = [];
       const emit = (event: ProviderEvent) => {
         if (listener) listener(event);
-        else queued.push(event);
+        else {
+          queued.push(event);
+          // A listener that never attaches must not grow the queue forever.
+          if (queued.length > 2_000) queued.splice(0, queued.length - 2_000);
+        }
       };
 
       const stateFor = (paseoSessionId: string, zcodeSessionId: string): SessionState => {
@@ -1186,7 +1232,7 @@ export function createZcodeProvider(): ProviderRegistration {
             return true;
           }
           const permissionId = String(request.id);
-          permissions.set(permissionId, { request, logicalId, kind: "permission" });
+          rememberPermission(permissionId, { request, logicalId, kind: "permission" });
           if (logicalId) pendingPermissionIds.set(logicalId, permissionId);
           const options = Array.isArray(params.options) ? (params.options as Array<Record<string, unknown>>) : [];
           const toolInput = params.input && typeof params.input === "object" && !Array.isArray(params.input)
@@ -1284,7 +1330,7 @@ export function createZcodeProvider(): ProviderRegistration {
               return true;
             }
             const permissionId = String(request.id);
-            permissions.set(permissionId, {
+            rememberPermission(permissionId, {
               request,
               logicalId,
               kind: "question",
@@ -1376,7 +1422,8 @@ export function createZcodeProvider(): ProviderRegistration {
         if (event.type === "zcode.turn_failed") {
           // Early failure (model/auth/quota) reported outside the session/event
           // stream; recover the reason from the CLI log when possible.
-          const reason = readLastTurnFailure(event.sessionId) ?? "Turn failed before producing output";
+          const rawReason = readLastTurnFailure(event.sessionId) ?? "Turn failed before producing output";
+          const reason = zcodeFailurePresentation({ message: rawReason }) || rawReason;
           const clientMessageId = state.pendingClientMessageId;
           state.pendingClientMessageId = undefined;
           emit({
@@ -2215,7 +2262,9 @@ export function createZcodeProvider(): ProviderRegistration {
             : archivedId ? sessions.get(archivedId)?.paseoSessionId ?? archivedId : undefined;
           const pending = sessionId ? sessionInputs.get(sessionId) : undefined;
           const handled = (pending ?? Promise.resolve()).then(() => handleInput(input)).catch((error) => {
-            const message = error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error
+              ? (zcodeFailurePresentation(error as Error & { code?: number }) || error.message)
+              : String(error);
             if (input.type === "session.prompt") {
               const state = sessions.get(zcodeIdFor.get(input.sessionId) ?? input.sessionId);
               if (state) state.pendingClientMessageId = undefined;

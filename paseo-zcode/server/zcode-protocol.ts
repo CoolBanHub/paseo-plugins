@@ -93,6 +93,7 @@ const RUNTIME_PREFERENCES = {
 export class ZcodeProtocolClient {
   private child: ChildProcess | undefined;
   private nextId = 1;
+  private readonly exitListeners = new Set<(info: { code: number | null; signal: NodeJS.Signals | null; spawnError?: Error }) => void>();
   private pending = new Map<
     number,
     { resolve: (r: ZcodeRequestResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
@@ -122,6 +123,12 @@ export class ZcodeProtocolClient {
     return (message: string, detail?: unknown) => this.options.onLog?.(message, detail);
   }
 
+  /** Notified once whenever the app-server process goes away unexpectedly. */
+  onProcessExit(listener: (info: { code: number | null; signal: NodeJS.Signals | null; spawnError?: Error }) => void): () => void {
+    this.exitListeners.add(listener);
+    return () => this.exitListeners.delete(listener);
+  }
+
   get childPid(): number | undefined {
     return this.child?.pid;
   }
@@ -145,18 +152,35 @@ export class ZcodeProtocolClient {
       const text = chunk.toString().trim();
       if (text) this.log("[zcode] stderr: " + text.slice(0, 500));
     });
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       this.log(`[zcode] app-server exited (code=${code})`);
-      for (const [, entry] of this.pending) {
-        entry.reject(new Error("zcode app-server exited"));
-        clearTimeout(entry.timer);
-      }
-      this.pending.clear();
-      if (!this.closed) {
-        this.child = undefined;
-      }
-      this.exitResolve();
+      this.handleGone(code, signal);
     });
+    // A spawn failure (ENOENT, EACCES) never fires "exit"; without this
+    // hook every pending request would hang until its own timeout.
+    child.on("error", (error) => {
+      this.log("[zcode] app-server spawn error: " + error.message);
+      this.handleGone(null, null, error);
+    });
+  }
+
+  private handleGone(code: number | null, signal: NodeJS.Signals | null, spawnError?: Error): void {
+    for (const [, entry] of this.pending) {
+      entry.reject(spawnError ?? new Error("zcode app-server exited"));
+      clearTimeout(entry.timer);
+    }
+    this.pending.clear();
+    if (!this.closed) {
+      this.child = undefined;
+      for (const listener of this.exitListeners) {
+        try {
+          listener({ code, signal, ...(spawnError ? { spawnError } : {}) });
+        } catch {
+          // A broken listener must not block the remaining cleanup.
+        }
+      }
+    }
+    this.exitResolve();
   }
 
   private handleStdout(chunk: Buffer) {
@@ -279,7 +303,11 @@ export class ZcodeProtocolClient {
   async requestOk(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>> {
     const response = await this.request(method, params, timeoutMs);
     if (response.error) {
-      throw new Error(`zcode ${method} failed: ${response.error.message}`);
+      // Keep the structured code on the Error so presentation layers can map
+      // quota/auth/rate-limit classes instead of parsing the message.
+      const error = new Error(`zcode ${method} failed: ${response.error.message}`) as Error & { code?: number };
+      error.code = response.error.code;
+      throw error;
     }
     return (response.result ?? {}) as Record<string, unknown>;
   }
