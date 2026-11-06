@@ -1274,6 +1274,56 @@ test("reopening while the previous Paseo session is closing binds new subsession
   assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "paseo-session"));
 });
 
+test("opening the same ZCode session again rebinds existing subsessions to the new parent", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  const parentSessionId = "sess_rebind_parent";
+  const persistence = { version: 1, data: { zcodeSessionId: parentSessionId } };
+  f.setSubagents(parentSessionId, {
+    revision: 1,
+    childSessionIds: ["sess_rebind_child_1"],
+    running: [{
+      childSessionId: "sess_rebind_child_1", toolCallId: "agent-call-rebind-1",
+      subagentType: "Explore", status: "running",
+    }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_rebind_child_1", { sessionStatus: "running", messages: [] });
+
+  await f.open({}, persistence, "replay");
+  t.mock.timers.tick(0); await flush();
+  const first = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_rebind_child_1");
+  assert.equal(first.parentSessionId, "paseo-session");
+
+  f.setSubagents(parentSessionId, {
+    revision: 2,
+    childSessionIds: ["sess_rebind_child_1", "sess_rebind_child_2"],
+    running: [
+      { childSessionId: "sess_rebind_child_1", toolCallId: "agent-call-rebind-1", subagentType: "Explore", status: "running" },
+      { childSessionId: "sess_rebind_child_2", toolCallId: "agent-call-rebind-2", subagentType: "Explore", status: "running" },
+    ],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_rebind_child_2", { sessionStatus: "running", messages: [] });
+
+  await f.open({}, persistence, "replay", "paseo-second");
+  t.mock.timers.tick(0); await flush();
+
+  const reopened = f.events.filter((event) => event.type === "session.opened" && event.sessionId === "sess_rebind_child_1").at(-1);
+  assert.equal(reopened.parentSessionId, "paseo-second", "the existing child must be rebound to the new parent");
+  const secondChild = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_rebind_child_2");
+  assert.equal(secondChild.parentSessionId, "paseo-second");
+  assert.ok(
+    f.events.some((event) => event.type === "session.closed" && event.sessionId === "sess_rebind_child_1"),
+    "children bound to the superseded parent must be closed",
+  );
+  assert.ok(
+    !f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_rebind_child_2"
+      && event.parentSessionId === "paseo-session"),
+    "a child must never attach to the superseded Paseo session",
+  );
+});
+
 test("without session.subsession, subagents stay on the legacy background card", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = await fixture(t, { subsessions: false });
