@@ -47,6 +47,8 @@ export interface DispatcherOptions {
     text: string;
     format: ReplyFormat;
     replyInThread: boolean;
+    /** Stable per logical reply; retries reuse it so sends cannot duplicate. */
+    idempotencyKey?: string;
   }) => Promise<string | null>;
   /** Injectable thread-root lookup for tests; may also learn sender names. */
   readThreadRootDetail?: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;

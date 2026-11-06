@@ -15,6 +15,7 @@ interface ReplyCall {
   text: string;
   format: string;
   replyInThread: boolean;
+  idempotencyKey?: string;
 }
 
 function baseValues(overrides: Partial<BotValues> = {}): BotValues {
