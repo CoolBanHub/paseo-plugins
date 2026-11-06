@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Pressable, ScrollView, Switch, Text, TextInput, View } from "react-native";
+import { ScrollView, Text, TextInput, View, useWindowDimensions } from "react-native";
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
-import type { PluginTheme } from "@getpaseo/plugin";
 import { useToast } from "@getpaseo/plugin/client/react-native";
 import {
   larkBotChatMembersRpc,
@@ -16,36 +15,34 @@ import {
   larkBotSettingsRpc,
   type BotValues,
   type ChatBinding,
-  type ReplyFormat,
 } from "../shared/settings.ts";
+import {
+  AddChatPicker,
+  BindingEditor,
+  findProvider,
+  type MemberCatalogState,
+} from "./BindingEditor.tsx";
+import {
+  Card,
+  CardTitle,
+  FieldLabel,
+  HoverPressable,
+  InfoRow,
+  Pill,
+  PrimaryButton,
+  ToggleRow,
+  applyTheme,
+  colors,
+  inputStyle,
+} from "./widgets.tsx";
 
 /**
- * Standalone Feishu-bot management surface (sidebar entry "飞书机器人"):
- * runtime status, per-chat bindings, and global options. Draft-based editing
- * with a single save action, following the team-work admin-screen pattern.
+ * Standalone Feishu-bot management screen (sidebar entry "飞书机器人"):
+ * binding list and settings sections on the left, the selected page's editor
+ * on the right; narrow windows stack the panes with back navigation. One
+ * draft for everything with a single save action in the pane's action bar
+ * (visible from every page, so long forms never need scrolling to save).
  */
-
-// Lightweight theme bridge: the host hands each render a fresh theme; resolve
-// it once per render through module state like team-work's design.tsx.
-let palette: PluginTheme["colors"] | null = null;
-function applyTheme(theme: PluginTheme): void {
-  palette = theme.colors;
-}
-function colors(): PluginTheme["colors"] {
-  return palette ?? {
-    surface0: "#f7f7f8",
-    surface1: "#ffffff",
-    surface2: "#f0f0f2",
-    border: "#e3e3e6",
-    foreground: "#1b1b1f",
-    foregroundMuted: "#6d6d78",
-    accent: "#3b5bfd",
-    accentForeground: "#ffffff",
-    statusSuccess: "#1f9d55",
-    statusWarning: "#b7791f",
-    statusDanger: "#d24545",
-  };
-}
 
 interface StatusState {
   consumerState: string;
@@ -64,44 +61,16 @@ const CONSUMER_LABELS: Record<string, { text: string; tone: "success" | "warning
   retrying: { text: "重试中", tone: "danger" },
 };
 
-const REPLY_FORMATS: { value: ReplyFormat; label: string }[] = [
-  { value: "markdown", label: "Markdown" },
-  { value: "text", label: "纯文本" },
-  { value: "post", label: "富文本@" },
-];
+type Selection =
+  | { kind: "none" }
+  | { kind: "add" }
+  | { kind: "binding"; chatId: string }
+  | { kind: "status" }
+  | { kind: "credentials" }
+  | { kind: "global" };
 
-const CARD = 12;
-
-interface MemberCatalogState {
-  loading: boolean;
-  members: LarkBotChatMember[];
-  error: string | null;
-}
-
-/** Provider ids can be `provider/model`; the picker lists the bare id. */
-function findProvider(providers: LarkBotProviderInfo[], providerId: string): LarkBotProviderInfo | undefined {
-  const base = providerId.split("/", 1)[0] ?? providerId;
-  return providers.find((candidate) => candidate.id === base) ?? providers.find((candidate) => candidate.id === providerId);
-}
-
-/** The selected model, or the provider default when the binding leaves it empty. */
-function findModel(provider: LarkBotProviderInfo | undefined, modelId: string) {
-  if (!provider) return undefined;
-  if (modelId) {
-    const selected = provider.models.find((model) => model.id === modelId);
-    if (selected) return selected;
-  }
-  return (
-    provider.models.find((model) => model.isDefault) ??
-    provider.models[0] ??
-    undefined
-  );
-}
-
-function permissionLabel(provider: LarkBotProviderInfo | undefined, value: string): string {
-  if (!value) return "默认";
-  return provider?.permissionOptions.find((option) => option.value === value)?.label ?? value;
-}
+/** Below this window width the panes stack and navigate instead of splitting. */
+const WIDE_MIN_WIDTH = 960;
 
 export function BotCenterSurface(props: PluginSurfaceProps) {
   applyTheme(props.theme);
@@ -122,6 +91,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
   const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<StatusState | null>(null);
+  const [selection, setSelection] = useState<Selection>({ kind: "none" });
+  const wide = useWindowDimensions().width >= WIDE_MIN_WIDTH;
 
   const reload = useCallback(async () => {
     try {
@@ -207,6 +178,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           ],
         };
       });
+      setSelection({ kind: "binding", chatId });
     },
     [chatCatalog, providers],
   );
@@ -215,6 +187,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     setDraft((current) =>
       current ? { ...current, chats: current.chats.filter((chat) => chat.chatId !== chatId) } : current,
     );
+    setSelection({ kind: "none" });
   }, []);
 
   const selectProvider = useCallback(
@@ -315,6 +288,10 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     draft !== null && loaded !== null && JSON.stringify(normalize(draft)) !== JSON.stringify(normalize(loaded));
   const bindingsValid = (draft?.chats ?? []).every((chat) => chat.provider.trim().length > 0);
 
+  const discard = useCallback(() => {
+    setDraft(loaded);
+  }, [loaded]);
+
   const save = useCallback(async () => {
     if (revision === null || draft === null || saving) return;
     setSaving(true);
@@ -359,568 +336,333 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       .filter((chat) => !boundIds.has(chat.chatId))
       .map((chat) => ({
         chatId: chat.chatId,
-        label: `${chat.chatType === "p2p" ? "单聊" : "会话"} ${chat.chatId}（最近发过消息）`,
+        label: `${chat.chatType === "p2p" ? "单聊" : "会话"} ${chat.chatId}`,
+        note: "最近有人给机器人发过消息",
       })),
   ];
+  const selectedBinding = selection.kind === "binding"
+    ? draft.chats.find((chat) => chat.chatId === selection.chatId) ?? null
+    : null;
 
-  return (
-    <ScrollView
-      style={{ flex: 1, backgroundColor: colors().surface0 }}
-      contentContainerStyle={{ maxWidth: 880, width: "100%", alignSelf: "center", padding: 20, gap: 14 }}
+  const navRow = (key: string, title: string, subtitle: string | null, active: boolean, onPress: () => void, trailing?: React.ReactNode) => (
+    <HoverPressable
+      key={key}
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      onPress={onPress}
+      style={({ hovered, pressed }) => ({
+        backgroundColor: active || pressed || hovered ? colors().surface2 : colors().surface1,
+        borderLeftWidth: 3,
+        borderLeftColor: active ? colors().accent : "transparent",
+        borderRadius: 8,
+        paddingVertical: 10,
+        paddingHorizontal: 12,
+        gap: 2,
+      })}
     >
-      {/* Header */}
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-        <Text style={{ fontSize: 20, fontWeight: "700", color: colors().foreground, flex: 1 }}>飞书机器人</Text>
-        {consumer && <Pill text={consumer.text} tone={consumer.tone} />}
-        <PrimaryButton label="刷新" onPress={() => void refreshStatus()} subtle />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text numberOfLines={1} style={{ color: colors().foreground, fontSize: 13, fontWeight: "600", flexShrink: 1 }}>
+          {title}
+        </Text>
+        <View style={{ flex: 1 }} />
+        {trailing}
       </View>
-      <Text style={{ color: colors().foregroundMuted, fontSize: 13, marginTop: -8 }}>
-        群里 @ 机器人（或单聊直发）即由绑定的 provider 处理，结果以话题回复返回；一个话题一个智能体会话。
-      </Text>
+      {subtitle !== null ? (
+        <Text numberOfLines={1} style={{ color: colors().foregroundMuted, fontSize: 11 }}>
+          {subtitle}
+        </Text>
+      ) : null}
+    </HoverPressable>
+  );
 
-      {/* Runtime status */}
-      <Card>
-        <CardTitle text="运行状态" />
-        <InfoRow label="事件监听" value={consumer ? consumer.text + (status?.lastError ? `（${status.lastError}）` : "") : "未知"} />
-        <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在下方填写路径）"} muted={!status?.cliPath} />
-        <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
-        <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
-        {(status?.sessions ?? []).length === 0 ? (
-          <Text style={{ color: colors().foregroundMuted, fontSize: 13, marginTop: 6 }}>暂无进行中的话题会话。</Text>
-        ) : (
-          (status?.sessions ?? []).map((session) => (
-            <InfoRow
-              key={session.topicKey}
-              label={`话题 …${session.topicKey.slice(-10)}`}
-              value={`${session.busy ? "处理中" : "空闲"}${session.queued > 0 ? ` · 排队 ${session.queued} 条` : ""}`}
-            />
-          ))
-        )}
-      </Card>
-
-      {/* Chat bindings */}
-      <Card>
-        <CardTitle text="会话绑定" hint="每个飞书会话用哪个 provider 处理消息" />
+  const listPane = (
+    <View
+      style={{
+        width: wide ? 280 : undefined,
+        flex: wide ? undefined : 1,
+        backgroundColor: colors().surface1,
+        borderRightWidth: wide ? 1 : 0,
+        borderRightColor: colors().border,
+      }}
+    >
+      <View style={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8, gap: 6 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <Text style={{ fontSize: 18, fontWeight: "700", color: colors().foreground, flex: 1 }}>飞书机器人</Text>
+          <PrimaryButton label="刷新" onPress={() => void refreshStatus()} subtle />
+        </View>
+        {consumer ? <Pill text={consumer.text} tone={consumer.tone} /> : null}
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          群里 @ 机器人（或单聊直发）即由绑定的 provider 处理；一个话题一个智能体会话。
+        </Text>
+      </View>
+      {/* Saving stays reachable on the stacked list view too. */}
+      {!wide && dirty ? (
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 8 }}>
+          <Text style={{ color: colors().statusWarning, fontSize: 12, flex: 1 }}>有未保存的修改</Text>
+          <PrimaryButton label="放弃" onPress={discard} subtle />
+          <PrimaryButton label={saving ? "保存中…" : "保存"} onPress={() => void save()} disabled={!bindingsValid || saving} />
+        </View>
+      ) : null}
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16, gap: 4 }}>
+        <Text style={{ fontSize: 11, fontWeight: "700", color: colors().foregroundMuted, marginTop: 8, paddingHorizontal: 4 }}>
+          会话绑定（{draft.chats.length}）
+        </Text>
         {draft.chats.map((binding) => {
-          const provider = findProvider(providers, binding.provider);
-          const effectiveModel = findModel(provider, binding.model);
-          const thinkingOptions = effectiveModel?.thinkingOptions ?? [];
-          const selectedMemberIds = new Set(binding.allowedUsers.map((user) => user.openId));
-          const memberCatalog = memberCatalogs[binding.chatId];
-          const addableMembers = (memberCatalog?.members ?? []).filter(
-            (member) => !selectedMemberIds.has(member.openId),
-          );
-          const unknownModel =
-            binding.model && !provider?.models.some((model) => model.id === binding.model)
-              ? binding.model
-              : null;
-          const unknownThinking =
-            binding.thinkingOptionId && !thinkingOptions.some((option) => option.id === binding.thinkingOptionId)
-              ? binding.thinkingOptionId
-              : null;
-          const unknownPermission =
-            binding.permission && !provider?.permissionOptions.some((option) => option.value === binding.permission)
-              ? binding.permission
-              : null;
-          const defaultPermissionLabel = provider?.defaultPermission
-            ? permissionLabel(provider, provider.defaultPermission)
-            : null;
-          const permissionHint = !provider
-            ? "未获取到 provider 信息，留空使用 provider / 插件默认权限。"
-            : provider.permissionKind === "dsh-preset"
-              ? "留空 = 完全权限（与旧版一致）；按 dsh 权限预设限制本会话可用的工具能力。"
-              : provider.permissionKind === "mode"
-                ? `留空 = provider 默认${defaultPermissionLabel ? `（${defaultPermissionLabel}）` : ""}；决定工具审批/运行模式。`
-                : "该 provider 没有可配置的权限模式，使用自身默认。";
-          const thinkingDefaultLabel = provider?.permissionKind === "dsh-preset" ? "默认（最深）" : "默认";
-          return (
-            <View
-              key={binding.chatId}
-              style={{
-                borderWidth: 1,
-                borderColor: colors().border,
-                borderRadius: 10,
-                padding: 12,
-                gap: 10,
-                backgroundColor: colors().surface1,
-              }}
-            >
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                <Text style={{ fontWeight: "600", color: colors().foreground, flex: 1 }}>
-                  {binding.chatName || "未命名会话"}
-                </Text>
-                <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>{binding.chatId}</Text>
-                <Pressable onPress={() => removeBinding(binding.chatId)} hitSlop={6}>
-                  <Text style={{ color: colors().statusDanger, fontSize: 13 }}>移除</Text>
-                </Pressable>
-              </View>
-
-              <FieldLabel text="Provider" />
-              {providers.length > 0 ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  {providers.map((candidate) => (
-                    <ChoicePill
-                      key={candidate.id}
-                      label={candidate.label}
-                      active={findProvider(providers, binding.provider)?.id === candidate.id}
-                      onPress={() => selectProvider(binding.chatId, candidate.id)}
-                    />
-                  ))}
-                </View>
-              ) : (
-                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-                  未获取到 provider 列表，请先点顶部「刷新」。
-                </Text>
-              )}
-
-              <FieldLabel text="模型（留空 = provider 默认模型）" />
-              {(provider?.models.length ?? 0) > 0 || unknownModel ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <ChoicePill
-                    label="默认"
-                    active={!binding.model}
-                    onPress={() => selectModel(binding.chatId, "")}
-                  />
-                  {(provider?.models ?? []).map((model) => (
-                    <ChoicePill
-                      key={model.id}
-                      label={model.label + (model.isDefault ? "（默认）" : "")}
-                      active={binding.model === model.id}
-                      onPress={() => selectModel(binding.chatId, model.id)}
-                    />
-                  ))}
-                  {unknownModel ? (
-                    <ChoicePill
-                      label={`${unknownModel}（未在列表）`}
-                      active
-                      onPress={() => selectModel(binding.chatId, "")}
-                    />
-                  ) : null}
-                </View>
-              ) : (
-                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-                  未获取到模型列表，留空使用 provider 默认模型。
-                </Text>
-              )}
-
-              <FieldLabel text="思考深度（留空 = 模型默认；dsh 留空 = 最深）" />
-              {thinkingOptions.length > 0 ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <ChoicePill
-                    label={thinkingDefaultLabel}
-                    active={!binding.thinkingOptionId}
-                    onPress={() => patchBinding(binding.chatId, { thinkingOptionId: "" })}
-                  />
-                  {thinkingOptions.map((option) => (
-                    <ChoicePill
-                      key={option.id}
-                      label={option.label}
-                      active={binding.thinkingOptionId === option.id}
-                      onPress={() => patchBinding(binding.chatId, { thinkingOptionId: option.id })}
-                    />
-                  ))}
-                  {unknownThinking ? (
-                    <ChoicePill
-                      label={`${unknownThinking}（未在列表）`}
-                      active
-                      onPress={() => patchBinding(binding.chatId, { thinkingOptionId: "" })}
-                    />
-                  ) : null}
-                </View>
-              ) : (
-                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-                  {provider
-                    ? "该模型没有可选的思考深度，留空使用 provider / 模型默认。"
-                    : "未获取到 provider 信息，留空使用默认思考深度。"}
-                </Text>
-              )}
-
-              <FieldLabel text="权限（留空 = provider / 插件默认）" />
-              {(provider?.permissionOptions.length ?? 0) > 0 || unknownPermission ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <ChoicePill
-                    label="默认"
-                    active={!binding.permission}
-                    onPress={() => patchBinding(binding.chatId, { permission: "" })}
-                  />
-                  {(provider?.permissionOptions ?? []).map((option) => (
-                    <ChoicePill
-                      key={option.value}
-                      label={option.label}
-                      active={binding.permission === option.value}
-                      onPress={() => patchBinding(binding.chatId, { permission: option.value })}
-                    />
-                  ))}
-                  {unknownPermission ? (
-                    <ChoicePill
-                      label={`${unknownPermission}（未在列表）`}
-                      active
-                      onPress={() => patchBinding(binding.chatId, { permission: "" })}
-                    />
-                  ) : null}
-                </View>
-              ) : null}
-              <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>{permissionHint}</Text>
-
-              <FieldLabel text="允许 @ 的成员（留空 = 所有人可触发）" />
-              {binding.allowedUsers.length === 0 ? (
-                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-                  当前所有人都可以 @ 我处理。
-                </Text>
-              ) : (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  {binding.allowedUsers.map((user) => (
-                    <ChoicePill
-                      key={user.openId}
-                      label={`${user.name || user.openId} ×`}
-                      active
-                      onPress={() => removeAllowedUser(binding.chatId, user.openId)}
-                    />
-                  ))}
-                </View>
-              )}
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                <TextInput
-                  value={allowedDrafts[binding.chatId] ?? ""}
-                  placeholder="ou_xxx，多个用逗号分隔"
-                  placeholderTextColor={colors().foregroundMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  returnKeyType="done"
-                  onSubmitEditing={() => addAllowedFromText(binding.chatId)}
-                  onChangeText={(text) =>
-                    setAllowedDrafts((current) => ({ ...current, [binding.chatId]: text }))
-                  }
-                  style={inputStyle({ flex: 1 })}
-                />
-                <PrimaryButton label="添加" onPress={() => addAllowedFromText(binding.chatId)} subtle />
-                <PrimaryButton
-                  label={memberCatalog?.loading ? "读取中…" : "读取群成员"}
-                  onPress={() => void loadMembers(binding.chatId)}
-                  subtle
-                />
-              </View>
-              {memberCatalog?.error ? (
-                <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
-                  读取群成员失败：{memberCatalog.error}。仍可手动填写 open_id。
-                </Text>
-              ) : null}
-              {addableMembers.length > 0 ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  {addableMembers.slice(0, 50).map((member) => (
-                    <ChoicePill
-                      key={member.openId}
-                      label={member.name || member.openId}
-                      active={false}
-                      onPress={() => addAllowedUser(binding.chatId, member)}
-                    />
-                  ))}
-                </View>
-              ) : null}
-              <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
-                非指定成员 @ 时会收到提示，消息不会进入话题上下文。读取成员需要飞书权限 im:chat.members:read。
-              </Text>
-
-              <FieldLabel text="工作目录（空 = 用户主目录；支持 ~/ 开头）" />
-              <TextInput
-                value={binding.cwd}
-                placeholder="~/Workspace/project"
-                placeholderTextColor={colors().foregroundMuted}
-                onChangeText={(text) => patchBinding(binding.chatId, { cwd: text })}
-                style={inputStyle()}
-              />
-
-              <FieldLabel text="系统提示（可选，追加在该会话的指令前）" />
-              <TextInput
-                value={binding.systemPrompt}
-                placeholder="例：你是项目维护助手，用中文回答"
-                placeholderTextColor={colors().foregroundMuted}
-                multiline
-                onChangeText={(text) => patchBinding(binding.chatId, { systemPrompt: text })}
-                style={inputStyle({ height: 64, textAlignVertical: "top" })}
-              />
-
-              <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
-              <View style={{ flexDirection: "row", gap: 8 }}>
-                {REPLY_FORMATS.map((format) => (
-                  <ChoicePill
-                    key={format.value}
-                    label={format.label}
-                    active={binding.replyFormat === format.value}
-                    onPress={() => patchBinding(binding.chatId, { replyFormat: format.value })}
-                  />
-                ))}
-              </View>
-            </View>
+          const providerLabel = binding.provider.trim()
+            ? findProvider(providers, binding.provider)?.label ?? binding.provider
+            : "未选择 provider";
+          return navRow(
+            binding.chatId,
+            binding.chatName || binding.chatId,
+            providerLabel,
+            selection.kind === "binding" && selection.chatId === binding.chatId,
+            () => setSelection({ kind: "binding", chatId: binding.chatId }),
           );
         })}
+        {navRow("add", "＋ 添加会话", "机器人可见的会话列表", selection.kind === "add", () => setSelection({ kind: "add" }))}
 
-        <FieldLabel text="添加会话" />
-        {addableChats.length === 0 ? (
-          <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-            没有可选会话：先把机器人拉进飞书群，或等有人给机器人发过消息后点「刷新」。
-          </Text>
-        ) : (
-          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-            {addableChats.map((chat) => (
-              <ChoicePill key={chat.chatId} label={`+ ${chat.label}`} active={false} onPress={() => addBinding(chat.chatId)} />
-            ))}
-          </View>
+        <Text style={{ fontSize: 11, fontWeight: "700", color: colors().foregroundMuted, marginTop: 12, paddingHorizontal: 4 }}>
+          设置
+        </Text>
+        {navRow(
+          "status",
+          "运行状态",
+          consumer ? consumer.text + (status?.sessions.length ? ` · ${status.sessions.length} 个话题` : "") : "未知",
+          selection.kind === "status",
+          () => setSelection({ kind: "status" }),
+          <View style={{
+            width: 8, height: 8, borderRadius: 4,
+            backgroundColor: consumer
+              ? consumer.tone === "success" ? colors().statusSuccess
+                : consumer.tone === "warning" ? colors().statusWarning
+                  : consumer.tone === "danger" ? colors().statusDanger
+                    : colors().foregroundMuted
+              : colors().foregroundMuted,
+          }} />,
         )}
-      </Card>
+        {navRow(
+          "credentials",
+          "应用凭证",
+          draft.appId.trim() || status?.currentAppId || "未配置（沿用 lark-cli）",
+          selection.kind === "credentials",
+          () => setSelection({ kind: "credentials" }),
+        )}
+        {navRow("global", "全局设置", "路径、话题、回复选项", selection.kind === "global", () => setSelection({ kind: "global" }))}
+      </ScrollView>
+    </View>
+  );
 
-      {/* App credentials */}
-      <Card>
-        <CardTitle
-          text="飞书应用凭证"
-          hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
-        />
-        <FieldLabel text="App ID（cli_ 开头）" />
-        <TextInput
-          value={draft.appId}
-          placeholder="cli_xxxxxxxx"
-          placeholderTextColor={colors().foregroundMuted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          onChangeText={(text) => patchDraft({ appId: text })}
-          style={inputStyle()}
-        />
-        <FieldLabel text="App Secret（明文显示）" />
-        <TextInput
-          value={draft.appSecret}
-          placeholder="与 App ID 一起填写才生效"
-          placeholderTextColor={colors().foregroundMuted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          onChangeText={(text) => patchDraft({ appSecret: text })}
-          style={inputStyle()}
-        />
-        {status?.currentAppId ? (
-          <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
+  const pageTitle =
+    selection.kind === "binding" ? selectedBinding?.chatName || selectedBinding?.chatId || "会话绑定"
+    : selection.kind === "add" ? "添加会话绑定"
+    : selection.kind === "status" ? "运行状态"
+    : selection.kind === "credentials" ? "飞书应用凭证"
+    : selection.kind === "global" ? "全局设置"
+    : "飞书机器人";
+
+  const detailPane = (
+    <View style={{ flex: 1, backgroundColor: colors().surface0 }}>
+      <View style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 8,
+        paddingHorizontal: 16,
+        paddingVertical: 10,
+        borderBottomWidth: 1,
+        borderBottomColor: colors().border,
+        backgroundColor: colors().surface1,
+      }}>
+        {!wide ? (
+          <HoverPressable
+            accessibilityRole="button"
+            accessibilityLabel="返回列表"
+            onPress={() => setSelection({ kind: "none" })}
+            style={({ hovered }) => ({
+              paddingHorizontal: 8,
+              paddingVertical: 4,
+              borderRadius: 6,
+              backgroundColor: hovered ? colors().surface2 : "transparent",
+            })}
+          >
+            <Text style={{ color: colors().foreground, fontSize: 16 }}>‹</Text>
+          </HoverPressable>
         ) : null}
-        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-          已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存。按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示；请确保本机账户与备份安全。
+        <Text numberOfLines={1} style={{ color: colors().foreground, fontSize: 14, fontWeight: "700", flexShrink: 1 }}>
+          {pageTitle}
         </Text>
-      </Card>
-
-      {/* Global options */}
-      <Card>
-        <CardTitle text="全局设置" hint="对全部会话生效" />
-        <FieldLabel text="lark-cli 路径（空 = 自动发现：PATH / nvm / Homebrew）" />
-        <TextInput
-          value={draft.larkCliPath}
-          placeholder="留空自动发现"
-          placeholderTextColor={colors().foregroundMuted}
-          onChangeText={(text) => patchDraft({ larkCliPath: text })}
-          style={inputStyle()}
-        />
-        <ToggleRow
-          label="回复进话题"
-          hint="回复挂在被 @ 消息的话题下，而不是群消息流"
-          value={draft.replyInThread}
-          onChange={(value) => patchDraft({ replyInThread: value })}
-        />
-        <ToggleRow
-          label="提示未配置会话"
-          hint="未绑定的会话 @ 机器人时回复一条配置提示"
-          value={draft.notifyUnmatched}
-          onChange={(value) => patchDraft({ notifyUnmatched: value })}
-        />
-        <ToggleRow
-          label="收到消息先确认"
-          hint="收到 @ 消息立即回复一条「收到，正在处理」，处理完成后再回结果"
-          value={draft.ackOnReceive}
-          onChange={(value) => patchDraft({ ackOnReceive: value })}
-        />
-        <ToggleRow
-          label="权限请求通知到群"
-          hint="默认关闭；开启后权限请求会发到话题，仍需在 Paseo 客户端批准"
-          value={draft.notifyPermission}
-          onChange={(value) => patchDraft({ notifyPermission: value })}
-        />
-        <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
-        <TextInput
-          value={String(draft.sessionIdleMinutes)}
-          keyboardType="number-pad"
-          onChangeText={(text) => {
-            const minutes = Number.parseInt(text, 10);
-            if (Number.isFinite(minutes)) patchDraft({ sessionIdleMinutes: minutes });
-          }}
-          style={inputStyle()}
-        />
-        <FieldLabel text="回复截断长度（字符）" />
-        <TextInput
-          value={String(draft.maxReplyChars)}
-          keyboardType="number-pad"
-          onChangeText={(text) => {
-            const limit = Number.parseInt(text, 10);
-            if (Number.isFinite(limit)) patchDraft({ maxReplyChars: limit });
-          }}
-          style={inputStyle()}
-        />
-      </Card>
-
-      {/* Save */}
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 6 }}>
-        <Text style={{ color: dirty ? colors().statusWarning : colors().foregroundMuted, fontSize: 13, flex: 1 }}>
-          {dirty ? "有未保存的修改" : bindingsValid ? "无修改" : "有绑定未选择 provider"}
-        </Text>
+        {!bindingsValid && selection.kind !== "none" ? <Pill text="有绑定未选 provider" tone="danger" /> : null}
+        {dirty ? <Pill text="未保存" tone="warning" /> : null}
+        <View style={{ flex: 1 }} />
+        {dirty ? <PrimaryButton label="放弃" onPress={discard} subtle disabled={saving} /> : null}
         <PrimaryButton
           label={saving ? "保存中…" : "保存"}
           onPress={() => void save()}
           disabled={!dirty || !bindingsValid || revision === null || saving}
         />
       </View>
-    </ScrollView>
-  );
-}
 
-function Card({ children }: { children: React.ReactNode }) {
-  return (
-    <View
-      style={{
-        backgroundColor: colors().surface1,
-        borderRadius: CARD,
-        borderWidth: 1,
-        borderColor: colors().border,
-        padding: 16,
-        gap: 10,
-      }}
-    >
-      {children}
+      {selection.kind === "binding" && selectedBinding ? (
+        <BindingEditor
+          key={selectedBinding.chatId}
+          binding={selectedBinding}
+          providers={providers}
+          memberCatalog={memberCatalogs[selectedBinding.chatId]}
+          allowedText={allowedDrafts[selectedBinding.chatId] ?? ""}
+          onPatch={(patch) => patchBinding(selectedBinding.chatId, patch)}
+          onSelectProvider={(provider) => selectProvider(selectedBinding.chatId, provider)}
+          onSelectModel={(model) => selectModel(selectedBinding.chatId, model)}
+          onRemove={() => removeBinding(selectedBinding.chatId)}
+          onAllowedTextChange={(text) => setAllowedDrafts((current) => ({ ...current, [selectedBinding.chatId]: text }))}
+          onAddAllowedFromText={() => addAllowedFromText(selectedBinding.chatId)}
+          onAddAllowedUser={(user) => addAllowedUser(selectedBinding.chatId, user)}
+          onRemoveAllowedUser={(openId) => removeAllowedUser(selectedBinding.chatId, openId)}
+          onLoadMembers={() => { void loadMembers(selectedBinding.chatId); }}
+        />
+      ) : selection.kind === "add" ? (
+        <AddChatPicker addable={addableChats} onPick={addBinding} />
+      ) : selection.kind === "status" ? (
+        <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
+          <Card>
+            <CardTitle text="运行状态" />
+            <InfoRow label="事件监听" value={consumer ? consumer.text + (status?.lastError ? `（${status.lastError}）` : "") : "未知"} />
+            <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在全局设置填写路径）"} muted={!status?.cliPath} />
+            <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
+            <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
+            {(status?.sessions ?? []).length === 0 ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13, marginTop: 6 }}>暂无进行中的话题会话。</Text>
+            ) : (
+              (status?.sessions ?? []).map((session) => (
+                <InfoRow
+                  key={session.topicKey}
+                  label={`话题 …${session.topicKey.slice(-10)}`}
+                  value={`${session.busy ? "处理中" : "空闲"}${session.queued > 0 ? ` · 排队 ${session.queued} 条` : ""}`}
+                />
+              ))
+            )}
+          </Card>
+        </ScrollView>
+      ) : selection.kind === "credentials" ? (
+        <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
+          <Card>
+            <CardTitle
+              text="飞书应用凭证"
+              hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
+            />
+            <FieldLabel text="App ID（cli_ 开头）" />
+            <TextInput
+              value={draft.appId}
+              placeholder="cli_xxxxxxxx"
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => patchDraft({ appId: text })}
+              style={inputStyle()}
+            />
+            <FieldLabel text="App Secret（明文显示）" />
+            <TextInput
+              value={draft.appSecret}
+              placeholder="与 App ID 一起填写才生效"
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => patchDraft({ appSecret: text })}
+              style={inputStyle()}
+            />
+            {status?.currentAppId ? (
+              <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
+            ) : null}
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存。按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示；请确保本机账户与备份安全。
+            </Text>
+          </Card>
+        </ScrollView>
+      ) : selection.kind === "global" ? (
+        <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
+          <Card>
+            <CardTitle text="全局设置" hint="对全部会话生效" />
+            <FieldLabel text="lark-cli 路径（空 = 自动发现：PATH / nvm / Homebrew）" />
+            <TextInput
+              value={draft.larkCliPath}
+              placeholder="留空自动发现"
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => patchDraft({ larkCliPath: text })}
+              style={inputStyle()}
+            />
+            <ToggleRow
+              label="回复进话题"
+              hint="回复挂在被 @ 消息的话题下，而不是群消息流"
+              value={draft.replyInThread}
+              onChange={(value) => patchDraft({ replyInThread: value })}
+            />
+            <ToggleRow
+              label="提示未配置会话"
+              hint="未绑定的会话 @ 机器人时回复一条配置提示"
+              value={draft.notifyUnmatched}
+              onChange={(value) => patchDraft({ notifyUnmatched: value })}
+            />
+            <ToggleRow
+              label="收到消息先确认"
+              hint="收到 @ 消息立即回复一条「收到，正在处理」，处理完成后再回结果"
+              value={draft.ackOnReceive}
+              onChange={(value) => patchDraft({ ackOnReceive: value })}
+            />
+            <ToggleRow
+              label="权限请求通知到群"
+              hint="默认关闭；开启后权限请求会发到话题，仍需在 Paseo 客户端批准"
+              value={draft.notifyPermission}
+              onChange={(value) => patchDraft({ notifyPermission: value })}
+            />
+            <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
+            <TextInput
+              value={String(draft.sessionIdleMinutes)}
+              keyboardType="number-pad"
+              onChangeText={(text) => {
+                const minutes = Number.parseInt(text, 10);
+                if (Number.isFinite(minutes)) patchDraft({ sessionIdleMinutes: minutes });
+              }}
+              style={inputStyle()}
+            />
+            <FieldLabel text="回复截断长度（字符）" />
+            <TextInput
+              value={String(draft.maxReplyChars)}
+              keyboardType="number-pad"
+              onChangeText={(text) => {
+                const limit = Number.parseInt(text, 10);
+                if (Number.isFinite(limit)) patchDraft({ maxReplyChars: limit });
+              }}
+              style={inputStyle()}
+            />
+          </Card>
+        </ScrollView>
+      ) : (
+        <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 32, gap: 8 }}>
+          <Text style={{ color: colors().foreground, fontSize: 15, fontWeight: "600" }}>
+            {draft.chats.length === 0 ? "还没有会话绑定" : "选择一个会话绑定"}
+          </Text>
+          <Text style={{ color: colors().foregroundMuted, fontSize: 13, textAlign: "center" }}>
+            {draft.chats.length === 0
+              ? "点左侧「＋ 添加会话」把机器人所在的飞书群绑定到 provider；绑定后群里 @ 机器人即可使用。"
+              : "从左侧选择会话编辑 provider、模型与权限，或在「设置」里查看运行状态。"}
+          </Text>
+        </View>
+      )}
     </View>
   );
-}
 
-function CardTitle({ text, hint }: { text: string; hint?: string }) {
-  return (
-    <View>
-      <Text style={{ fontSize: 15, fontWeight: "700", color: colors().foreground }}>{text}</Text>
-      {hint ? <Text style={{ fontSize: 12, color: colors().foregroundMuted, marginTop: 2 }}>{hint}</Text> : null}
-    </View>
-  );
-}
-
-function InfoRow({ label, value, muted = true }: { label: string; value: string; muted?: boolean }) {
-  return (
-    <View style={{ flexDirection: "row", gap: 10 }}>
-      <Text style={{ color: colors().foregroundMuted, fontSize: 13, width: 110 }}>{label}</Text>
-      <Text style={{ color: muted ? colors().foreground : colors().statusDanger, fontSize: 13, flex: 1 }}>{value}</Text>
-    </View>
-  );
-}
-
-function FieldLabel({ text }: { text: string }) {
-  return <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>{text}</Text>;
-}
-
-function inputStyle(extra?: object): object {
-  return {
-    borderWidth: 1,
-    borderColor: colors().border,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    color: colors().foreground,
-    fontSize: 13,
-    backgroundColor: colors().surface0,
-    ...extra,
-  };
-}
-
-function ToggleRow({
-  label,
-  hint,
-  value,
-  onChange,
-}: {
-  label: string;
-  hint?: string;
-  value: boolean;
-  onChange(value: boolean): void;
-}) {
-  return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-      <View style={{ flex: 1 }}>
-        <Text style={{ fontSize: 13, color: colors().foreground }}>{label}</Text>
-        {hint ? <Text style={{ fontSize: 12, color: colors().foregroundMuted, marginTop: 1 }}>{hint}</Text> : null}
+  if (wide) {
+    return (
+      <View style={{ flex: 1, flexDirection: "row", backgroundColor: colors().surface0 }}>
+        {listPane}
+        <View style={{ flex: 1 }}>{detailPane}</View>
       </View>
-      <Switch
-        value={value}
-        onValueChange={onChange}
-        trackColor={{ true: colors().accent, false: colors().surface2 }}
-        thumbColor={colors().surface1}
-      />
+    );
+  }
+  return (
+    <View style={{ flex: 1, backgroundColor: colors().surface0 }}>
+      {selection.kind === "none" ? listPane : detailPane}
     </View>
-  );
-}
-
-function ChoicePill({
-  label,
-  active,
-  onPress,
-}: {
-  label: string;
-  active: boolean;
-  onPress(): void;
-}) {
-  const c = colors();
-  return (
-    <Pressable
-      onPress={onPress}
-      style={{
-        paddingHorizontal: 10,
-        paddingVertical: 5,
-        borderRadius: 999,
-        borderWidth: 1,
-        borderColor: active ? c.accent : c.border,
-        backgroundColor: active ? c.accent : c.surface1,
-      }}
-    >
-      <Text style={{ fontSize: 12, color: active ? c.accentForeground : c.foreground }}>{label}</Text>
-    </Pressable>
-  );
-}
-
-function Pill({ text, tone }: { text: string; tone: "success" | "warning" | "danger" | "muted" }) {
-  const c = colors();
-  const color = tone === "success" ? c.statusSuccess : tone === "warning" ? c.statusWarning : tone === "danger" ? c.statusDanger : c.foregroundMuted;
-  return (
-    <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, backgroundColor: c.surface2 }}>
-      <Text style={{ fontSize: 12, color }}>{text}</Text>
-    </View>
-  );
-}
-
-function PrimaryButton({
-  label,
-  onPress,
-  disabled,
-  subtle,
-}: {
-  label: string;
-  onPress(): void;
-  disabled?: boolean;
-  subtle?: boolean;
-}) {
-  const c = colors();
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      style={{
-        paddingHorizontal: 16,
-        paddingVertical: 8,
-        borderRadius: 8,
-        backgroundColor: disabled ? c.surface2 : subtle ? c.surface2 : c.accent,
-        borderWidth: 1,
-        borderColor: disabled ? c.border : subtle ? c.border : c.accent,
-      }}
-    >
-      <Text style={{ fontSize: 13, color: disabled ? c.foregroundMuted : subtle ? c.foreground : c.accentForeground }}>
-        {label}
-      </Text>
-    </Pressable>
   );
 }
 
