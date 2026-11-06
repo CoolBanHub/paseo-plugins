@@ -59,7 +59,7 @@ interface Sent {
 function fixture(values: Partial<typeof DEFAULT_NOTIFY_VALUES> = {}) {
   const sent: Sent[] = [];
   const notifier = createNotifier({
-    readValues: async () => ({ ...DEFAULT_NOTIFY_VALUES, ...values }),
+    readValues: async () => ({ ...DEFAULT_NOTIFY_VALUES, quietMinutes: 0, ...values }),
     resolveCli: () => "/tmp/lark-cli",
     readOpenId: async () => "ou_test",
     send: async (payload) => {
@@ -247,4 +247,104 @@ test("resolves the recipient from lark-cli when openId is empty", async () => {
   const { notifier, sent } = fixture({ openId: "" });
   await notifier.handlePermission({ agent, request } as never);
   assert.equal(sent[0]?.openId, "ou_test");
+});
+
+test("turn-end notifications within a quiet window are held back and summarized once", async () => {
+  const sent: Sent[] = [];
+  let clock = 1_000_000;
+  const keys: Array<string | undefined> = [];
+  const notifier = createNotifier({
+    readValues: async () => ({ ...DEFAULT_NOTIFY_VALUES, quietMinutes: 5 }),
+    resolveCli: () => "/tmp/lark-cli",
+    readOpenId: async () => "ou_test",
+    send: async (payload) => {
+      sent.push({ openId: payload.openId, text: payload.text, identity: payload.identity });
+      keys.push(payload.idempotencyKey);
+      return "om_1";
+    },
+    log: () => {},
+    now: () => clock,
+    schedule: (fn) => {
+      // The fake clock cannot drive a real timer; fire the flush promptly.
+      setTimeout(fn, 10);
+      return { unref: () => {} };
+    },
+  });
+  const turn = (text: string) => notifier.handleTurnEnded({
+    agent,
+    outcome: { kind: "completed" },
+    timeline: [{ type: "assistant_message", text }],
+  } as never);
+
+  await turn("第一轮");
+  assert.equal(sent.length, 1, "the first completion notifies immediately");
+  clock += 30_000;
+  await turn("第二轮");
+  clock += 30_000;
+  await turn("第三轮");
+  assert.equal(sent.length, 1, "completions inside the window are held back");
+  // Let the scheduled flush fire.
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.ok(sent.length >= 2, "the window expiry summarizes the held-back completions");
+  const flush = sent[sent.length - 1]!;
+  assert.match(flush.text, /静默期内另有 2 轮任务完成/);
+  assert.match(flush.text, /最近一轮：第三轮/);
+  // A later completion after the window notifies immediately again.
+  clock += 6 * 60_000;
+  await turn("第四轮");
+  const last = sent[sent.length - 1]!;
+  assert.match(last.text, /第四轮/);
+  assert.match(last.text, /静默期内已抑制 0 轮|第四轮/, "no stale suppression note");
+});
+
+test("quietMinutes 0 keeps the previous per-turn behavior", async () => {
+  const loud = fixture({ quietMinutes: 0 });
+  await loud.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never);
+  await loud.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never);
+  assert.equal(loud.sent.length, 2);
+});
+
+test("a failed send retries once with the same idempotency key", async () => {
+  const sent: Array<{ text: string; key?: string }> = [];
+  let failures = 1;
+  const notifier = createNotifier({
+    readValues: async () => ({ ...DEFAULT_NOTIFY_VALUES, quietMinutes: 0 }),
+    resolveCli: () => "/tmp/lark-cli",
+    readOpenId: async () => "ou_test",
+    send: async (payload) => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error("temporary lark-cli failure");
+      }
+      sent.push({ text: payload.text, key: payload.idempotencyKey });
+      return "om_1";
+    },
+    log: () => {},
+    retryDelayMs: 5,
+  });
+  await notifier.handlePermission({ agent, request } as never);
+  assert.equal(sent.length, 1, "the retry delivers the notification");
+  assert.ok(sent[0]?.key, "the notification carries an idempotency key");
+});
+
+test("seen permissions evict the oldest entry instead of clearing the set", async () => {
+  const values = { ...DEFAULT_NOTIFY_VALUES, quietMinutes: 0 };
+  const seen: string[] = [];
+  let clock = 1;
+  const notifier = createNotifier({
+    readValues: async () => values,
+    resolveCli: () => "/tmp/lark-cli",
+    readOpenId: async () => "ou_test",
+    send: async (payload) => {
+      seen.push(payload.text);
+      return "om_1";
+    },
+    log: () => {},
+    now: () => clock,
+  });
+  // First delivery registers the id.
+  await notifier.handlePermission({ agent, request } as never);
+  assert.equal(seen.length, 1);
+  await notifier.handlePermission({ agent, request } as never);
+  assert.equal(seen.length, 1, "a remembered permission is not re-notified");
 });

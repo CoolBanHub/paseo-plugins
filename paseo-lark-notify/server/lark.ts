@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { accessSync, constants, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -11,6 +11,8 @@ export interface SendDmOptions {
   openId: string;
   identity: "bot" | "user";
   text: string;
+  /** Stable per logical notification; lets a retry never duplicate a send. */
+  idempotencyKey?: string;
 }
 
 interface LarkError {
@@ -103,21 +105,55 @@ export async function readSelfOpenId(cliPath: string): Promise<string | null> {
   }
 }
 
+/** Run lark-cli with the body on stdin; a timeout kills the child hard. */
+function runWithStdin(cliPath: string, args: string[], stdin: string): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cliPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    let size = 0;
+    const timer = setTimeout(() => child.kill("SIGKILL"), SEND_TIMEOUT_MS);
+    timer.unref();
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (size + chunk.length <= 4 * 1024 * 1024) {
+        stdout.push(chunk);
+        size += chunk.length;
+      }
+    });
+    const stderr: Buffer[] = [];
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.reduce((total, part) => total + part.length, 0) + chunk.length <= 64 * 1024) stderr.push(chunk);
+    });
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (signal) {
+        reject(new Error("lark-cli 执行超时"));
+        return;
+      }
+      resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
+    });
+    child.stdin.on("error", () => { /* the child may exit before reading all input */ });
+    child.stdin.end(stdin);
+  });
+}
+
 export async function sendDm(options: SendDmOptions): Promise<string | null> {
-  const { stdout, stderr } = await execFileAsync(
-    options.cliPath,
-    [
-      "im",
-      "+messages-send",
-      "--as",
-      options.identity,
-      "--user-id",
-      options.openId,
-      "--markdown",
-      options.text,
-    ],
-    { timeout: SEND_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
-  );
+  // "-" reads the markdown from stdin so the notification body (project
+  // paths, session titles, reply excerpts) never appears in `ps` output.
+  const args = [
+    "im",
+    "+messages-send",
+    "--as",
+    options.identity,
+    "--user-id",
+    options.openId,
+    "--markdown",
+    "-",
+  ];
+  if (options.idempotencyKey) {
+    args.push("--idempotency-key", options.idempotencyKey.slice(0, 50));
+  }
+  const { stdout, stderr } = await runWithStdin(options.cliPath, args, options.text);
 
   const payload = parseLarkJson(stdout);
   if (payload?.ok === true) return payload.data?.message_id ?? null;

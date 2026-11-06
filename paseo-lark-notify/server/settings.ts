@@ -18,6 +18,12 @@ export const notifyValuesSchema = z.object({
   notifySessionEnd: z.boolean().default(true),
   /** Child agents also emit turn-ended events; keep them quiet by default. */
   includeSubagents: z.boolean().default(false),
+  /**
+   * Per-session suppression window for turn-end notifications: further
+   * completions inside the window are held back and summarized once when it
+   * expires. 0 sends every turn immediately.
+   */
+  quietMinutes: z.number().int().min(0).max(120).default(5),
 });
 
 export type NotifyValues = z.output<typeof notifyValuesSchema>;
