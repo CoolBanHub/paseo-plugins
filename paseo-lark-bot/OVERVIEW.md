@@ -109,3 +109,11 @@ npm run typecheck
 - 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）。
 - 仅支持飞书中国区（`open.feishu.cn`、`--brand feishu`），不计划支持国际版 Lark。
 - daemon 重启后的缓冲上限为 50 条；超过上限或缓冲期间插件始终未拿到 PaseoApi 时，旧消息会丢失。
+
+## 投递可靠性（2026-11 加固）
+
+- 回复发送失败自动重试：429/限流类退避 5 秒，瞬时网络类 1s/2s 递增，
+  最多三次，全部携带同一 `--idempotency-key`（message_id+正文哈希），
+  重试不会重复发消息；鉴权/权限类错误快速失败。
+- `message_id` 去重窗口持久化到 plugin-data（最近 1000 条，去抖原子写），
+  daemon 重启后 at-least-once 的重投不会再触发重复回复。

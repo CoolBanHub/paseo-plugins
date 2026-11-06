@@ -169,3 +169,13 @@ check again and load server changes. It refuses to reload when any ZCode
 agent is running, initializing, awaiting permission, or cannot be inspected.
 This is a snapshot check: avoid starting tasks during the reload. Changes to
 documentation, tests, or development scripts do not require a reload.
+
+## 崩溃恢复与错误呈现（2026-11 加固）
+
+- app-server 子进程 spawn 失败（如 node 路径无效）会立即让全部在途请求
+  失败，不再挂满超时；进程意外退出时，就绪会话会收到
+  `session.runtime_failed`（进行中的 turn 标记 failed），重新打开会话即可
+  恢复，不再出现事件流断供后回合永不结束的挂死。
+- 请求错误保留结构化错误码，常见类别（401/402/403/404/429 与额度、限流、
+  认证失效、上下文超限的消息模式）映射为中文提示；未决权限登记与
+  无监听者事件队列均有上界。

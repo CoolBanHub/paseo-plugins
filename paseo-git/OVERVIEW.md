@@ -119,3 +119,10 @@ rename -z order), stage/unstage round-trips, checked-files commit via
 cherry-pick conflict flows with continue/abort, reset/revert/rollback,
 diff modes with truncation, and the graph lane + IDEA segment models).
 After editing, `paseo plugin reload git-manager` picks up server changes.
+
+## 参数校验（2026-11 加固）
+
+- 切换/检出（`gitCheckout`）的目标 ref 与提交详情（`gitCommit`）的哈希
+  均按白名单校验：拒绝会被 git 解释为选项的值（如 `--output=…`），提交
+  哈希要求 4-64 位十六进制；非法输入返回中文错误，不影响正常分支与
+  缩写哈希。
