@@ -29,6 +29,10 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         chatId: "oc_group",
         chatName: "测试群",
         provider: "claude",
+        model: "",
+        thinkingOptionId: "",
+        permission: "",
+        allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
         replyFormat: "markdown" as const,
@@ -37,6 +41,10 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         chatId: "oc_p2p",
         chatName: "",
         provider: "codex",
+        model: "",
+        thinkingOptionId: "",
+        permission: "",
+        allowedUsers: [],
         cwd: "/tmp",
         systemPrompt: "",
         replyFormat: "text" as const,
@@ -52,6 +60,31 @@ describe("routeMessage", () => {
     assert.equal(decision.reason, "ok");
     assert.equal(decision.binding?.provider, "claude");
     assert.equal(decision.prompt, "帮我看看这个问题");
+  });
+
+  it("blocks senders outside the per-chat allowlist", () => {
+    const base = values();
+    const first = base.chats[0];
+    assert.ok(first);
+    const restricted = values({
+      chats: [
+        { ...first, allowedUsers: [{ openId: "ou_boss", name: "指定人" }] },
+        base.chats[1]!,
+      ],
+    });
+
+    const blocked = routeMessage(event({ sender_id: "ou_other" }), restricted, BOT);
+    assert.equal(blocked.reason, "blocked");
+    assert.equal(blocked.binding, null);
+
+    const allowed = routeMessage(event({ sender_id: "ou_boss" }), restricted, BOT);
+    assert.equal(allowed.reason, "ok");
+    assert.equal(allowed.binding?.provider, "claude");
+  });
+
+  it("keeps every sender allowed when the allowlist is empty", () => {
+    const decision = routeMessage(event({ sender_id: "ou_anyone" }), values(), BOT);
+    assert.equal(decision.reason, "ok");
   });
 
   it("ignores group messages without an @-mention of this bot", () => {

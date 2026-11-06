@@ -7,14 +7,28 @@ const HANDLED_MESSAGE_TYPES = new Set(["text", "post"]);
 export interface RoutingDecision {
   binding: ChatBinding | null;
   prompt: string;
-  reason: "ok" | "unmatched" | "ignored";
+  reason: "ok" | "unmatched" | "ignored" | "blocked";
+}
+
+/** True when this sender may drive the bot in the chat. Empty = everyone. */
+export function isSenderAllowed(binding: ChatBinding, senderId: string): boolean {
+  return (
+    binding.allowedUsers.length === 0 ||
+    binding.allowedUsers.some((user) => user.openId === senderId)
+  );
+}
+
+/** True when the event @-mentions this bot (group chats only). */
+export function mentionsBot(event: LarkMessageEvent, botOpenId: string | null): boolean {
+  if (!botOpenId) return false;
+  return (event.mentions ?? []).some((mention) => mention.id === botOpenId);
 }
 
 /**
  * Decide whether an inbound event should run through an agent and produce the
  * cleaned prompt. Group chats require an @-mention of this bot; p2p chats are
  * handled directly. The bot's own outgoing messages and non-text types are
- * ignored.
+ * ignored. A bound chat can restrict triggering to allowlisted users.
  */
 export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpenId: string | null): RoutingDecision {
   if (!HANDLED_MESSAGE_TYPES.has(event.message_type)) {
@@ -30,8 +44,7 @@ export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpen
     if (!botOpenId) {
       return { binding: null, prompt: "", reason: "ignored" };
     }
-    const mentioned = (event.mentions ?? []).some((mention) => mention.id === botOpenId);
-    if (!mentioned) {
+    if (!mentionsBot(event, botOpenId)) {
       return { binding: null, prompt: "", reason: "ignored" };
     }
   }
@@ -39,6 +52,9 @@ export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpen
   const binding = values.chats.find((chat) => chat.chatId === event.chat_id) ?? null;
   if (!binding) {
     return { binding: null, prompt: "", reason: "unmatched" };
+  }
+  if (!isSenderAllowed(binding, event.sender_id)) {
+    return { binding: null, prompt: "", reason: "blocked" };
   }
   return { binding, prompt: extractPrompt(event), reason: "ok" };
 }

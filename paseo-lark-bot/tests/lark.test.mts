@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseLarkJson, replyMessage, resolveLarkCli } from "../server/lark.ts";
+import { listChatMembers, parseLarkJson, replyMessage, resolveLarkCli } from "../server/lark.ts";
 
 describe("parseLarkJson", () => {
   it("parses JSON after leading warnings", () => {
@@ -98,6 +98,40 @@ describe("applyAppCredentials", () => {
     });
     assert.deepEqual(calls, [{ appId: "cli_good", secret: "secret" }]);
     assert.equal(busStopped, true);
+  });
+});
+
+describe("listChatMembers", () => {
+  it("parses human members and ignores non-open-id entries", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-members-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+if (!args.includes("+chat-members-list") || !args.includes("oc_chat") || !args.includes("--page-all")) {
+  console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv" } }));
+  process.exit(0);
+}
+console.log(JSON.stringify({
+  ok: true,
+  data: {
+    users: [
+      { member_id: "ou_a", name: "甲" },
+      { member_id: "not-an-open-id", name: "坏数据" },
+    ],
+    bots: [{ member_id: "ou_bot", name: "机器人" }],
+  },
+}));
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const members = await listChatMembers(cli, "oc_chat");
+      assert.deepEqual(members, [{ openId: "ou_a", name: "甲" }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

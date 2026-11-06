@@ -3,7 +3,14 @@ import { Pressable, ScrollView, Switch, Text, TextInput, View } from "react-nati
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useToast } from "@getpaseo/plugin/client/react-native";
-import { larkBotChatsRpc, larkBotProvidersRpc, larkBotStatusRpc } from "../shared/contracts.ts";
+import {
+  larkBotChatMembersRpc,
+  larkBotChatsRpc,
+  larkBotProvidersRpc,
+  larkBotStatusRpc,
+  type LarkBotChatMember,
+  type LarkBotProviderInfo,
+} from "../shared/contracts.ts";
 import {
   botValuesSchema,
   larkBotSettingsRpc,
@@ -65,6 +72,37 @@ const REPLY_FORMATS: { value: ReplyFormat; label: string }[] = [
 
 const CARD = 12;
 
+interface MemberCatalogState {
+  loading: boolean;
+  members: LarkBotChatMember[];
+  error: string | null;
+}
+
+/** Provider ids can be `provider/model`; the picker lists the bare id. */
+function findProvider(providers: LarkBotProviderInfo[], providerId: string): LarkBotProviderInfo | undefined {
+  const base = providerId.split("/", 1)[0] ?? providerId;
+  return providers.find((candidate) => candidate.id === base) ?? providers.find((candidate) => candidate.id === providerId);
+}
+
+/** The selected model, or the provider default when the binding leaves it empty. */
+function findModel(provider: LarkBotProviderInfo | undefined, modelId: string) {
+  if (!provider) return undefined;
+  if (modelId) {
+    const selected = provider.models.find((model) => model.id === modelId);
+    if (selected) return selected;
+  }
+  return (
+    provider.models.find((model) => model.isDefault) ??
+    provider.models[0] ??
+    undefined
+  );
+}
+
+function permissionLabel(provider: LarkBotProviderInfo | undefined, value: string): string {
+  if (!value) return "默认";
+  return provider?.permissionOptions.find((option) => option.value === value)?.label ?? value;
+}
+
 export function BotCenterSurface(props: PluginSurfaceProps) {
   applyTheme(props.theme);
   const toast = useToast();
@@ -72,6 +110,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const writeRpc = useRpc(larkBotSettingsRpc.write);
   const chatsRpc = useRpc(larkBotChatsRpc);
   const providersRpc = useRpc(larkBotProvidersRpc);
+  const chatMembersRpc = useRpc(larkBotChatMembersRpc);
   const statusRpc = useRpc(larkBotStatusRpc);
 
   const [revision, setRevision] = useState<string | null>(null);
@@ -79,7 +118,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [draft, setDraft] = useState<BotValues | null>(null);
   const [saving, setSaving] = useState(false);
   const [chatCatalog, setChatCatalog] = useState<{ chatId: string; name: string }[]>([]);
-  const [providers, setProviders] = useState<{ id: string; label: string }[]>([]);
+  const [providers, setProviders] = useState<LarkBotProviderInfo[]>([]);
+  const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
+  const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<StatusState | null>(null);
 
   const reload = useCallback(async () => {
@@ -155,6 +196,10 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               chatId,
               chatName: catalogName,
               provider: providers[0]?.id ?? "",
+              model: "",
+              thinkingOptionId: "",
+              permission: "",
+              allowedUsers: [],
               cwd: "",
               systemPrompt: "",
               replyFormat: "markdown",
@@ -171,6 +216,100 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       current ? { ...current, chats: current.chats.filter((chat) => chat.chatId !== chatId) } : current,
     );
   }, []);
+
+  const selectProvider = useCallback(
+    (chatId: string, provider: string) => {
+      // Model/thinking/permission ids are provider-specific; keeping a stale
+      // value would make the next agents.create() reject the config.
+      patchBinding(chatId, { provider, model: "", thinkingOptionId: "", permission: "" });
+    },
+    [patchBinding],
+  );
+
+  const selectModel = useCallback(
+    (chatId: string, model: string) => {
+      patchBinding(chatId, { model, thinkingOptionId: "" });
+    },
+    [patchBinding],
+  );
+
+  const addAllowedUser = useCallback((chatId: string, user: LarkBotChatMember) => {
+    setDraft((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        chats: current.chats.map((chat) => {
+          if (chat.chatId !== chatId || chat.allowedUsers.some((entry) => entry.openId === user.openId)) {
+            return chat;
+          }
+          return { ...chat, allowedUsers: [...chat.allowedUsers, { openId: user.openId, name: user.name }] };
+        }),
+      };
+    });
+  }, []);
+
+  const removeAllowedUser = useCallback((chatId: string, openId: string) => {
+    setDraft((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        chats: current.chats.map((chat) =>
+          chat.chatId === chatId
+            ? { ...chat, allowedUsers: chat.allowedUsers.filter((entry) => entry.openId !== openId) }
+            : chat,
+        ),
+      };
+    });
+  }, []);
+
+  const addAllowedFromText = useCallback(
+    (chatId: string) => {
+      const text = (allowedDrafts[chatId] ?? "").trim();
+      if (!text) return;
+      const tokens = text.split(/[\s,，;；]+/u).map((token) => token.trim()).filter(Boolean);
+      const invalid = tokens.find((token) => !token.startsWith("ou_"));
+      if (invalid) {
+        toast.error(`open_id 应以 ou_ 开头：${invalid}`);
+        return;
+      }
+      const names = new Map<string, string>();
+      for (const chat of draft?.chats ?? []) {
+        for (const user of chat.allowedUsers) names.set(user.openId, user.name);
+      }
+      for (const member of memberCatalogs[chatId]?.members ?? []) names.set(member.openId, member.name);
+      for (const openId of new Set(tokens)) {
+        addAllowedUser(chatId, { openId, name: names.get(openId) ?? "" });
+      }
+      setAllowedDrafts((current) => ({ ...current, [chatId]: "" }));
+    },
+    [addAllowedUser, allowedDrafts, draft, memberCatalogs, toast],
+  );
+
+  const loadMembers = useCallback(
+    async (chatId: string) => {
+      setMemberCatalogs((current) => ({
+        ...current,
+        [chatId]: { loading: true, members: current[chatId]?.members ?? [], error: null },
+      }));
+      try {
+        const result = await chatMembersRpc({ chatId });
+        setMemberCatalogs((current) => ({
+          ...current,
+          [chatId]: { loading: false, members: result.members, error: result.error },
+        }));
+      } catch (error) {
+        setMemberCatalogs((current) => ({
+          ...current,
+          [chatId]: {
+            loading: false,
+            members: current[chatId]?.members ?? [],
+            error: error instanceof Error ? error.message : String(error),
+          },
+        }));
+      }
+    },
+    [chatMembersRpc],
+  );
 
   const dirty =
     draft !== null && loaded !== null && JSON.stringify(normalize(draft)) !== JSON.stringify(normalize(loaded));
@@ -262,78 +401,259 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       {/* Chat bindings */}
       <Card>
         <CardTitle text="会话绑定" hint="每个飞书会话用哪个 provider 处理消息" />
-        {draft.chats.map((binding) => (
-          <View
-            key={binding.chatId}
-            style={{
-              borderWidth: 1,
-              borderColor: colors().border,
-              borderRadius: 10,
-              padding: 12,
-              gap: 10,
-              backgroundColor: colors().surface1,
-            }}
-          >
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-              <Text style={{ fontWeight: "600", color: colors().foreground, flex: 1 }}>
-                {binding.chatName || "未命名会话"}
-              </Text>
-              <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>{binding.chatId}</Text>
-              <Pressable onPress={() => removeBinding(binding.chatId)} hitSlop={6}>
-                <Text style={{ color: colors().statusDanger, fontSize: 13 }}>移除</Text>
-              </Pressable>
-            </View>
+        {draft.chats.map((binding) => {
+          const provider = findProvider(providers, binding.provider);
+          const effectiveModel = findModel(provider, binding.model);
+          const thinkingOptions = effectiveModel?.thinkingOptions ?? [];
+          const selectedMemberIds = new Set(binding.allowedUsers.map((user) => user.openId));
+          const memberCatalog = memberCatalogs[binding.chatId];
+          const addableMembers = (memberCatalog?.members ?? []).filter(
+            (member) => !selectedMemberIds.has(member.openId),
+          );
+          const unknownModel =
+            binding.model && !provider?.models.some((model) => model.id === binding.model)
+              ? binding.model
+              : null;
+          const unknownThinking =
+            binding.thinkingOptionId && !thinkingOptions.some((option) => option.id === binding.thinkingOptionId)
+              ? binding.thinkingOptionId
+              : null;
+          const unknownPermission =
+            binding.permission && !provider?.permissionOptions.some((option) => option.value === binding.permission)
+              ? binding.permission
+              : null;
+          const defaultPermissionLabel = provider?.defaultPermission
+            ? permissionLabel(provider, provider.defaultPermission)
+            : null;
+          const permissionHint = !provider
+            ? "未获取到 provider 信息，留空使用 provider / 插件默认权限。"
+            : provider.permissionKind === "dsh-preset"
+              ? "留空 = 完全权限（与旧版一致）；按 dsh 权限预设限制本会话可用的工具能力。"
+              : provider.permissionKind === "mode"
+                ? `留空 = provider 默认${defaultPermissionLabel ? `（${defaultPermissionLabel}）` : ""}；决定工具审批/运行模式。`
+                : "该 provider 没有可配置的权限模式，使用自身默认。";
+          const thinkingDefaultLabel = provider?.permissionKind === "dsh-preset" ? "默认（最深）" : "默认";
+          return (
+            <View
+              key={binding.chatId}
+              style={{
+                borderWidth: 1,
+                borderColor: colors().border,
+                borderRadius: 10,
+                padding: 12,
+                gap: 10,
+                backgroundColor: colors().surface1,
+              }}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Text style={{ fontWeight: "600", color: colors().foreground, flex: 1 }}>
+                  {binding.chatName || "未命名会话"}
+                </Text>
+                <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>{binding.chatId}</Text>
+                <Pressable onPress={() => removeBinding(binding.chatId)} hitSlop={6}>
+                  <Text style={{ color: colors().statusDanger, fontSize: 13 }}>移除</Text>
+                </Pressable>
+              </View>
 
-            <FieldLabel text="Provider" />
-            {providers.length > 0 ? (
-              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                {providers.map((provider) => (
+              <FieldLabel text="Provider" />
+              {providers.length > 0 ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  {providers.map((candidate) => (
+                    <ChoicePill
+                      key={candidate.id}
+                      label={candidate.label}
+                      active={findProvider(providers, binding.provider)?.id === candidate.id}
+                      onPress={() => selectProvider(binding.chatId, candidate.id)}
+                    />
+                  ))}
+                </View>
+              ) : (
+                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                  未获取到 provider 列表，请先点顶部「刷新」。
+                </Text>
+              )}
+
+              <FieldLabel text="模型（留空 = provider 默认模型）" />
+              {(provider?.models.length ?? 0) > 0 || unknownModel ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
                   <ChoicePill
-                    key={provider.id}
-                    label={provider.label}
-                    active={binding.provider === provider.id}
-                    onPress={() => patchBinding(binding.chatId, { provider: provider.id })}
+                    label="默认"
+                    active={!binding.model}
+                    onPress={() => selectModel(binding.chatId, "")}
+                  />
+                  {(provider?.models ?? []).map((model) => (
+                    <ChoicePill
+                      key={model.id}
+                      label={model.label + (model.isDefault ? "（默认）" : "")}
+                      active={binding.model === model.id}
+                      onPress={() => selectModel(binding.chatId, model.id)}
+                    />
+                  ))}
+                  {unknownModel ? (
+                    <ChoicePill
+                      label={`${unknownModel}（未在列表）`}
+                      active
+                      onPress={() => selectModel(binding.chatId, "")}
+                    />
+                  ) : null}
+                </View>
+              ) : (
+                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                  未获取到模型列表，留空使用 provider 默认模型。
+                </Text>
+              )}
+
+              <FieldLabel text="思考深度（留空 = 模型默认；dsh 留空 = 最深）" />
+              {thinkingOptions.length > 0 ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <ChoicePill
+                    label={thinkingDefaultLabel}
+                    active={!binding.thinkingOptionId}
+                    onPress={() => patchBinding(binding.chatId, { thinkingOptionId: "" })}
+                  />
+                  {thinkingOptions.map((option) => (
+                    <ChoicePill
+                      key={option.id}
+                      label={option.label}
+                      active={binding.thinkingOptionId === option.id}
+                      onPress={() => patchBinding(binding.chatId, { thinkingOptionId: option.id })}
+                    />
+                  ))}
+                  {unknownThinking ? (
+                    <ChoicePill
+                      label={`${unknownThinking}（未在列表）`}
+                      active
+                      onPress={() => patchBinding(binding.chatId, { thinkingOptionId: "" })}
+                    />
+                  ) : null}
+                </View>
+              ) : (
+                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                  {provider
+                    ? "该模型没有可选的思考深度，留空使用 provider / 模型默认。"
+                    : "未获取到 provider 信息，留空使用默认思考深度。"}
+                </Text>
+              )}
+
+              <FieldLabel text="权限（留空 = provider / 插件默认）" />
+              {(provider?.permissionOptions.length ?? 0) > 0 || unknownPermission ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <ChoicePill
+                    label="默认"
+                    active={!binding.permission}
+                    onPress={() => patchBinding(binding.chatId, { permission: "" })}
+                  />
+                  {(provider?.permissionOptions ?? []).map((option) => (
+                    <ChoicePill
+                      key={option.value}
+                      label={option.label}
+                      active={binding.permission === option.value}
+                      onPress={() => patchBinding(binding.chatId, { permission: option.value })}
+                    />
+                  ))}
+                  {unknownPermission ? (
+                    <ChoicePill
+                      label={`${unknownPermission}（未在列表）`}
+                      active
+                      onPress={() => patchBinding(binding.chatId, { permission: "" })}
+                    />
+                  ) : null}
+                </View>
+              ) : null}
+              <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>{permissionHint}</Text>
+
+              <FieldLabel text="允许 @ 的成员（留空 = 所有人可触发）" />
+              {binding.allowedUsers.length === 0 ? (
+                <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                  当前所有人都可以 @ 我处理。
+                </Text>
+              ) : (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  {binding.allowedUsers.map((user) => (
+                    <ChoicePill
+                      key={user.openId}
+                      label={`${user.name || user.openId} ×`}
+                      active
+                      onPress={() => removeAllowedUser(binding.chatId, user.openId)}
+                    />
+                  ))}
+                </View>
+              )}
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <TextInput
+                  value={allowedDrafts[binding.chatId] ?? ""}
+                  placeholder="ou_xxx，多个用逗号分隔"
+                  placeholderTextColor={colors().foregroundMuted}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  returnKeyType="done"
+                  onSubmitEditing={() => addAllowedFromText(binding.chatId)}
+                  onChangeText={(text) =>
+                    setAllowedDrafts((current) => ({ ...current, [binding.chatId]: text }))
+                  }
+                  style={inputStyle({ flex: 1 })}
+                />
+                <PrimaryButton label="添加" onPress={() => addAllowedFromText(binding.chatId)} subtle />
+                <PrimaryButton
+                  label={memberCatalog?.loading ? "读取中…" : "读取群成员"}
+                  onPress={() => void loadMembers(binding.chatId)}
+                  subtle
+                />
+              </View>
+              {memberCatalog?.error ? (
+                <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
+                  读取群成员失败：{memberCatalog.error}。仍可手动填写 open_id。
+                </Text>
+              ) : null}
+              {addableMembers.length > 0 ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  {addableMembers.slice(0, 50).map((member) => (
+                    <ChoicePill
+                      key={member.openId}
+                      label={member.name || member.openId}
+                      active={false}
+                      onPress={() => addAllowedUser(binding.chatId, member)}
+                    />
+                  ))}
+                </View>
+              ) : null}
+              <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
+                非指定成员 @ 时会收到提示，消息不会进入话题上下文。读取成员需要飞书权限 im:chat.members:read。
+              </Text>
+
+              <FieldLabel text="工作目录（空 = 用户主目录；支持 ~/ 开头）" />
+              <TextInput
+                value={binding.cwd}
+                placeholder="~/Workspace/project"
+                placeholderTextColor={colors().foregroundMuted}
+                onChangeText={(text) => patchBinding(binding.chatId, { cwd: text })}
+                style={inputStyle()}
+              />
+
+              <FieldLabel text="系统提示（可选，追加在该会话的指令前）" />
+              <TextInput
+                value={binding.systemPrompt}
+                placeholder="例：你是项目维护助手，用中文回答"
+                placeholderTextColor={colors().foregroundMuted}
+                multiline
+                onChangeText={(text) => patchBinding(binding.chatId, { systemPrompt: text })}
+                style={inputStyle({ height: 64, textAlignVertical: "top" })}
+              />
+
+              <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
+              <View style={{ flexDirection: "row", gap: 8 }}>
+                {REPLY_FORMATS.map((format) => (
+                  <ChoicePill
+                    key={format.value}
+                    label={format.label}
+                    active={binding.replyFormat === format.value}
+                    onPress={() => patchBinding(binding.chatId, { replyFormat: format.value })}
                   />
                 ))}
               </View>
-            ) : (
-              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-                未获取到 provider 列表，请先点顶部「刷新」。
-              </Text>
-            )}
-
-            <FieldLabel text="工作目录（空 = 用户主目录；支持 ~/ 开头）" />
-            <TextInput
-              value={binding.cwd}
-              placeholder="~/Workspace/project"
-              placeholderTextColor={colors().foregroundMuted}
-              onChangeText={(text) => patchBinding(binding.chatId, { cwd: text })}
-              style={inputStyle()}
-            />
-
-            <FieldLabel text="系统提示（可选，追加在该会话的指令前）" />
-            <TextInput
-              value={binding.systemPrompt}
-              placeholder="例：你是项目维护助手，用中文回答"
-              placeholderTextColor={colors().foregroundMuted}
-              multiline
-              onChangeText={(text) => patchBinding(binding.chatId, { systemPrompt: text })}
-              style={inputStyle({ height: 64, textAlignVertical: "top" })}
-            />
-
-            <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
-            <View style={{ flexDirection: "row", gap: 8 }}>
-              {REPLY_FORMATS.map((format) => (
-                <ChoicePill
-                  key={format.value}
-                  label={format.label}
-                  active={binding.replyFormat === format.value}
-                  onPress={() => patchBinding(binding.chatId, { replyFormat: format.value })}
-                />
-              ))}
             </View>
-          </View>
-        ))}
+          );
+        })}
 
         <FieldLabel text="添加会话" />
         {addableChats.length === 0 ? (
@@ -615,6 +935,15 @@ function normalize(values: BotValues): BotValues {
       ...chat,
       chatName: chat.chatName.trim(),
       provider: chat.provider.trim(),
+      model: chat.model.trim(),
+      thinkingOptionId: chat.thinkingOptionId.trim(),
+      permission: chat.permission.trim(),
+      allowedUsers: chat.allowedUsers
+        .map((user) => ({ openId: user.openId.trim(), name: user.name.trim() }))
+        .filter(
+          (user, index, users) =>
+            user.openId.length > 0 && users.findIndex((candidate) => candidate.openId === user.openId) === index,
+        ),
       cwd: chat.cwd.trim(),
       systemPrompt: chat.systemPrompt.trim(),
     })),

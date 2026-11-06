@@ -11,15 +11,54 @@ export const larkBotChatsRpc = defineRpc({
   }),
 });
 
-/** Enabled Paseo providers, for the per-chat provider picker. */
+/** Enabled Paseo providers with the options the binding UI can select. */
 export const larkBotProvidersRpc = defineRpc({
   name: "lark-bot.providers.list",
   input: z.object({}).strict(),
   output: z.object({
-    providers: z.array(z.object({ id: z.string(), label: z.string() })),
+    providers: z.array(
+      z.object({
+        id: z.string(),
+        label: z.string(),
+        models: z.array(
+          z.object({
+            id: z.string(),
+            label: z.string(),
+            isDefault: z.boolean(),
+            thinkingOptions: z.array(z.object({ id: z.string(), label: z.string() })),
+            defaultThinkingOptionId: z.string().nullable(),
+          }),
+        ),
+        modes: z.array(
+          z.object({ id: z.string(), label: z.string(), description: z.string().nullable() }),
+        ),
+        /**
+         * How `permission` is applied: dsh uses a permission preset feature,
+         * other providers use their mode id, and `none` means no selectable
+         * permission option is available.
+         */
+        permissionKind: z.enum(["dsh-preset", "mode", "none"]),
+        permissionOptions: z.array(z.object({ value: z.string(), label: z.string() })),
+        /** Effective provider default when the binding leaves permission empty. */
+        defaultPermission: z.string().nullable(),
+      }),
+    ),
     error: z.string().nullable(),
   }),
 });
+
+/** Members of one chat, for the per-binding allowlist picker. */
+export const larkBotChatMembersRpc = defineRpc({
+  name: "lark-bot.chat.members",
+  input: z.object({ chatId: z.string().min(1) }).strict(),
+  output: z.object({
+    members: z.array(z.object({ openId: z.string(), name: z.string() })),
+    error: z.string().nullable(),
+  }),
+});
+
+export type LarkBotProviderInfo = z.output<typeof larkBotProvidersRpc.output>["providers"][number];
+export type LarkBotChatMember = z.output<typeof larkBotChatMembersRpc.output>["members"][number];
 
 /** Runtime status for the settings screen. */
 export const larkBotStatusRpc = defineRpc({

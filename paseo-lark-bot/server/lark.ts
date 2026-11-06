@@ -302,6 +302,45 @@ export async function listChats(cliPath: string): Promise<LarkChat[]> {
   return chats;
 }
 
+export interface LarkChatMember {
+  openId: string;
+  name: string;
+}
+
+/** Human members of a chat, for the settings UI allowlist picker. */
+export async function listChatMembers(cliPath: string, chatId: string): Promise<LarkChatMember[]> {
+  const payload = await runCli(
+    cliPath,
+    [
+      "im",
+      "+chat-members-list",
+      "--chat-id",
+      chatId,
+      "--member-types",
+      "user",
+      "--page-all",
+      "--format",
+      "json",
+    ],
+    "拉取群成员",
+  );
+  // The shortcut returns separate users[] / bots[] buckets; only users can be
+  // allowlisted, and --page-all already walked the pages.
+  const items = (payload.data as { users?: unknown } | undefined)?.users;
+  if (!Array.isArray(items)) return [];
+  const members: LarkChatMember[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const openId = record.member_id;
+    const name = record.name;
+    if (typeof openId === "string" && openId.startsWith("ou_")) {
+      members.push({ openId, name: typeof name === "string" ? name : "" });
+    }
+  }
+  return members;
+}
+
 export interface ReplyOptions {
   cliPath: string;
   /** The @-mention message the reply attaches to (om_…). */

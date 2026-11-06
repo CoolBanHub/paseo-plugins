@@ -16,6 +16,35 @@ import { z } from "zod";
 export const replyFormatSchema = z.enum(["markdown", "text", "post"]);
 export type ReplyFormat = z.output<typeof replyFormatSchema>;
 
+/**
+ * A Feishu user allowed to drive the bot in one chat. Only `openId` is used
+ * for matching; `name` is a display convenience kept from the member picker.
+ */
+export const allowedUserSchema = z.object({
+  openId: z.string().min(1),
+  name: z.string().default(""),
+});
+
+export type AllowedUser = z.output<typeof allowedUserSchema>;
+
+/**
+ * dsh's permission presets. Kept here (rather than imported from paseo-dsh)
+ * because this plugin runs standalone and the values are dsh-protocol level.
+ * Empty `permission` keeps the historical danger-full-access default.
+ */
+export const DSH_PERMISSION_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "read-only", label: "仅可查看" },
+  { value: "workspace-write", label: "工作区内修改" },
+  { value: "danger-full-access", label: "完全权限" },
+];
+
+export const DSH_DEFAULT_PERMISSION = "danger-full-access";
+
+/** True for the bare dsh provider or `dsh/<model>`; custom ids stay untouched. */
+export function isDshProvider(provider: string): boolean {
+  return provider.split("/", 1)[0] === "dsh";
+}
+
 export const chatBindingSchema = z.object({
   /** Feishu chat_id (oc_…); group chats and p2p chats are keyed the same way. */
   chatId: z.string().min(1),
@@ -23,6 +52,22 @@ export const chatBindingSchema = z.object({
   chatName: z.string().default(""),
   /** Paseo provider id, optionally `provider/model`. */
   provider: z.string().min(1),
+  /** Model id; empty means the provider's default model. */
+  model: z.string().default(""),
+  /** Provider thinking option id; empty means the provider/model default. */
+  thinkingOptionId: z.string().default(""),
+  /**
+   * Provider mode id for most providers (Claude/Codex/ZCode use modes for
+   * approval behavior). For dsh this stores a permission preset such as
+   * `workspace-write` and is applied as the dsh permission feature instead.
+   * Empty keeps the plugin/provider default.
+   */
+  permission: z.string().default(""),
+  /**
+   * Who may @ the bot in this chat. Empty means everyone (default). Feishu
+   * sender_id is an open_id, so entries are matched against `openId`.
+   */
+  allowedUsers: z.array(allowedUserSchema).default([]),
   /**
    * Working directory for the agent session; empty means the user's home
    * directory (resolved server-side — this shared bundle cannot import

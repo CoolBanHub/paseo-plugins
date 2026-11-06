@@ -18,7 +18,7 @@ import {
   formatPermissionNotice,
   formatTurnOutcome,
 } from "./format.ts";
-import { routeMessage, extractPrompt } from "./router.ts";
+import { mentionsBot, routeMessage, extractPrompt, isSenderAllowed } from "./router.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
 import type { BotValues, ReplyFormat } from "../shared/settings.ts";
 
@@ -29,7 +29,7 @@ export interface DispatcherOptions {
   paseo: SessionPaseoApi;
   readValues: () => Promise<BotValues>;
   /** Normalizes bare provider ids to provider/model for agents.create(). */
-  resolveProvider?: (provider: string) => Promise<string>;
+  resolveProvider?: (provider: string, model: string) => Promise<string>;
   /** Fallback reply lookup when turn_ended carries no assistant text. */
   fetchLastReply?: (agentId: string) => Promise<string | null>;
   resolveCli?: (explicit: string) => string | null;
@@ -69,6 +69,7 @@ const MEDIA_LABELS: Record<string, string> = {
   system: "系统消息",
 };
 const UNMATCHED_HINT = "这个会话还没有绑定 provider，请先在 Paseo 的「飞书机器人」设置里配置。";
+const BLOCKED_HINT = "当前会话仅允许指定成员 @ 我处理，请让指定成员发起请求，或联系会话管理员。";
 const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 
@@ -411,7 +412,17 @@ export function createDispatcher(options: DispatcherOptions) {
 
       // Record/ingest before routing so unmentioned messages in a bound chat
       // still contribute thread context; awaiting the download keeps a fast
-      // follow-up @ from reading an empty image cache.
+      // follow-up @ from reading an empty image cache. Disallowed senders are
+      // stopped here so their text/media never enters the topic transcript.
+      if (!isSenderAllowed(binding, event.sender_id)) {
+        const triggered =
+          event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
+        if (triggered && event.sender_type !== "bot") {
+          log(`会话 ${event.chat_id} 收到未授权成员 ${event.sender_id} 的 @，已拒绝处理`);
+          await send(cliPath, event.message_id, BLOCKED_HINT, values, "text");
+        }
+        return;
+      }
       recordHistory(event);
       await ingestMedia(cliPath, event);
       const decision = routeMessage(event, values, botOpenId);

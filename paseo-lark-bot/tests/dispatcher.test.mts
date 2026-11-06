@@ -30,6 +30,10 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         chatId: "oc_group",
         chatName: "测试群",
         provider: "claude",
+        model: "",
+        thinkingOptionId: "",
+        permission: "",
+        allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
         replyFormat: "markdown",
@@ -176,6 +180,44 @@ describe("createDispatcher", () => {
     await flush();
     const last = h.replies[h.replies.length - 1];
     assert.ok(last.text.includes("处理结果答复"));
+  });
+
+  it("rejects non-allowlisted senders without recording their text", async () => {
+    const base = baseValues();
+    const first = base.chats[0];
+    assert.ok(first);
+    const h = makeHarness(
+      baseValues({
+        chats: [{ ...first, allowedUsers: [{ openId: "ou_boss", name: "指定人" }] }],
+      }),
+    );
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_block",
+        root_id: "om_topic",
+        sender_id: "ou_other",
+        content: "@_user_1 机密讨论",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 0, "blocked sender must not start a session");
+    assert.equal(h.replies.length, 1);
+    assert.ok(h.replies[0].text.includes("指定成员"));
+    assert.equal(h.replies[0].messageId, "om_block");
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_allowed",
+        root_id: "om_topic",
+        sender_id: "ou_boss",
+        content: "@_user_1 正常请求",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.ok(h.created[0].prompt?.includes("正常请求"));
+    assert.ok(!h.created[0].prompt?.includes("机密讨论"), "blocked text must stay out of thread history");
   });
 
   it("notifies the chat about permission requests for its own agents only", async () => {
@@ -433,6 +475,10 @@ describe("p2p and delivery hygiene", () => {
         chatId: "oc_p2p",
         chatName: "私聊",
         provider: "claude",
+        model: "",
+        thinkingOptionId: "",
+        permission: "",
+        allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
         replyFormat: "markdown",

@@ -19,7 +19,16 @@ interface Harness {
   registry: ReturnType<typeof createSessionRegistry>;
   replies: ReplyCall[];
   notices: { chatId: string | null; messageId: string; text: string }[];
-  created: { prompt?: string; provider: string; cwd: string; config: { thinkingOptionId?: string; featureValues?: Record<string, unknown> } }[];
+  created: {
+    prompt?: string;
+    provider: string;
+    cwd: string;
+    config: {
+      modeId?: string;
+      thinkingOptionId?: string;
+      featureValues?: Record<string, unknown>;
+    };
+  }[];
   runCalls: { agentId: string; text: string }[];
   agentCounter: number;
   currentAgent: () => SessionAgentHandle;
@@ -30,6 +39,10 @@ const binding: ChatBinding = {
   chatId: "oc_group",
   chatName: "测试群",
   provider: "claude",
+  model: "",
+  thinkingOptionId: "",
+  permission: "",
+  allowedUsers: [],
   cwd: "/tmp/project",
   systemPrompt: "用中文回答",
   replyFormat: "markdown",
@@ -395,6 +408,73 @@ describe("createSessionRegistry", () => {
     assert.equal(h.created.length, 1);
     assert.equal(h.created[0].config.thinkingOptionId, undefined);
     assert.equal(h.created[0].config.featureValues, undefined);
+  });
+
+  it("applies the selected model, thinking depth, and provider mode", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      provider: "claude",
+      model: "claude-opus-4",
+      thinkingOptionId: "high",
+      permission: "plan",
+    });
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].provider, "claude/claude-opus-4");
+    assert.equal(h.created[0].config.modeId, "plan");
+    assert.equal(h.created[0].config.thinkingOptionId, "high");
+    assert.equal(h.created[0].config.featureValues, undefined);
+  });
+
+  it("lets dsh bindings override the default permission and thinking depth", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      provider: "dsh/deepseek-v4.1-flash",
+      thinkingOptionId: "high",
+      permission: "workspace-write",
+    });
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].provider, "dsh/deepseek-v4.1-flash");
+    assert.equal(h.created[0].config.thinkingOptionId, "high");
+    assert.deepEqual(h.created[0].config.featureValues, {
+      paseo_dsh_permission_preset: "workspace-write",
+    });
+  });
+
+  it("passes the binding model to the provider resolver", async () => {
+    const resolutions: { provider: string; model: string }[] = [];
+    let createdProvider = "";
+    const paseo: SessionPaseoApi = {
+      agents: {
+        create: async (request) => {
+          createdProvider = request.config.provider;
+          return {
+            id: "agent-1",
+            send: async () => {},
+            run: async () => ({ status: "idle", error: null, lastMessage: null }),
+          };
+        },
+        ref: () => {
+          throw new Error("unused");
+        },
+      },
+    };
+    const registry = createSessionRegistry({
+      paseo,
+      getIdleMs: () => 30 * 60_000,
+      resolveProvider: async (provider, model) => {
+        resolutions.push({ provider, model });
+        return provider + "/" + model;
+      },
+      callbacks: { onReply: () => {}, onNotice: () => {} },
+    });
+    registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, model: "deepseek-v4.1-flash" });
+    await flush();
+    assert.deepEqual(resolutions, [{ provider: "claude", model: "deepseek-v4.1-flash" }]);
+    assert.equal(createdProvider, "claude/deepseek-v4.1-flash");
   });
 
   it("expands a leading ~ in cwd", async () => {

@@ -1,6 +1,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ChatBinding } from "../shared/settings.ts";
+import {
+  DSH_DEFAULT_PERMISSION,
+  isDshProvider,
+  type ChatBinding,
+} from "../shared/settings.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
 function resolveCwd(cwd: string): string {
@@ -11,28 +15,46 @@ function resolveCwd(cwd: string): string {
   return trimmed;
 }
 
+/** dsh permission preset ids are the only values accepted for that provider. */
+function dshPermissionPreset(permission: string): string {
+  return permission.trim() || DSH_DEFAULT_PERMISSION;
+}
+
 /**
- * dsh sessions created by the bot must not stop for interactive approvals:
- * use the deepest reasoning effort and pre-approve every tool/permission.
- * Other providers keep their own defaults.
+ * Build the agents.create() config from a binding. dsh sessions created by the
+ * bot default to the deepest reasoning effort and full tool access (so group
+ * turns do not stop on an approval prompt); both are now overridable per chat.
+ * Other providers keep their own defaults unless the binding selects a mode,
+ * model, or thinking depth.
  */
-function providerCreateConfig(provider: string, systemPrompt: string): {
+function providerCreateConfig(provider: string, binding: ChatBinding): {
   provider: string;
   systemPrompt?: string;
+  modeId?: string;
   thinkingOptionId?: string;
   featureValues?: Record<string, unknown>;
 } {
   const config: {
     provider: string;
     systemPrompt?: string;
+    modeId?: string;
     thinkingOptionId?: string;
     featureValues?: Record<string, unknown>;
-  } = { provider, ...(systemPrompt ? { systemPrompt } : {}) };
-  if (provider === "dsh" || provider.startsWith("dsh/")) {
-    config.thinkingOptionId = "max";
+  } = { provider, ...(binding.systemPrompt ? { systemPrompt: binding.systemPrompt } : {}) };
+
+  if (isDshProvider(provider)) {
+    config.thinkingOptionId = binding.thinkingOptionId.trim() || "max";
     config.featureValues = {
-      paseo_dsh_permission_preset: "danger-full-access",
+      paseo_dsh_permission_preset: dshPermissionPreset(binding.permission),
     };
+    return config;
+  }
+
+  if (binding.permission.trim()) {
+    config.modeId = binding.permission.trim();
+  }
+  if (binding.thinkingOptionId.trim()) {
+    config.thinkingOptionId = binding.thinkingOptionId.trim();
   }
   return config;
 }
@@ -68,6 +90,7 @@ export interface SessionPaseoApi {
       config: {
         provider: string;
         systemPrompt?: string;
+        modeId?: string;
         thinkingOptionId?: string;
         featureValues?: Record<string, unknown>;
       };
@@ -86,7 +109,21 @@ export interface SessionPaseoApi {
 }
 
 export interface SessionProviderSnapshot {
-  entries: { provider: string; models?: { id: string; isDefault?: boolean }[] }[];
+  entries: {
+    provider: string;
+    label?: string;
+    enabled?: boolean;
+    defaultModeId?: string | null;
+    modes?: { id: string; label: string; description?: string }[];
+    models?: {
+      id: string;
+      label?: string;
+      isDefault?: boolean;
+      isSelectable?: boolean;
+      thinkingOptions?: { id: string; label: string }[];
+      defaultThinkingOptionId?: string;
+    }[];
+  }[];
 }
 
 export interface ChatSessionStatus {
@@ -166,10 +203,11 @@ export function createSessionRegistry(options: {
   getIdleMs: () => number;
   /**
    * Newer daemons reject bare provider ids: normalize `dsh` to
-   * `dsh/<default-model>` before agents.create(). Returning the input
-   * unchanged lets older hosts keep working.
+   * `dsh/<default-model>` before agents.create(). An explicit model from the
+   * binding takes precedence. Returning the input unchanged lets older hosts
+   * keep working.
    */
-  resolveProvider?: (provider: string) => Promise<string>;
+  resolveProvider?: (provider: string, model: string) => Promise<string>;
   /**
    * Fallback when turn_ended carries no assistant text: refetch the agent
    * timeline and pull the latest reply from there.
@@ -179,7 +217,12 @@ export function createSessionRegistry(options: {
   /** Grace period for a missing turn_ended after run() resolves idle. */
   turnFallbackMs?: number;
 }) {
-  const resolveProvider = options.resolveProvider ?? (async (provider: string) => provider);
+  const resolveProvider =
+    options.resolveProvider ??
+    (async (provider: string, model: string) => {
+      const chosen = model.trim();
+      return chosen && !provider.includes("/") ? provider + "/" + chosen : provider;
+    });
   const fetchLastReply = options.fetchLastReply ?? (async () => null);
   const now = options.now ?? Date.now;
   const turnFallbackMs = options.turnFallbackMs ?? DEFAULT_TURN_FALLBACK_MS;
@@ -392,9 +435,9 @@ export function createSessionRegistry(options: {
     if (state.handle && !expired) return { handle: state.handle, created: false };
 
     if (state.agentId) agentToTopic.delete(state.agentId);
-    const provider = await resolveProvider(item.binding.provider);
+    const provider = await resolveProvider(item.binding.provider, item.binding.model);
     const handle = await options.paseo.agents.create({
-      config: providerCreateConfig(provider, item.binding.systemPrompt),
+      config: providerCreateConfig(provider, item.binding),
       cwd: resolveCwd(item.binding.cwd),
       title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },

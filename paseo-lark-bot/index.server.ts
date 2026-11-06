@@ -1,12 +1,30 @@
 import { createHash } from "node:crypto";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { larkBotChatsRpc, larkBotProvidersRpc, larkBotStatusRpc } from "./shared/contracts.ts";
+import {
+  larkBotChatMembersRpc,
+  larkBotChatsRpc,
+  larkBotProvidersRpc,
+  larkBotStatusRpc,
+} from "./shared/contracts.ts";
 import { createEventConsumer, type EventConsumer, type LarkMessageEvent } from "./server/lark-events.ts";
-import { applyAppCredentials, listChats, readCurrentAppId, resolveLarkCli } from "./server/lark.ts";
+import {
+  applyAppCredentials,
+  listChatMembers,
+  listChats,
+  readCurrentAppId,
+  resolveLarkCli,
+} from "./server/lark.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
-import { DEFAULT_BOT_VALUES, larkBotSettings, type BotValues } from "./shared/settings.ts";
+import {
+  DSH_DEFAULT_PERMISSION,
+  DSH_PERMISSION_OPTIONS,
+  DEFAULT_BOT_VALUES,
+  isDshProvider,
+  larkBotSettings,
+  type BotValues,
+} from "./shared/settings.ts";
 
 /**
  * The daemon hands each hook/RPC call its own PaseoApi handle; there is no
@@ -34,21 +52,30 @@ function credentialFingerprint(appId: string, appSecret: string): string {
 
 /**
  * Daemons since 0.15 reject bare provider ids in agents.create(); resolve
- * `dsh` to `dsh/<default-model>` using the provider snapshot. Older hosts
- * without the providers slice keep the input unchanged.
+ * `dsh` to `dsh/<default-model>` using the provider snapshot. A model selected
+ * in the chat binding takes precedence. Older hosts without the providers
+ * slice keep the input unchanged.
  */
-async function resolveProviderModel(provider: string): Promise<string> {
+async function resolveProviderModel(provider: string, model = ""): Promise<string> {
+  const slash = provider.indexOf("/");
+  const base = slash > 0 ? provider.slice(0, slash) : provider;
+  const legacyModel = slash > 0 ? provider.slice(slash + 1) : "";
+  const chosen = model.trim() || legacyModel;
+  // Paseo splits provider/model at the first slash, so a model id that itself
+  // contains slashes (e.g. OpenRouter) is carried through unchanged.
+  if (chosen) return base + "/" + chosen;
   if (provider.includes("/")) return provider;
-  const cached = providerModelCache.get(provider);
+  const cached = providerModelCache.get(base);
   if (cached) return cached;
   if (!paseo?.providers) return provider;
   try {
     const snapshot = await paseo.providers.waitForReady({ timeoutMs: 5_000 });
-    const entry = snapshot.entries.find((candidate) => candidate.provider === provider);
-    const model = entry?.models?.find((candidate) => candidate.isDefault)?.id ?? entry?.models?.[0]?.id;
-    if (!model) return provider;
-    const full = provider + "/" + model;
-    providerModelCache.set(provider, full);
+    const entry = snapshot.entries.find((candidate) => candidate.provider === base);
+    const chosenModel =
+      entry?.models?.find((candidate) => candidate.isDefault)?.id ?? entry?.models?.[0]?.id;
+    if (!chosenModel) return provider;
+    const full = base + "/" + chosenModel;
+    providerModelCache.set(base, full);
     return full;
   } catch {
     return provider;
@@ -212,10 +239,51 @@ export default function contribute(server: PluginServerContext) {
       const snapshot = await context.paseo.providers.waitForReady({ timeoutMs: 5_000 });
       const providers = snapshot.entries
         .filter((entry) => entry.enabled)
-        .map((entry) => ({ id: entry.provider, label: entry.label ?? entry.provider }));
+        .map((entry) => {
+          const modes = (entry.modes ?? []).map((mode) => ({
+            id: mode.id,
+            label: mode.label,
+            description: mode.description ?? null,
+          }));
+          const models = (entry.models ?? [])
+            .filter((model) => model.isSelectable !== false)
+            .map((model) => ({
+              id: model.id,
+              label: model.label,
+              isDefault: model.isDefault === true,
+              thinkingOptions: (model.thinkingOptions ?? []).map((option) => ({
+                id: option.id,
+                label: option.label,
+              })),
+              defaultThinkingOptionId: model.defaultThinkingOptionId ?? null,
+            }));
+          const dsh = isDshProvider(entry.provider);
+          return {
+            id: entry.provider,
+            label: entry.label ?? entry.provider,
+            models,
+            modes,
+            permissionKind: dsh ? ("dsh-preset" as const) : modes.length > 0 ? ("mode" as const) : ("none" as const),
+            permissionOptions: dsh
+              ? DSH_PERMISSION_OPTIONS.map((option) => ({ ...option }))
+              : modes.map((mode) => ({ value: mode.id, label: mode.label })),
+            defaultPermission: dsh ? DSH_DEFAULT_PERMISSION : (entry.defaultModeId ?? null),
+          };
+        });
       return { providers, error: null };
     } catch (error) {
       return { providers: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  server.handle(larkBotChatMembersRpc, async (input) => {
+    const values = await readValues();
+    const cliPath = resolveLarkCli(values.larkCliPath);
+    if (!cliPath) return { members: [], error: "找不到 lark-cli" };
+    try {
+      return { members: await listChatMembers(cliPath, input.chatId), error: null };
+    } catch (error) {
+      return { members: [], error: error instanceof Error ? error.message : String(error) };
     }
   });
 
