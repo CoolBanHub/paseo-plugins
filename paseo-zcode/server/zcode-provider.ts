@@ -30,9 +30,12 @@ import {
   readAccountProviders,
   readBuiltinRevision,
   readLastTurnFailure,
+  readOAuthTokenSet,
   registerAccountProviders,
+  resolveZcodeAppVersion,
   type AccountProvider,
 } from "./zcode-account";
+import { resolveAccountRequestAuth } from "./zcode-account-oauth";
 import { ZcodeTaskIndex } from "./zcode-task-index";
 import { zcodeCatalogCacheKey } from "./zcode-catalog-key";
 
@@ -1086,7 +1089,10 @@ export function createZcodeProvider(): ProviderRegistration {
         }
       };
       const pendingPermissionIds = new Map<string, string>();
-      const accountProviders: AccountProvider[] = readAccountProviders();
+      const accountProviders: AccountProvider[] = readAccountProviders({
+        onSkip: (providerId, reason) => log("account provider skipped", { providerId, reason }),
+      });
+      const zcodeAppVersion = resolveZcodeAppVersion(cliPath);
       let accountProvidersRegistered = false;
 
       // Account providers must be registered before they can be used.
@@ -1267,11 +1273,49 @@ export function createZcodeProvider(): ProviderRegistration {
         if (request.method === "interaction/requestProviderRuntimeHeaders") {
           const providerId = String(request.params?.providerId ?? "");
           const account = accountProviders.find((p) => p.providerId === providerId);
-          if (account) {
-            client.replyServerRequest(request.id, { headersApplied: true, requestAuth: { apiKey: account.apiKey } });
-          } else {
+          if (!account) {
             client.replyServerRequest(request.id, { headersApplied: false });
+            return true;
           }
+          if (!account.oauth) {
+            if (account.apiKey) {
+              client.replyServerRequest(request.id, { headersApplied: true, requestAuth: { apiKey: account.apiKey } });
+            } else {
+              client.replyServerRequest(request.id, { headersApplied: false, errorMessage: "账号凭据不可用" });
+            }
+            return true;
+          }
+
+          // The desktop may refresh the OAuth token between turns; pick up the
+          // newest file contents before computing the account scope.
+          const fresh = readOAuthTokenSet(account.family);
+          if (fresh) {
+            account.oauth = {
+              ...account.oauth,
+              accessToken: fresh.accessToken,
+              zcodeJwtToken: fresh.zcodeJwtToken,
+            };
+          }
+
+          void resolveAccountRequestAuth(account.oauth, request.params ?? {}, { clientVersion: zcodeAppVersion })
+            .then((result) => {
+              try {
+                client.replyServerRequest(request.id, result);
+              } catch {
+                // The app-server may have exited while the token exchange was in flight.
+              }
+            })
+            .catch((error) => {
+              log("account request auth failed", {
+                providerId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              try {
+                client.replyServerRequest(request.id, { headersApplied: false, errorMessage: "账号凭据解析失败" });
+              } catch {
+                // Ignore a reply to a process that is already gone.
+              }
+            });
           return true;
         }
         if (request.method === "interaction/requestPermission") {

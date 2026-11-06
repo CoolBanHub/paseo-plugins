@@ -147,9 +147,15 @@ local ZCode sessions are listed in Paseo's session picker.
   updates both invalidate the cached catalog on the next plugin reload.
 - Coding-plan account providers (BigModel / Z.ai plans logged in inside the
   ZCode desktop app) are registered into the CLI at runtime and their models
-  are selectable; credentials are read and decrypted locally from
-  `~/.zcode/v2/credentials.json` and supplied per model request, mirroring
-  what the desktop app does. Plan rate limits apply as usual.
+  are selectable. Both credential shapes are supported: a manual coding-plan
+  API key, and the desktop's OAuth session (BigModel individual plan and
+  Start Plan). OAuth accounts are exchanged for a short-lived project token
+  and sent as `apiKey` / `apiKeyId` / `accountScope` on each model request;
+  project tokens are cached in memory and refreshed when the desktop rotates
+  the login. A missing `project-key-location` is discovered from the account's
+  default project on first use. Z.ai and team-plan OAuth are not supported
+  yet; use the API Key connection mode for those. Plan rate limits apply as
+  usual.
 - When Paseo reopens a persisted session with `history: replay`, the provider
   reads up to the latest 1,000 messages from the native ZCode snapshot and
   replays visible user, reasoning, assistant and tool rows before marking the
