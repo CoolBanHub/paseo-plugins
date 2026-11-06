@@ -105,23 +105,28 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
 
   const items = dshHistoryTimelineItems("history-a", ptcEvents);
   assert.deepEqual(items.map((item) => item.type), [
-    "user_message", "reasoning", "assistant_message",
+    "user_message", "tool_call", "reasoning", "assistant_message",
     "tool_call", "tool_call", "tool_call", "tool_call", "todo",
     "tool_call", "tool_call", "compaction", "compaction", "tool_call",
   ]);
   assert.equal(items[0]?.id, "user-id");
-  assert.equal(items[0]?.type === "user_message" ? items[0].text : "", "Hello");
-  assert.equal(items[1]?.type === "reasoning" ? items[1].text : "", "Thinking");
-  assert.equal(items[2]?.type === "assistant_message" ? items[2].text : "", "Hi there");
-  assert.equal(items[3]?.id, "tool-1");
-  assert.equal(items[3]?.type === "tool_call" ? items[3].status : "", "running");
-  assert.equal(items[4]?.id, "tool-1");
-  assert.equal(items[4]?.type === "tool_call" ? items[4].status : "", "completed");
-  assert.equal(items[5]?.id, "sub-1");
-  assert.equal(items[6]?.id, "sub-1");
   assert.deepEqual(
-    items[7]?.type === "todo"
-      ? items[7].items.map(({ text, status }) => ({ text, status }))
+    items[1]?.type === "tool_call" ? items[1].revertToken : undefined,
+    { v: 1, kind: "dsh-rewind", messageId: "user-id", seq: 1 },
+    "every visible user message carries a native revert token",
+  );
+  assert.equal(items[0]?.type === "user_message" ? items[0].text : "", "Hello");
+  assert.equal(items[2]?.type === "reasoning" ? items[2].text : "", "Thinking");
+  assert.equal(items[3]?.type === "assistant_message" ? items[3].text : "", "Hi there");
+  assert.equal(items[4]?.id, "tool-1");
+  assert.equal(items[4]?.type === "tool_call" ? items[4].status : "", "running");
+  assert.equal(items[5]?.id, "tool-1");
+  assert.equal(items[5]?.type === "tool_call" ? items[5].status : "", "completed");
+  assert.equal(items[6]?.id, "sub-1");
+  assert.equal(items[7]?.id, "sub-1");
+  assert.deepEqual(
+    items[8]?.type === "todo"
+      ? items[8].items.map(({ text, status }) => ({ text, status }))
       : undefined,
     [
       { text: "scan the repo", status: "completed" },
@@ -129,19 +134,103 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
     ],
     "the durable todo/write event restores the native plan list",
   );
-  const job = items[8];
+  const job = items[9];
   assert.equal(job?.type === "tool_call" && job.name, "Build");
   assert.deepEqual(
     job?.type === "tool_call" && job.detail,
     { type: "shell", command: "pwd" },
     "a background job restores with its originating command",
   );
-  assert.equal(items[9]?.type === "tool_call" && items[9].status, "completed");
-  assert.equal(items[10]?.type === "compaction" && items[10].status, "loading");
-  assert.equal(items[11]?.type === "compaction" && items[11].status, "completed");
-  assert.equal(items[12]?.id, "dsh:goal");
+  assert.equal(items[10]?.type === "tool_call" && items[10].status, "completed");
+  assert.equal(items[11]?.type === "compaction" && items[11].status, "loading");
+  assert.equal(items[12]?.type === "compaction" && items[12].status, "completed");
+  assert.equal(items[13]?.id, "dsh:goal");
   assert.ok(!items.some((item) => item.id === "run-1"), "a run_code call with mirrored dispatches is not shown twice");
   assert.ok(!items.some((item) => item.type === "user_message" && item.text.includes("Do not display")));
+});
+
+test("surface replace ops hide shadowed events and rewind markers render as notices", () => {
+  const rewound: DshSessionEvent[] = [
+    { type: "user/message", seq: 1, surfaceOp: { op: "append" }, data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "Keep me" }] } },
+    { type: "assistant/message", seq: 2, surfaceOp: { op: "append" }, data: { message: { id: "a1", content: [{ type: "text", text: "Old answer" }] } } },
+    { type: "user/message", seq: 3, surfaceOp: { op: "append" }, data: { id: "u2", source: { kind: "user" }, content: [{ type: "text", text: "Rewound prompt" }] } },
+    { type: "assistant/message", seq: 4, surfaceOp: { op: "append" }, data: { message: { id: "a2", content: [{ type: "text", text: "Gone answer" }] } } },
+    {
+      type: "user/message",
+      seq: 5,
+      surfaceOp: { op: "replace", startSeq: 3, endSeq: 4 },
+      data: { id: "marker", source: { kind: "paseo-rewind" }, content: [{ type: "text", text: "Paseo rewind" }] },
+    },
+  ];
+
+  const items = dshHistoryTimelineItems("history-r", rewound);
+  const texts = items.map((item) => item.type === "user_message" || item.type === "assistant_message" ? item.text : item.type);
+  // seq 1-2 survive (only 3..4 are replaced); the rewound prompt, its answer
+  // and the marker's own user row never render as conversation messages.
+  assert.deepEqual(texts, ["Keep me", "tool_call", "Old answer", "notification"]);
+  assert.ok(!texts.includes("Gone answer"), "the replaced assistant message is gone");
+  assert.ok(!texts.includes("Rewound prompt"), "the replaced user message is gone");
+  const notice = items.find((item) => item.type === "notification");
+  assert.equal(notice?.type === "notification" ? notice.message : "", "会话已回退到此处");
+  // The shadowed user message leaves no revert marker either.
+  assert.equal(items.filter((item) => item.id.includes("revert")).length, 1);
+});
+
+test("a tool call whose result was shadowed does not dangle as running", () => {
+  const events: DshSessionEvent[] = [
+    { type: "user/message", seq: 1, surfaceOp: { op: "append" }, data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "Hi" }] } },
+    { type: "tool/call", seq: 2, data: { callId: "c1", name: "bash", arguments: "{}" } },
+    { type: "tool/result", seq: 3, surfaceOp: { op: "append" }, data: { message: { toolCallId: "c1", content: [{ type: "text", text: "out" }] } } },
+    {
+      type: "user/message",
+      seq: 4,
+      surfaceOp: { op: "replace", startSeq: 3, endSeq: 3 },
+      data: { id: "marker", source: { kind: "paseo-rewind" }, content: [{ type: "text", text: "Rewind" }] },
+    },
+  ];
+  const items = dshHistoryTimelineItems("history-d", events);
+  assert.ok(!items.some((item) => item.type === "tool_call" && item.id === "c1"), "the shadowed call is dropped entirely");
+});
+
+test("attachment blocks replay with name and size annotations", () => {
+  const events: DshSessionEvent[] = [{
+    type: "user/message",
+    seq: 1,
+    surfaceOp: { op: "append" },
+    data: {
+      id: "u1",
+      source: { kind: "user" },
+      content: [
+        { type: "text", text: "Look at this" },
+        { type: "image", attachment: { mediaType: "image/png", bytes: 2048 } },
+        { type: "file", attachment: { name: "report.pdf", bytes: 3 * 1024 * 1024 } },
+      ],
+    },
+  }];
+  const items = dshHistoryTimelineItems("history-att", events);
+  const text = items[0]?.type === "user_message" ? items[0].text : "";
+  assert.match(text, /\[图片 image\/png · 2KB\]/);
+  assert.match(text, /\[文件 report\.pdf · 3\.0MB\]/);
+});
+
+test("oversized histories keep the newest window instead of disabling replay", async (t) => {
+  const home = temporaryHome();
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  // 50,100 events exceeds MAX_HISTORY_EVENTS; the tail reader must keep the
+  // newest 50,000 rather than returning undefined.
+  const lines: string[] = [JSON.stringify({ type: "session", version: 4, id: "history-big", cwd: "/tmp" })];
+  for (let seq = 1; seq <= 50_100; seq += 1) {
+    lines.push(JSON.stringify({ type: "user/message", seq, data: { id: `u${seq}`, source: { kind: "user" }, content: [{ type: "text", text: `m${seq}` }] } }));
+  }
+  const dir = join(home, "sessions", "--tmp--", "history-big");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "session.v4.jsonl"), `${lines.join("\n")}\n`);
+
+  const { readDshSessionEventsTail } = await import("../server/probe-cleanup.ts");
+  const events = await readDshSessionEventsTail("history-big", { home });
+  assert.equal(events?.length, 50_000);
+  assert.equal(events?.[0]?.seq, 101);
+  assert.equal(events?.[49_999]?.seq, 50_100);
 });
 
 test("history replay is emitted before ready only for restored sessions requesting replay", async (t) => {
@@ -193,7 +282,10 @@ test("history replay is emitted before ready only for restored sessions requesti
   });
 
   await open("replay", "replay");
-  assert.deepEqual(events.map((event) => event.type), ["timeline.item", "timeline.item", "timeline.item", "timeline.item", "timeline.item", "session.ready"]);
+  assert.deepEqual(events.map((event) => event.type), [
+    "timeline.item", "timeline.item", "timeline.item", "timeline.item",
+    "timeline.item", "timeline.item", "session.ready",
+  ]);
   assert.deepEqual(seenInputs.map((input) => input.type), ["session.open"]);
 
   events.length = 0;

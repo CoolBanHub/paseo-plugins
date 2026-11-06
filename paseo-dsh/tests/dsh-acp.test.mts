@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,7 @@ import {
   PERMISSION_SETTING_NAME,
   dshCatalogShape,
 } from "../server/dsh-labels.ts";
-import { dshCatalogCacheKey, resolvePluginSourceRoot, writeWebModelOverlay } from "../server/dsh-catalog.ts";
+import { dshCatalogCacheKey, resolveModelOverlay, resolvePluginSourceRoot, writeWebModelOverlay } from "../server/dsh-catalog.ts";
 import { resolveDshQuestion } from "../server/dsh-questions.ts";
 import {
   currentDshSessionLaunchContext,
@@ -597,4 +597,61 @@ test("Web model overlay keeps ACP route settings and current model capabilities"
   assert.match(overlay, /apiKeyEnv: BAI_API_KEY/);
   assert.match(overlay, /max: max/);
   assert.doesNotMatch(overlay, /do-not-copy/, "raw API keys are never copied into the overlay");
+});
+
+test("the startup sweep removes every known leftover older than an hour", () => {
+  const dataDir = join(home, "plugin-data", "dsh");
+  mkdirSync(dataDir, { recursive: true });
+  const stale = new Date(Date.now() - 2 * 60 * 60_000);
+  const staleFiles = [
+    "ptc-events-stale.jsonl",
+    "dsh-events-stale.jsonl",
+    "permission-control-stale.json",
+    "permission-catalog-stale.json",
+    "command-catalog-stale.json",
+    "plan-control-stale.json",
+    "file-receipts-conn-stale.jsonl",
+  ];
+  for (const name of staleFiles) writeFileSync(join(dataDir, name), "", { mode: 0o600 });
+  mkdirSync(join(dataDir, "bridge-requests-stale"));
+  mkdirSync(join(dataDir, "bridge-responses-stale"));
+  writeFileSync(join(dataDir, "bridge-requests-stale", "req.json"), "{}");
+  for (const name of [...staleFiles, "bridge-requests-stale", "bridge-responses-stale"]) {
+    utimesSync(join(dataDir, name), stale, stale);
+  }
+  // Live artifacts and unrelated files stay untouched.
+  const fresh = new Date();
+  writeFileSync(join(dataDir, "dsh-events-fresh.jsonl"), "");
+  utimesSync(join(dataDir, "dsh-events-fresh.jsonl"), fresh, fresh);
+  mkdirSync(join(dataDir, "file-receipts"));
+  writeFileSync(join(dataDir, "file-receipts", "session.jsonl"), "");
+
+  createDshConnector(noLog);
+
+  for (const name of [...staleFiles, "bridge-requests-stale", "bridge-responses-stale"]) {
+    assert.equal(existsSync(join(dataDir, name)), false, `${name} should be swept`);
+  }
+  assert.equal(existsSync(join(dataDir, "dsh-events-fresh.jsonl")), true, "recent sidecars survive");
+  assert.equal(existsSync(join(dataDir, "file-receipts", "session.jsonl")), true, "persistent receipts survive");
+});
+
+test("resolveModelOverlay degrades to last-good or no overlay instead of failing the spawn", () => {
+  const output = join(home, "degraded-models.patch.yml");
+  const brokenWeb = join(home, "profiles", "broken-web");
+  mkdirSync(brokenWeb, { recursive: true });
+  writeFileSync(join(brokenWeb, "cordis.patch.yml"), "- id: other\n");
+
+  // No prior overlay: the spawn proceeds without one.
+  const missing = resolveModelOverlay(acpProfileRoot, brokenWeb, join(home, "no-prior.patch.yml"));
+  assert.equal(missing.path, undefined);
+  assert.equal(missing.ids.length, 0);
+  assert.match(missing.degradedReason ?? "", /does not define any bai models/);
+
+  // A previously written overlay at the same path is reused verbatim.
+  const good = resolveModelOverlay(acpProfileRoot, webProfileRoot, output);
+  assert.deepEqual(good.ids, ["deepseek-v4.1-flash"]);
+  const degraded = resolveModelOverlay(acpProfileRoot, brokenWeb, output);
+  assert.equal(degraded.path, output);
+  assert.match(degraded.degradedReason ?? "", /does not define any bai models/);
+  assert.equal(readFileSync(output, "utf8"), readFileSync(output, "utf8"));
 });

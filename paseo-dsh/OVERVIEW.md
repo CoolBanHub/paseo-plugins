@@ -39,9 +39,14 @@ dsh JSONL session log when Paseo reopens a persisted session with
 `history: replay`. Visible user, assistant, reasoning, tool and PTC sub-call
 rows are emitted before the restored session becomes ready; injected runtime
 context remains hidden. A `history: skip` open reconnects without rebuilding
-the old timeline. Replay is limited to the latest 4,000 timeline rows; the
-compressed session log and decompressed content are capped at 32 MiB and
-128 MiB. The underlying dsh session keeps its full context either way.
+the old timeline. Replay is limited to the latest 4,000 timeline rows and the
+newest 50,000 log events; oversized logs keep their newest window instead of
+disabling replay. dsh appends one Zstandard frame per durable flush and
+Node's zstd APIs decode only the first frame, so the reader scans for frame
+magics and decodes each frame from its own offset. `replace` surface
+operations (rewind markers, compaction checkpoints) hide the events they
+shadow, so a rewound or compacted session replays exactly its visible
+transcript. The underlying dsh session keeps its full context either way.
 
 ### dsh discovery
 
@@ -111,7 +116,11 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   refresh the provider catalog to see the update. The ACP profile still owns
   the provider endpoint and credential configuration. dsh's "Provider default" effort
   (empty string) is stripped by the connector because Paseo's schema
-  requires non-empty option ids.
+  requires non-empty option ids. A missing or malformed Web profile no
+  longer fails the spawn: the last successfully written overlay is reused,
+  and only when none exists does the session open without the overlay
+  (dsh falls back to its own ACP profile models) with a log line explaining
+  the degradation.
 - Permissions: dsh runs sessions under the `workspace-write` permission preset by
   default — sandboxed in-workspace operations run without prompts, and
   escalations (outside-workspace writes, wider sandbox) surface as
@@ -140,9 +149,25 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   through the bridge instead of being sent to the model; the command's text
   result appears as a Paseo notice.
 - Retries and compaction surface as they happen: `llm/retry` becomes a
-  warning notice, and `compaction/start|summary|end` becomes Paseo's native
+  warning notice (with the failure's stable code mapped to a short Chinese
+  explanation), and `compaction/start|summary|end` becomes Paseo's native
   compaction timeline item with manual/auto attribution and pre-compaction
   token counts.
+- Failed turns surface in Paseo: dsh's ACP bridge reports every failed turn
+  as a normal `end_turn`, so the connector mirrors `turn/end` reasons and
+  renders errors (quota, context window, credentials, rate limit — see
+  `dsh-error-present.ts` for the code table) as timeline error rows, with
+  max-tokens and blocked endings as warning notices.
+- Every assistant step reports its token accounting: the `usage` snapshot on
+  `assistant/message` becomes a compact info notice (输入/缓存读/缓存写/输出).
+  Context-window pressure continues to arrive through dsh's own native
+  `usage_update`.
+- Long generations stream: dsh's ACP bridge only projects the settled
+  assistant message, so the bridge plugin mirrors `agent/assistant-stream`
+  frames and the connector renders one updating 生成中… row per attempt once
+  it has run longer than ~1.5 seconds; quick replies never grow an extra
+  row, and the settled row is a compact 已生成 N 字 marker because the full
+  message follows it.
 - Background jobs (`job/registered` / `job/settled`) render as Shell or
   labelled status rows with the originating command and terminal detail.
   Subagent runs update their `sub_agent` card with the child session id,
@@ -156,14 +181,39 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
 - Subagent cards carry the child session id, but Paseo does not open them
   as nested sessions: the ACP adapter has no `session.subsession`
   capability, so child transcripts stay available in dsh's own clients.
-- Images and other non-text assistant/tool output are still not carried
-  over. Commands come from dsh's live registry, so a preset without a
-  command service exposes no slash commands; commands that start their own
-  turn settle the ACP prompt when the command returns. Timed
-  `ask_user_question` calls (`mode: timed`) are not reattached after their
-  foreground wait expires; the shipped presets use blocking mode.
-- The ACP adapter does not implement `session.archive`, `session.unarchive`
-  or `session.revert`; those operations remain dsh-client features.
+- Image and file attachments in history replay render as annotated
+  placeholders (`[文件 report.pdf · 3.0MB]`, `[图片 image/png · 2KB]`); live
+  binary content is still not carried over. Commands come from dsh's live
+  registry, so a preset without a command service exposes no slash commands;
+  commands that start their own turn settle the ACP prompt when the command
+  returns. When a timed `ask_user_question` expires, the Paseo form is
+  dismissed with a notice instead of waiting forever; dsh does not re-ask.
+- Session revert is implemented natively. Every user message carries a
+  revert token (a slim 可回退 marker row), and Paseo's revert affordances
+  send `session.revert` with a conversation/files/both scope:
+  - **Conversation rewind** appends one marker user message through the
+    in-dsh bridge under dsh's exclusive maintenance lock; its native
+    `surfaceOp replace` shadows everything after the chosen message, and a
+    successful flush confirms durability. The connector then closes the
+    connection (Paseo cannot retract rendered rows); reopening replays the
+    rewound transcript. `/rewind [n]` (rewind to the n-th previous user
+    message) does the same from the prompt box.
+  - **File revert** restores byte-level before-snapshots the bridge
+    checkpointed for `write`/`edit` tool calls (≤256 KiB each, persisted
+    per dsh session under `plugin-data/dsh/file-receipts/`). Receipts are
+    undone newest-first with the current file digest verified against what
+    the tool produced; a mismatch stops the chain instead of clobbering
+    divergent files, replaced inodes are kept as `*.dsh-backup-*`, and files
+    the call created are moved aside rather than deleted. `/revert-files [n]`
+    undoes the last n checkpointed writes.
+  - Rewind planning is deliberately conservative (mirrors dsh-web's own
+    rules): only plain exchanges and fully settled `read`/`write`/`edit`
+    calls can be rewound; sessions that used bash, background jobs, goals,
+    PTC programs or any stateful projection fail closed with a clear
+    message. Files written through bash or other tools are never
+    checkpointed, so revert does not guess about them.
+- The ACP adapter does not implement `session.archive` or
+  `session.unarchive`; those operations remain dsh-client features.
 - The plugin is kept on the same `@getpaseo/plugin` protocol version as the
   Paseo daemon. It also normalizes dsh failed tool updates that omit an error
   payload, because Paseo requires a JSON error for failed timeline tool items.
@@ -192,6 +242,15 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   description and carrying its printed output (or error). Only live
   sessions' records are mirrored, and the sidecar is removed when the
   process exits.
+- Sidecar plumbing is incremental and bounded. The connector tails each
+  sidecar by byte offset (only newly appended bytes are read) and dedups
+  re-read records by their monotonic counter, while the bridge compacts a
+  sidecar in place once it passes 8 MiB (keeping the newest 4 MiB of
+  complete records) — long sessions no longer pay quadratic re-reads or
+  unbounded file growth. The startup sweep removes every known leftover
+  artifact older than an hour (event sidecars, control files, bridge
+  request/response directories, connection receipt logs), not just PTC
+  mirrors.
 
 ## Development
 

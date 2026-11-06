@@ -1,4 +1,13 @@
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
@@ -28,6 +37,13 @@ export interface DshSessionEvent {
   seq?: number;
   time?: number;
   data?: Record<string, unknown>;
+  /**
+   * Surface operation of a message-producing event. dsh's ordered surface is
+   * defined by these ops (`append`, or `replace` shadowing an earlier seq
+   * range); history replay keeps only events still on the surface, which is
+   * what makes rewind markers and compaction checkpoints disappear correctly.
+   */
+  surfaceOp?: { op?: unknown; startSeq?: unknown; endSeq?: unknown };
 }
 
 export interface ProbeCleanupOptions {
@@ -63,6 +79,38 @@ function sessionLogPath(sessionDir: string): string | undefined {
   return undefined;
 }
 
+/**
+ * dsh appends one zstd frame per durable flush, and Node's zstd APIs (both
+ * `zstdDecompressSync` and `createZstdDecompress`) decode only the first
+ * frame of a multi-frame file. Scan for frame magics and decode each frame
+ * from its own offset — `zstdDecompressSync` ignores trailing bytes after a
+ * frame, so no boundary arithmetic is needed. False-positive magics inside a
+ * frame's compressed payload either fail to decode (skipped) or produce text
+ * that line-level JSON validation drops.
+ */
+function decodeZstdFrames(data: Buffer, maxTotalOutput: number): string | undefined {
+  const decompress = (zlib as typeof zlib & {
+    zstdDecompressSync?: (buffer: Buffer, options?: { maxOutputLength?: number }) => Buffer;
+  }).zstdDecompressSync;
+  if (typeof decompress !== "function") return undefined;
+  const parts: Buffer[] = [];
+  let total = 0;
+  for (let offset = 0; offset + 4 <= data.length; offset += 1) {
+    if (data[offset] !== 0x28 || data[offset + 1] !== 0xb5 || data[offset + 2] !== 0x2f || data[offset + 3] !== 0xfd) {
+      continue;
+    }
+    try {
+      const out = decompress(data.subarray(offset), { maxOutputLength: maxTotalOutput });
+      parts.push(out);
+      total += out.length;
+      if (total > maxTotalOutput) return undefined;
+    } catch {
+      // Not a real frame start; keep scanning.
+    }
+  }
+  return parts.length ? Buffer.concat(parts).toString("utf8") : undefined;
+}
+
 function readSessionLog(sessionDir: string, maxBytes = MAX_PROBE_LOG_BYTES): string | undefined {
   const path = sessionLogPath(sessionDir);
   if (!path) return undefined;
@@ -70,14 +118,10 @@ function readSessionLog(sessionDir: string, maxBytes = MAX_PROBE_LOG_BYTES): str
     if (statSync(path).size > maxBytes) return undefined;
     const data = readFileSync(path);
     if (!path.endsWith(".zstd")) return data.toString("utf8");
-    const decompress = (zlib as typeof zlib & {
-      zstdDecompressSync?: (buffer: Buffer, options?: { maxOutputLength?: number }) => Buffer;
-    }).zstdDecompressSync;
-    if (typeof decompress !== "function") return undefined;
     const maxOutputLength = maxBytes === MAX_PROBE_LOG_BYTES
       ? MAX_PROBE_OUTPUT_BYTES
       : MAX_HISTORY_OUTPUT_BYTES;
-    return decompress(data, { maxOutputLength }).toString("utf8");
+    return decodeZstdFrames(data, maxOutputLength);
   } catch {
     return undefined;
   }
@@ -88,11 +132,29 @@ export function readDshSessionEvents(
   sessionId: string,
   options: Pick<ProbeCleanupOptions, "home"> = {},
 ): DshSessionEvent[] | undefined {
-  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
-  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
-  if (!sessionDir) return undefined;
-  const log = readSessionLog(sessionDir, MAX_HISTORY_LOG_BYTES);
+  const log = readHistoryLogText(sessionId, options);
   if (log === undefined) return undefined;
+  return parseSessionEvents(log);
+}
+
+/**
+ * Tail-bounded variant used by history replay. Oversized logs no longer
+ * disable replay: the newest `MAX_HISTORY_EVENTS` events are kept instead of
+ * failing the whole session, matching the timeline's own newest-4,000-item
+ * window. Reading is async because the zstd path streams through Node's
+ * decompressor with a bounded ring buffer rather than materializing the
+ * full (potentially >128 MiB) output.
+ */
+export async function readDshSessionEventsTail(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home"> = {},
+): Promise<DshSessionEvent[] | undefined> {
+  const log = await readHistoryLogTextTail(sessionId, options);
+  if (log === undefined) return undefined;
+  return parseSessionEvents(log);
+}
+
+function parseSessionEvents(log: string): DshSessionEvent[] | undefined {
   const events: DshSessionEvent[] = [];
   try {
     for (const line of log.split("\n")) {
@@ -109,13 +171,122 @@ export function readDshSessionEvents(
         ...(event.data && typeof event.data === "object" && !Array.isArray(event.data)
           ? { data: event.data as Record<string, unknown> }
           : {}),
+        ...(event.surfaceOp && typeof event.surfaceOp === "object" && !Array.isArray(event.surfaceOp)
+          ? { surfaceOp: event.surfaceOp as DshSessionEvent["surfaceOp"] }
+          : {}),
       });
-      if (events.length > MAX_HISTORY_EVENTS) return undefined;
     }
   } catch {
     return undefined;
   }
-  return events;
+  return events.length > MAX_HISTORY_EVENTS ? events.slice(-MAX_HISTORY_EVENTS) : events;
+}
+
+function readHistoryLogText(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home">,
+): string | undefined {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
+  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
+  if (!sessionDir) return undefined;
+  return readSessionLog(sessionDir, MAX_HISTORY_LOG_BYTES);
+}
+
+/**
+ * Oversized plain logs are tail-read directly; every zstd log is streamed
+ * through the decompressor with a bounded ring buffer so the newest lines
+ * survive whatever the total decompressed size is.
+ */
+async function readHistoryLogTextTail(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home">,
+): Promise<string | undefined> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
+  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
+  if (!sessionDir) return undefined;
+  const path = sessionLogPath(sessionDir);
+  if (!path) return undefined;
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return undefined;
+  }
+  if (!path.endsWith(".zstd")) {
+    if (size <= MAX_HISTORY_LOG_BYTES) {
+      try {
+        return readFileSync(path).toString("utf8");
+      } catch {
+        return undefined;
+      }
+    }
+    // Read only the newest capped window, aligned to the first full line.
+    const buffer = Buffer.alloc(MAX_HISTORY_LOG_BYTES);
+    const fd = openSync(path, "r");
+    try {
+      let read = 0;
+      const start = size - MAX_HISTORY_LOG_BYTES;
+      while (read < MAX_HISTORY_LOG_BYTES) {
+        const bytes = readSync(fd, buffer, read, MAX_HISTORY_LOG_BYTES - read, start + read);
+        if (bytes <= 0) break;
+        read += bytes;
+      }
+    } finally {
+      closeSync(fd);
+    }
+    const text = buffer.toString("utf8");
+    const firstNewline = text.indexOf("\n");
+    return firstNewline === -1 ? text : text.slice(firstNewline + 1);
+  }
+  return streamZstdTail(path);
+}
+
+const ZSTD_STREAM_TIMEOUT_MS = 30_000;
+/** Ring-buffer budget for one streamed session log, in decompressed bytes. */
+const ZSTD_TAIL_BUDGET_BYTES = 96 * 1024 * 1024;
+/** Compressed session logs beyond this size are not read whole. */
+const ZSTD_MAX_FILE_BYTES = 128 * 1024 * 1024;
+
+/**
+ * Tail of a (multi-frame) zstd log, decoded frame by frame with a bounded
+ * ring buffer over complete lines.
+ */
+function streamZstdTail(path: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let data: Buffer;
+    try {
+      if (statSync(path).size > ZSTD_MAX_FILE_BYTES) {
+        resolve(undefined);
+        return;
+      }
+      data = readFileSync(path);
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    const timer = setTimeout(() => resolve(undefined), ZSTD_STREAM_TIMEOUT_MS);
+    timer.unref();
+    try {
+      const text = decodeZstdFrames(data, ZSTD_TAIL_BUDGET_BYTES) ?? "";
+      const lines: string[] = [];
+      let total = 0;
+      for (const line of text.split("\n")) {
+        lines.push(line);
+        total += line.length + 1;
+        while (total > ZSTD_TAIL_BUDGET_BYTES || lines.length > MAX_HISTORY_EVENTS) {
+          const dropped = lines.shift();
+          if (dropped === undefined) break;
+          total -= dropped.length + 1;
+        }
+      }
+      while (lines.length && !lines[0].trim()) lines.shift();
+      clearTimeout(timer);
+      resolve(lines.join("\n"));
+    } catch {
+      clearTimeout(timer);
+      resolve(undefined);
+    }
+  });
 }
 
 /** Last modification time of a session log, for Paseo's session list. */

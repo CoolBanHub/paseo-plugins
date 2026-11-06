@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { createDshConnector } from "../server/dsh-acp.ts";
 
 // The bridge plugin runs inside the dsh process, so it has no TypeScript
@@ -247,4 +248,240 @@ test("the installed bridge mirrors events, questions, commands and plan changes"
     description: "Toggle plan mode",
     argumentHint: "[off|message]",
   }]);
+});
+
+test("the bridge mirrors usage, turn ends, revert points and stream previews", async () => {
+  process.env.DSH_STREAM_REVEAL_MS = "0";
+  process.env.DSH_STREAM_INTERVAL_MS = "0";
+  const bridgePath = await generatedBridgePath();
+  const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
+    apply(ctx: unknown): void;
+  };
+  const fake = fakeContext();
+  bridge.apply(fake.ctx);
+  const agent = { session: { id: "session-2", header: { id: "session-2" } }, ctx: {} };
+  await (fake.handlers("agent/created")[0] as (arg: unknown) => Promise<void>)({ agent });
+
+  fake.emit("session/event", { header: { id: "session-2" } }, {
+    type: "user/message",
+    seq: 11,
+    data: { id: "user-11", source: { kind: "user" }, content: [{ type: "text", text: "Fix it" }] },
+  });
+  fake.emit("session/event", { header: { id: "session-2" } }, {
+    type: "assistant/message",
+    data: { turn: 3, step: 1, message: { content: [] }, usage: { inputTokens: 10, outputTokens: 5 } },
+  });
+  fake.emit("session/event", { header: { id: "session-2" } }, {
+    type: "turn/end",
+    data: { turn: 3, reason: { kind: "error", error: { code: "QUOTA", message: "quota text" } } },
+  });
+
+  // Streaming frames: quick reveal knobs are zeroed for the test, so chunks
+  // surface immediately and the end frame settles the row.
+  const streamAgent = { session: { header: { id: "session-2" } } };
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "start", attemptId: "at-1", revision: 1, turn: 3, step: 1 } });
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "chunk", attemptId: "at-1", revision: 2, index: 0, chunk: { type: "text-delta", text: "Hello " } } });
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "chunk", attemptId: "at-1", revision: 3, index: 1, chunk: { type: "text-delta", text: "world" } } });
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "end", attemptId: "at-1", revision: 4, index: 2, outcome: { kind: "committed", eventType: "assistant/message", seq: 12 } } });
+  // A reasoning delta never reaches the preview.
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "start", attemptId: "at-2", revision: 1 } });
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "chunk", attemptId: "at-2", revision: 2, index: 0, chunk: { type: "reasoning-delta", text: "hidden" } } });
+  fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "end", attemptId: "at-2", revision: 3, index: 1, outcome: { kind: "abandoned" } } });
+
+  const events = readEvents();
+  const revertPoint = events.find((event) => event.kind === "revert-point");
+  assert.deepEqual(revertPoint?.data, { messageId: "user-11", seq: 11, text: "Fix it" });
+  const usage = events.find((event) => event.kind === "usage");
+  assert.deepEqual(usage?.data, { turn: 3, step: 1, usage: { inputTokens: 10, outputTokens: 5 } });
+  const turnEnd = events.find((event) => event.kind === "turn-end");
+  assert.deepEqual(turnEnd?.data, { turn: 3, reason: { kind: "error", error: { code: "QUOTA", message: "quota text" } } });
+
+  const streamRows = events.filter((event) => event.kind === "stream-row");
+  // Zeroed knobs surface every chunk: two running previews then the settled
+  // row (production throttles to at most one row per interval).
+  assert.equal(streamRows.length, 3, "two running previews and one settled row");
+  assert.equal((streamRows[0] as { data?: { text?: string } }).data?.text, "Hello ");
+  assert.equal((streamRows[1] as { data?: { text?: string } }).data?.text, "Hello world");
+  assert.equal((streamRows[2] as { data?: { text?: string; phase?: string } }).data?.text, "Hello world");
+  assert.equal((streamRows[2] as { data?: { phase?: string } }).data?.phase, "completed");
+  assert.ok(!events.some((event) => event.kind === "stream-row" && JSON.stringify(event).includes("hidden")),
+    "reasoning deltas stay out of the preview");
+
+  delete process.env.DSH_STREAM_REVEAL_MS;
+  delete process.env.DSH_STREAM_INTERVAL_MS;
+});
+
+test("the bridge checkpoints write/edit calls and records file receipts", async () => {
+  const receiptFile = join(home, "bridge-receipts.jsonl");
+  writeFileSync(receiptFile, "");
+  process.env.DSH_RECEIPT_FILE = receiptFile;
+  const bridgePath = await generatedBridgePath();
+  const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
+    apply(ctx: unknown): void;
+  };
+  const fake = fakeContext();
+  bridge.apply(fake.ctx);
+  const target = join(home, "checkpoint-target.txt");
+  writeFileSync(target, "before-bytes");
+
+  const agent = {
+    session: { id: "session-3", header: { id: "session-3" }, snapshotEvents: () => [{ seq: 1 }, { seq: 2 }] },
+  };
+  const preExecute = fake.handlers("tools/pre-execute")[0] as (
+    call: unknown,
+    next: () => Promise<unknown>,
+  ) => Promise<unknown>;
+  const result = fake.handlers("tools/result")[0] as (call: unknown, result: unknown) => void;
+
+  await preExecute({ callId: "w1", name: "write", arguments: JSON.stringify({ file_path: target, content: "after" }), agent }, async () => "done");
+  writeFileSync(target, "after");
+  result({ callId: "w1", name: "write", agent }, { isError: false });
+  // A failed call and a bash call record nothing.
+  await preExecute({ callId: "w2", name: "edit", arguments: JSON.stringify({ file_path: target }), agent }, async () => "done");
+  result({ callId: "w2", name: "edit", agent }, { isError: true });
+  await preExecute({ callId: "w3", name: "bash", arguments: JSON.stringify({ command: "echo hi" }), agent }, async () => "done");
+  result({ callId: "w3", name: "bash", agent }, { isError: false });
+
+  const receipts = readFileSync(receiptFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(receipts.length, 1);
+  const receipt = receipts[0]!;
+  assert.equal(receipt.callId, "w1");
+  assert.equal(receipt.sessionId, "session-3");
+  assert.equal(receipt.path, target);
+  assert.equal(receipt.seq, 2, "the session event count orders receipts against revert tokens");
+  assert.equal(receipt.beforeB64, Buffer.from("before-bytes").toString("base64"));
+  assert.equal(receipt.afterDigest, createHash("sha256").update("after").digest("hex"));
+  delete process.env.DSH_RECEIPT_FILE;
+});
+
+test("rewind requests append a native replace marker under the maintenance lock", async () => {
+  // Every imported bridge keeps its own 100ms request poll alive, so earlier
+  // instances must not race this one for the rewind request; point this
+  // instance at fresh directories before it evaluates its env constants.
+  const rewindRequestDir = join(home, "rewind-requests");
+  const rewindResponseDir = join(home, "rewind-responses");
+  mkdirSync(rewindRequestDir, { recursive: true });
+  mkdirSync(rewindResponseDir, { recursive: true });
+  const previousRequestDir = process.env.DSH_BRIDGE_REQUEST_DIR;
+  const previousResponseDir = process.env.DSH_BRIDGE_RESPONSE_DIR;
+  process.env.DSH_BRIDGE_REQUEST_DIR = rewindRequestDir;
+  process.env.DSH_BRIDGE_RESPONSE_DIR = rewindResponseDir;
+  const bridgePath = await generatedBridgePath();
+  const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
+    apply(ctx: unknown): void;
+  };
+  process.env.DSH_BRIDGE_REQUEST_DIR = previousRequestDir;
+  process.env.DSH_BRIDGE_RESPONSE_DIR = previousResponseDir;
+  const fake = fakeContext();
+  (fake.ctx as { sessions?: unknown }).sessions = { flush: async () => true };
+  bridge.apply(fake.ctx);
+
+  const appended: unknown[] = [];
+  const events: unknown[] = [];
+  for (let seq = 0; seq <= 6; seq += 1) {
+    events.push({ seq, type: "turn/start", turn: 1, data: { turn: 1 } });
+  }
+  events[1] = {
+    seq: 1,
+    type: "user/message",
+    surfaceOp: "append",
+    data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "Keep this message" }] },
+  };
+  events[2] = { seq: 2, type: "assistant/message", surfaceOp: "append", data: { message: { content: [{ type: "text", text: "answer" }] } } };
+  events[3] = {
+    seq: 3,
+    type: "user/message",
+    surfaceOp: "append",
+    data: { id: "u2", source: { kind: "user" }, content: [{ type: "text", text: "Rewind me" }] },
+  };
+  events[4] = { seq: 4, type: "assistant/message", surfaceOp: "append", data: { message: { content: [{ type: "text", text: "later answer" }] } } };
+  events[5] = { seq: 5, type: "turn/end", turn: 1, data: { turn: 1, reason: { kind: "completed" } } };
+  events[6] = { seq: 6, type: "step/end", turn: 1, step: 1, data: {} };
+  const agent = {
+    session: { id: "session-4" },
+    status: "idle",
+    inbox: { nextTurn: [], nextStep: [] },
+    runMaintenance: async (task: (signal: AbortSignal) => Promise<void>) => task(new AbortController().signal),
+    sessionRefs: undefined,
+  };
+  Object.assign(agent, {
+    session: {
+      id: "session-4",
+      snapshotEvents: () => events,
+      surface: { nodes: [1, 2, 3, 4] },
+      append: (type: string, message: unknown, options: unknown) => {
+        appended.push({ type, message, options });
+        return { seq: 7, type, data: message };
+      },
+    },
+  });
+  await (fake.handlers("agent/created")[0] as (arg: unknown) => Promise<void>)({ agent });
+
+  writeFileSync(join(rewindRequestDir, "rewind-ok.json"), JSON.stringify({
+    kind: "rewind",
+    requestId: "rewind-ok",
+    sessionId: "session-4",
+    messageId: "u1",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const ok = JSON.parse(readFileSync(join(rewindResponseDir, "rewind-ok.json"), "utf8"));
+  assert.equal(ok.ok, true);
+  assert.equal(ok.result.messageId, "u1");
+  assert.match(ok.result.summary, /Keep this message/);
+  assert.equal(appended.length, 1);
+  const marker = appended[0] as { type: string; options: { surfaceOp: { op: string; startSeq: number; endSeq: number }; sourceEventSeqs: number[] } };
+  assert.equal(marker.type, "user/message");
+  assert.deepEqual(marker.options.surfaceOp, { op: "replace", startSeq: 2, endSeq: 4 });
+  assert.deepEqual(marker.options.sourceEventSeqs, [2, 3, 4]);
+
+  // A busy agent and an unsupportable transcript both fail closed.
+  (agent as unknown as { status: string }).status = "running";
+  writeFileSync(join(rewindRequestDir, "rewind-busy.json"), JSON.stringify({
+    kind: "rewind",
+    requestId: "rewind-busy",
+    sessionId: "session-4",
+    back: 1,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const busy = JSON.parse(readFileSync(join(rewindResponseDir, "rewind-busy.json"), "utf8"));
+  assert.equal(busy.ok, false);
+  assert.match(busy.error, /忙碌/);
+
+  (agent as unknown as { status: string }).status = "idle";
+  events[4] = { seq: 4, type: "job/registered", turn: 1, data: {} };
+  writeFileSync(join(rewindRequestDir, "rewind-plain.json"), JSON.stringify({
+    kind: "rewind",
+    requestId: "rewind-plain",
+    sessionId: "session-4",
+    messageId: "u1",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const plain = JSON.parse(readFileSync(join(rewindResponseDir, "rewind-plain.json"), "utf8"));
+  assert.equal(plain.ok, false);
+  assert.match(plain.error, /不支持在此处回退/);
+  events[4] = { seq: 4, type: "assistant/message", surfaceOp: "append", data: { message: { content: [{ type: "text", text: "later answer" }] } } };
+});
+
+test("a timed-out dsh question emits question-cancelled", async () => {
+  const bridgePath = await generatedBridgePath();
+  const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
+    apply(ctx: unknown): void;
+  };
+  const fake = fakeContext();
+  bridge.apply(fake.ctx);
+  const agent = { session: { id: "session-5" }, ctx: {} };
+  await (fake.handlers("agent/created")[0] as (arg: unknown) => Promise<void>)({ agent });
+
+  const controller = new AbortController();
+  controller.abort();
+  const handler = fake.handlers("user-questions/request")[0] as (
+    request: unknown,
+    next: () => Promise<unknown>,
+  ) => Promise<unknown>;
+  await assert.rejects(
+    handler({ agent, questions: [], signal: controller.signal }, async () => undefined),
+    /cancelled/,
+  );
+  const cancelled = readEvents().find((event) => event.kind === "question-cancelled");
+  assert.ok(cancelled, "the cancellation is mirrored so the connector can dismiss the form");
 });

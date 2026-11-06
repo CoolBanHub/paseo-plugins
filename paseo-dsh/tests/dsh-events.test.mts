@@ -147,3 +147,73 @@ test("unknown and malformed events are ignored", () => {
   assert.equal(dshEventUpdates(DSH_EVENT_METHOD, null, "s"), null);
   assert.deepEqual(map("unknown", {}), []);
 });
+
+test("failed turns map their stable error code to a Chinese error row", () => {
+  const updates = map("turn-end", {
+    turn: 3,
+    reason: { kind: "error", error: { code: "QUOTA", message: "raw provider text", status: 402 } },
+  });
+  assert.deepEqual(updates, [{
+    type: "timeline",
+    item: {
+      type: "error",
+      id: "dsh:turn-error:paseo-session:3",
+      message: "账号额度或余额已用尽（HTTP 402）",
+    },
+  }]);
+  const unknown = map("turn-end", {
+    turn: 4,
+    reason: { kind: "error", error: { message: "mystery" } },
+  });
+  assert.equal(unknown[0]?.type === "timeline" && unknown[0].item.type === "error" && unknown[0].item.message, "mystery");
+  const completed = map("turn-end", { turn: 5, reason: { kind: "completed" } });
+  assert.equal(completed.length, 0);
+  const maxTokens = map("turn-end", { turn: 6, reason: { kind: "max-tokens" } });
+  assert.equal((maxTokens[0] as { notice?: { title?: string } })?.notice?.title, "达到输出上限");
+});
+
+test("usage snapshots become compact info notices", () => {
+  const updates = map("usage", {
+    turn: 2,
+    step: 1,
+    usage: { inputTokens: 1200, outputTokens: 800, cacheReadTokens: 45000, cacheWriteTokens: 500 },
+  });
+  const notice = updates[0];
+  assert.equal((notice as { notice?: { title?: string } })?.notice?.title, "Token 用量");
+  assert.match((notice as { notice?: { description?: string } }).notice?.description ?? "", /输入 1\.2k/);
+  assert.match((notice as { notice?: { description?: string } }).notice?.description ?? "", /输出 800/);
+  assert.equal(map("usage", { usage: {} }).length, 0);
+});
+
+test("stream preview rows update one stable id and settle compactly", () => {
+  const running = map("stream-row", { attemptId: "a1", phase: "running", text: "part one", chars: 9 });
+  const item = running[0]?.type === "timeline" ? running[0].item : undefined;
+  assert.equal(item?.type === "tool_call" && item.id, "dsh:stream:paseo-session:a1");
+  assert.equal(item?.type === "tool_call" && item.detail.type === "plain_text" ? item.detail.label : "", "正在生成…");
+  const done = map("stream-row", { attemptId: "a1", phase: "completed", text: "part one", chars: 9 });
+  const doneItem = done[0]?.type === "timeline" ? done[0].item : undefined;
+  assert.equal(
+    doneItem?.type === "tool_call" && doneItem.detail.type === "plain_text" ? doneItem.detail.label : "",
+    "已生成 9 字",
+  );
+});
+
+test("revert points carry the native revert token", () => {
+  const updates = map("revert-point", { messageId: "m1", seq: 5, text: "Fix the parser" });
+  const item = updates[0]?.type === "timeline" ? updates[0].item : undefined;
+  assert.equal(item?.type === "tool_call" && item.id, "dsh:revert:paseo-session:m1");
+  assert.deepEqual(
+    item?.type === "tool_call" ? item.revertToken : undefined,
+    { v: 1, kind: "dsh-rewind", messageId: "m1", seq: 5 },
+  );
+  assert.equal(map("revert-point", {}).length, 0);
+});
+
+test("question timeouts and rewind completions become notices", () => {
+  const cancelled = map("question-cancelled", { requestId: "q1" });
+  assert.equal((cancelled[0] as { notice?: { title?: string } })?.notice?.title, "提问已取消");
+  const rewound = map("rewind-applied", { summary: "Fix the parser" });
+  const description = (rewound[0] as { notice?: { description?: string } })?.notice?.description ?? "";
+  assert.match(description, /Fix the parser/);
+  assert.match(description, /重新打开会话/);
+});

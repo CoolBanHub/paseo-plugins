@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Hash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseDocument, stringify } from "yaml";
@@ -177,4 +177,45 @@ export function writeWebModelOverlay(
   mkdirSync(dirname(outputPath), { recursive: true });
   writeFileSync(outputPath, stringify(overlay), { mode: 0o600 });
   return ids;
+}
+
+export interface ModelOverlayResolution {
+  /** Overlay patch to mount; undefined spawns dsh without the Web model overlay. */
+  path?: string;
+  /** Model ids in the freshly written overlay; empty when degraded. */
+  ids: string[];
+  /** Why a previously-written overlay or no overlay is being used. */
+  degradedReason?: string;
+}
+
+/**
+ * Resolve the Web model overlay for one spawn, degrading instead of failing.
+ *
+ * `writeWebModelOverlay` requires both profiles to be present and well-formed,
+ * which used to abort every session open and catalog probe when the Web
+ * profile was mid-edit or not yet initialized. A failure now reuses the last
+ * successfully written overlay (same fixed path), and only when none exists
+ * does the spawn proceed without the overlay — dsh falls back to its own ACP
+ * profile models and the next successful refresh restores the full list.
+ */
+export function resolveModelOverlay(
+  acpProfileRoot: string,
+  webProfileRoot: string,
+  outputPath: string,
+): ModelOverlayResolution {
+  try {
+    return { path: outputPath, ids: writeWebModelOverlay(acpProfileRoot, webProfileRoot, outputPath) };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (existsSync(outputPath)) {
+      try {
+        if (statSync(outputPath).size > 0) {
+          return { path: outputPath, ids: [], degradedReason: reason };
+        }
+      } catch {
+        // Fall through to the no-overlay path.
+      }
+    }
+    return { ids: [], degradedReason: reason };
+  }
 }

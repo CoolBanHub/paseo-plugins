@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -14,17 +15,19 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import { ndJsonStream } from "@agentclientprotocol/sdk";
 import type { AcpConnector, AcpStream, AcpStreamMessage } from "@getpaseo/plugin/server/acp";
 import type { DshSessionLaunchContext } from "./session-launch-context";
-import { writeWebModelOverlay } from "./dsh-catalog.ts";
+import { resolveModelOverlay } from "./dsh-catalog.ts";
 import { DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
 import { DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD } from "./tool-present.ts";
 import { DSH_EVENT_METHOD } from "./dsh-events.ts";
 import { dshSessionLastActivity, dshSessionPlanActive, dshSessionTitle } from "./dsh-projections.ts";
 import { cancelAllDshQuestions, cancelDshQuestion, registerDshQuestion } from "./dsh-questions.ts";
+import { SidecarTail, type SidecarTailRecord } from "./sidecar-tail.ts";
+import { registerDshRevertHandler, unregisterDshRevertHandler } from "./dsh-revert.ts";
 import {
   DEFAULT_PERMISSION_OPTIONS,
   DSH_MODES,
@@ -145,17 +148,35 @@ function versionTupleOf(nodePath: string): number[] | undefined {
 
 const nodeVersionCache = new Map<string, number[]>();
 
-const AGENT_PRESET_BRIDGE_SOURCE = `import { appendFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+const AGENT_PRESET_BRIDGE_SOURCE = `import { appendFileSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 const NL = String.fromCharCode(10);
 const PRESETS = new Set(["standard", "ptc", "minimal", "cordis"]);
+const SIDECAR_CAP_BYTES = 8 * 1024 * 1024;
+const SIDECAR_KEEP_BYTES = 4 * 1024 * 1024;
+const SNAPSHOT_MAX_BYTES = 256 * 1024;
+// The reveal knobs are env-overridable so tests can exercise the gating
+// without waiting real seconds; production uses the defaults below.
+const streamKnob = (name, fallback) => {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+const STREAM_REVEAL_MS = streamKnob("DSH_STREAM_REVEAL_MS", 1500);
+const STREAM_INTERVAL_MS = streamKnob("DSH_STREAM_INTERVAL_MS", 500);
+const REWIND_PLAIN = new Set(["session/start","session/create","session/end-seed","turn/start","turn/end","step/start","step/end",
+  "agent/inbox/spliced","user/message","assistant/message","assistant/attempt","system/message","request/header","request/context","session/title","tool/call","tool/result",
+  // Durable-delivery bookkeeping the session log writer appends per flush; it
+  // carries no surface or state projection, so rewinding past it is safe.
+  "session-log-deepseek/delivery-accepted"]);
 const permissionAgents = new Map();
 const appliedPermissions = new Map();
 const appliedPlanRequests = new Map();
 const toolCalls = new Map();
 const subagentRuns = new Map();
 const startedRuns = new Set();
+const pendingWrites = new Map();
 const controlFile = process.env.DSH_PERMISSION_CONTROL_FILE;
 const catalogFile = process.env.DSH_PERMISSION_CATALOG_FILE;
 const ptcEventFile = process.env.DSH_PTC_EVENT_FILE;
@@ -164,12 +185,17 @@ const requestDir = process.env.DSH_BRIDGE_REQUEST_DIR;
 const responseDir = process.env.DSH_BRIDGE_RESPONSE_DIR;
 const commandCatalogFile = process.env.DSH_COMMAND_CATALOG_FILE;
 const planControlFile = process.env.DSH_PLAN_CONTROL_FILE;
+const receiptFile = process.env.DSH_RECEIPT_FILE;
 let questionSeq = 0;
 let pollTick = 0;
 let processingRequests = false;
+let eventSeq = 0;
+let ptcSeq = 0;
+let receiptSeq = 0;
+let rewindSeq = 0;
 
 export const name = "paseo-dsh-agent-preset-bridge";
-export const inject = ["agentPresets", "sessionProjections", "permissionPresets"];
+export const inject = ["agentPresets", "sessionProjections", "permissionPresets", "sessions"];
 
 function cap(value) {
   if (typeof value === "string") return value.length > 20000 ? value.slice(0, 20000) : value;
@@ -196,10 +222,26 @@ function writeJson(file, value) {
   }
 }
 
+// The connector tails each sidecar by byte offset and dedups re-read records
+// by their monotonic record counter, so compaction only drops old lines.
+function compactSidecar(file) {
+  if (!file) return;
+  try {
+    if (statSync(file).size <= SIDECAR_CAP_BYTES) return;
+    const text = readFileSync(file, "utf8");
+    const keep = text.slice(Math.max(0, text.length - SIDECAR_KEEP_BYTES));
+    const start = keep.indexOf(NL);
+    writeFileSync(file, start === -1 ? "" : keep.slice(start + 1), { mode: 0o600 });
+  } catch {
+    // Compaction is best-effort; growth alone is not fatal.
+  }
+}
+
 function appendEvent(kind, sessionId, data) {
   if (!eventFile) return;
   try {
-    appendFileSync(eventFile, JSON.stringify({ kind, sessionId, data: cap(data) }) + NL);
+    appendFileSync(eventFile, JSON.stringify({ n: ++eventSeq, kind, sessionId, data: cap(data) }) + NL);
+    compactSidecar(eventFile);
   } catch {
     // Event mirroring is best-effort; the agent must keep running.
   }
@@ -319,6 +361,7 @@ function ptcMirror(ctx) {
     if (event.type !== "tool/ptc-dispatch-start" && event.type !== "tool/ptc-dispatch") return;
     try {
       appendFileSync(ptcEventFile, JSON.stringify({
+        n: ++ptcSeq,
         kind: event.type === "tool/ptc-dispatch-start" ? "call" : "result",
         sessionId: session.header.id,
         data: cap({
@@ -331,6 +374,7 @@ function ptcMirror(ctx) {
           content: event.data.content,
         }),
       }) + NL);
+      compactSidecar(ptcEventFile);
     } catch (error) {
       ctx.logger.warn("paseo-dsh: ptc event mirror failed", error);
     }
@@ -399,6 +443,31 @@ function eventMirror(ctx) {
         appendEvent("llm-retry", sessionId, data);
         return;
       }
+      if (event.type === "user/message") {
+        const source = data.source || {};
+        if (source.kind === "user" && typeof data.id === "string") {
+          appendEvent("revert-point", sessionId, {
+            messageId: data.id,
+            seq: typeof event.seq === "number" ? event.seq : undefined,
+            text: textOf(data.content).slice(0, 120),
+          });
+        }
+        return;
+      }
+      if (event.type === "assistant/message") {
+        if (data.usage && typeof data.usage === "object") {
+          appendEvent("usage", sessionId, {
+            turn: data.turn,
+            step: data.step,
+            usage: data.usage,
+          });
+        }
+        return;
+      }
+      if (event.type === "turn/end") {
+        appendEvent("turn-end", sessionId, { turn: data.turn, reason: data.reason });
+        return;
+      }
       if (event.type === "compaction/start") {
         appendEvent("compaction-start", sessionId, data);
         return;
@@ -462,6 +531,259 @@ function eventMirror(ctx) {
   });
 }
 
+// Live assistant streaming preview. dsh's ACP bridge only projects the
+// settled assistant message, so the first visible token would otherwise wait
+// for the whole turn. Frames are transient; accumulate text deltas and mirror
+// a throttled preview that the connector renders as one updating row. Quick
+// attempts (under STREAM_REVEAL_MS) never surface a row at all.
+function streamMirror(ctx) {
+  if (!eventFile) return;
+  const attempts = new Map();
+  ctx.on("agent/assistant-stream", (payload) => {
+    const agent = payload && payload.agent;
+    const frame = payload && payload.frame;
+    if (!agent || !agent.session || !frame || typeof frame.attemptId !== "string") return;
+    const sessionId = agent.session.header && agent.session.header.id;
+    if (typeof sessionId !== "string") return;
+    if (frame.type === "start") {
+      attempts.set(frame.attemptId, { lastSent: 0, text: "", chars: 0, started: Date.now(), shown: false });
+      return;
+    }
+    if (frame.type === "chunk") {
+      const state = attempts.get(frame.attemptId);
+      if (!state) return;
+      const chunk = frame.chunk;
+      if (chunk && chunk.type === "text-delta" && typeof chunk.text === "string") {
+        state.text = (state.text + chunk.text).slice(-2000);
+        state.chars += chunk.text.length;
+      }
+      const now = Date.now();
+      if (now - state.started >= STREAM_REVEAL_MS && now - state.lastSent >= STREAM_INTERVAL_MS && state.chars > 0) {
+        state.lastSent = now;
+        state.shown = true;
+        appendEvent("stream-row", sessionId, {
+          attemptId: frame.attemptId,
+          phase: "running",
+          text: state.text,
+          chars: state.chars,
+        });
+      }
+      return;
+    }
+    if (frame.type === "end") {
+      const state = attempts.get(frame.attemptId);
+      attempts.delete(frame.attemptId);
+      if (!state || !state.shown) return;
+      const abandoned = !frame.outcome || frame.outcome.kind !== "committed";
+      appendEvent("stream-row", sessionId, {
+        attemptId: frame.attemptId,
+        phase: abandoned ? "failed" : "completed",
+        text: state.text,
+        chars: state.chars,
+      });
+    }
+  });
+}
+
+// Byte-level before-snapshots of the model's write/edit tool calls, appended
+// to a sidecar the connector persists per dsh session. bash and other tools
+// are deliberately not checkpointed: their file effects cannot be captured
+// reliably, and revert fails closed for them instead of guessing.
+function fileCheckpoints(ctx) {
+  if (!receiptFile) return;
+  const snapshotBefore = (callId, path) => {
+    try {
+      const before = statSync(path);
+      if (!before.isFile() || before.size > SNAPSHOT_MAX_BYTES) {
+        pendingWrites.set(callId, { path, absent: false, bytes: null });
+        return;
+      }
+      const content = readFileSync(path);
+      const after = statSync(path);
+      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+        pendingWrites.set(callId, { path, absent: false, bytes: null });
+        return;
+      }
+      pendingWrites.set(callId, { path, absent: false, bytes: content });
+    } catch {
+      // ENOENT: the file did not exist before this call created it.
+      pendingWrites.set(callId, { path, absent: true, bytes: null });
+    }
+  };
+  ctx.on("tools/pre-execute", async (call, next) => {
+    try {
+      if (call && (call.name === "write" || call.name === "edit")) {
+        const args = parseArgs(call.arguments);
+        const path = args && typeof args === "object" ? (args.file_path || args.path) : undefined;
+        if (typeof path === "string" && path && typeof call.callId === "string") {
+          snapshotBefore(call.callId, path);
+        }
+      }
+    } catch {
+      // A failed snapshot only means this call is not revertible.
+    }
+    return next();
+  });
+  ctx.on("tools/result", (call, result) => {
+    try {
+      if (!call || typeof call.callId !== "string") return;
+      const snapshot = pendingWrites.get(call.callId);
+      if (!snapshot) return;
+      pendingWrites.delete(call.callId);
+      if (!result || result.isError === true) return;
+      const agent = call.agent;
+      const sessionId = agent && agent.session && agent.session.header ? agent.session.header.id : undefined;
+      if (typeof sessionId !== "string" || !sessionId) return;
+      let afterDigest;
+      try {
+        afterDigest = createHash("sha256").update(readFileSync(snapshot.path)).digest("hex");
+      } catch {
+        afterDigest = undefined;
+      }
+      let seq;
+      try {
+        const events = agent.session.snapshotEvents();
+        if (Array.isArray(events)) seq = events.length;
+      } catch {
+        seq = undefined;
+      }
+      appendFileSync(receiptFile, JSON.stringify({
+        n: ++receiptSeq,
+        sessionId,
+        callId: call.callId,
+        tool: call.name,
+        path: snapshot.path,
+        absentBefore: snapshot.absent === true,
+        beforeB64: snapshot.bytes ? snapshot.bytes.toString("base64") : undefined,
+        afterDigest,
+        seq,
+        time: Date.now(),
+      }) + NL);
+      compactSidecar(receiptFile);
+    } catch (error) {
+      ctx.logger.warn("paseo-dsh: file receipt failed", error);
+    }
+  });
+}
+
+// Conversation rewind appends one marker user message whose native surfaceOp
+// replace shadows everything after the chosen cut, using dsh's own log
+// semantics. Planning is deliberately conservative: only plain exchanges and
+// fully settled read/write/edit calls are rewound; jobs, goals, PTC programs
+// and anything stateful fail closed.
+function planRewind(events, messageId, back) {
+  if (!Array.isArray(events) || events.length === 0 || events.length > 100000) return null;
+  const hidden = [];
+  for (const event of events) {
+    if (
+      event && event.type === "user/message" && typeof event.seq === "number" &&
+      event.data && event.data.source && event.data.source.kind === "paseo-rewind" &&
+      event.surfaceOp && event.surfaceOp.op === "replace" &&
+      typeof event.surfaceOp.startSeq === "number"
+    ) {
+      hidden.push([event.surfaceOp.startSeq - 1, event.seq]);
+    }
+  }
+  const isHidden = (seq) => hidden.some((range) => seq > range[0] && seq <= range[1]);
+  const userMessages = [];
+  for (const event of events) {
+    if (event.type !== "user/message" || typeof event.seq !== "number" || isHidden(event.seq)) continue;
+    const data = event.data || {};
+    if (data.source && data.source.kind === "user" && typeof data.id === "string") {
+      userMessages.push({ seq: event.seq, id: data.id, text: textOf(data.content) });
+    }
+  }
+  if (userMessages.length === 0) return null;
+  let target = null;
+  if (typeof messageId === "string" && messageId) {
+    target = userMessages.find((entry) => entry.id === messageId) || null;
+  } else {
+    const backIndex = typeof back === "number" && back >= 1 ? Math.floor(back) : 1;
+    target = userMessages[Math.max(0, userMessages.length - backIndex)] || null;
+  }
+  if (!target) return null;
+  const summary = target.text && target.text.trim() ? target.text.trim().slice(0, 60) : "更早的消息";
+  const cut = target.seq;
+  const sources = [];
+  const openCalls = new Set();
+  const toolNames = new Set(["read", "write", "edit"]);
+  const declared = new Map();
+  for (const event of events) {
+    if (typeof event.seq !== "number" || event.seq <= cut || isHidden(event.seq)) continue;
+    if (!REWIND_PLAIN.has(event.type)) return null;
+    if (event.surfaceOp !== undefined) {
+      if (event.surfaceOp !== "append" && event.surfaceOp.op !== "append") return null;
+      if (event.surfaceOp === "append" || event.surfaceOp.op === "append") sources.push(event.seq);
+    }
+    const data = event.data || {};
+    if (event.type === "assistant/message") {
+      const content = data.message && Array.isArray(data.message.content) ? data.message.content : [];
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        if (part.type === "text" || part.type === "reasoning") continue;
+        if (
+          part.type !== "tool-call" || typeof part.id !== "string" || !part.id ||
+          !toolNames.has(part.name) || typeof part.arguments !== "string" ||
+          !Number.isSafeInteger(data.turn) || !Number.isSafeInteger(data.step)
+        ) return null;
+        declared.set(part.id, { name: part.name, arguments: part.arguments, turn: data.turn, step: data.step });
+      }
+    } else if (event.type === "tool/call") {
+      const spec = declared.get(data.callId);
+      if (
+        !spec || spec.name !== data.name || spec.arguments !== data.arguments ||
+        spec.turn !== data.turn || spec.step !== data.step || !toolNames.has(data.name)
+      ) return null;
+      openCalls.add(data.callId);
+    } else if (event.type === "tool/result") {
+      const message = data.message || {};
+      if (!openCalls.delete(message.toolCallId)) return null;
+    } else if (event.type === "step/end" || event.type === "turn/end") {
+      if (openCalls.size) return null;
+    }
+  }
+  if (openCalls.size || sources.length === 0) return null;
+  return { cut, messageId: target.id, summary, first: sources[0], last: sources[sources.length - 1], sources };
+}
+
+async function performRewind(ctx, agent, request) {
+  if (!agent || agent.status !== "idle" || typeof agent.runMaintenance !== "function" || !agent.session) {
+    throw new Error("会话忙碌或未就绪，暂时无法回退");
+  }
+  const inbox = agent.inbox;
+  if (
+    inbox && ((Array.isArray(inbox.nextTurn) && inbox.nextTurn.length) ||
+      (Array.isArray(inbox.nextStep) && inbox.nextStep.length))
+  ) {
+    throw new Error("会话还有排队中的消息，请等本轮结束后再回退");
+  }
+  let plan;
+  let appended = false;
+  await agent.runMaintenance(async () => {
+    const events = agent.session.snapshotEvents();
+    if (!Array.isArray(events)) throw new Error("无法读取会话事件");
+    plan = planRewind(events, request.messageId, request.back);
+    if (!plan) throw new Error("当前会话内容不支持在此处回退（例如包含 bash、后台任务或未完成的调用）");
+    const message = {
+      role: "user",
+      id: "paseo-rewind-" + Date.now().toString(36) + "-" + (++rewindSeq),
+      content: [{ type: "text", text: "Paseo：以上为保留的会话上下文。" }],
+      source: { kind: "paseo-rewind" },
+    };
+    agent.session.append("user/message", message, {
+      surfaceOp: { op: "replace", startSeq: plan.first, endSeq: plan.last },
+      sourceEventSeqs: plan.sources,
+    });
+    appended = true;
+    if (!ctx.sessions || typeof ctx.sessions.flush !== "function") {
+      throw new Error("回退已写入但无法确认持久化");
+    }
+    const flushed = await ctx.sessions.flush(agent.session);
+    if (!flushed) throw new Error("回退已写入但未能确认持久化，请重新打开会话核对");
+  });
+  return plan;
+}
+
 // The ACP app has no answerer for ctx.userQuestions. Relay each request to
 // Paseo's native question form and return the selected labels / custom text.
 function questionBridge(ctx) {
@@ -482,7 +804,12 @@ function questionBridge(ctx) {
         rmSync(answerFile, { force: true });
         return { answers: answer.answers };
       }
-      if (request.signal && request.signal.aborted) throw new Error("user question cancelled");
+      if (request.signal && request.signal.aborted) {
+        // dsh gave up waiting (timed ask_user_question): let the connector
+        // dismiss the Paseo form so it does not keep waiting for a dead answer.
+        appendEvent("question-cancelled", agent.session.id, { requestId });
+        throw new Error("user question cancelled");
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   });
@@ -519,7 +846,9 @@ async function processRequests(ctx) {
           const commands = ctx.get("commands");
           if (!agent || !commands || typeof commands.execute !== "function") throw new Error("commands are not available in this preset");
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 120000);
+          // The connector's own deadline (130s) fires first and reports a
+          // clean failure; this backstop only guards a stuck native command.
+          const timer = setTimeout(() => controller.abort(), 150000);
           try {
             const execution = await commands.execute(agent, String(request.line || ""), [], controller.signal);
             writeJson(responseFile, execution
@@ -528,6 +857,19 @@ async function processRequests(ctx) {
           } finally {
             clearTimeout(timer);
           }
+        } else if (request.kind === "rewind") {
+          const agent = permissionAgents.get(request.sessionId);
+          const plan = await performRewind(ctx, agent, request);
+          writeJson(responseFile, {
+            ok: true,
+            result: {
+              messageId: plan.messageId,
+              cut: plan.cut,
+              summary: plan.summary,
+              first: plan.first,
+              last: plan.last,
+            },
+          });
         } else {
           writeJson(responseFile, { ok: false, error: "unknown bridge request" });
         }
@@ -546,6 +888,8 @@ export function apply(ctx) {
   writeCatalog(ctx);
   ptcMirror(ctx);
   eventMirror(ctx);
+  streamMirror(ctx);
+  fileCheckpoints(ctx);
   questionBridge(ctx);
   ctx.on("agent/created", async ({ agent }) => {
     const recorded = ctx.sessionProjections.stateOf(agent.session, "agentPreset");
@@ -591,7 +935,7 @@ const AGENT_PRESET_INTEGRATION_PATCH = `- insert:
       name: "@deepseek-ai/dsh-tool-cordis/host"
     - id: paseo-agent-preset-selection
       name: ./agent-preset-bridge.js
-      inject: [agentPresets, sessionProjections, permissionPresets]
+      inject: [agentPresets, sessionProjections, permissionPresets, sessions]
 `;
 
 function normalizeModeId(mode: string | undefined): DshModeId {
@@ -1052,14 +1396,30 @@ export function createDshConnector(
     log("catalog probe sweep failed", { error: String(error) });
   }
 
-  // PTC mirror sidecars from crashed or reloaded connectors. Live ones are
-  // owned by a running child; anything an hour old is a leftover.
+  // Sidecars and control files from crashed or reloaded connectors. Live ones
+  // are owned by a running child; anything an hour old is a leftover. The
+  // sweep covers every per-connection artifact this plugin creates; before it
+  // only matched PTC mirrors, so a daemon crash leaked the rest forever.
+  const leftoverPrefixes = [
+    "ptc-events-",
+    "dsh-events-",
+    "permission-control-",
+    "permission-catalog-",
+    "command-catalog-",
+    "plan-control-",
+    "file-receipts-conn-",
+    "bridge-requests-",
+    "bridge-responses-",
+  ];
   try {
     for (const file of readdirSync(dataDir)) {
-      if (!file.startsWith("ptc-events-")) continue;
+      if (!leftoverPrefixes.some((prefix) => file.startsWith(prefix))) continue;
       const path = join(dataDir, file);
       try {
-        if (Date.now() - statSync(path).mtimeMs > 60 * 60_000) rmSync(path, { force: true });
+        const stats = statSync(path);
+        if (Date.now() - stats.mtimeMs > 60 * 60_000) {
+          rmSync(path, { recursive: true, force: true });
+        }
       } catch {
         // Unreadable leftovers are harmless; leave them for the next sweep.
       }
@@ -1081,7 +1441,13 @@ export function createDshConnector(
     const initialMode = normalizeModeId(launchContext?.mode);
     const presetPatches = presetPatchPaths(script, initialMode, dataDir);
     const modelOverlayPath = join(dataDir, "web-models.patch.yml");
-    const modelIds = writeWebModelOverlay(dshProfileRoot("acp"), dshProfileRoot("web"), modelOverlayPath);
+    const modelOverlay = resolveModelOverlay(dshProfileRoot("acp"), dshProfileRoot("web"), modelOverlayPath);
+    if (modelOverlay.degradedReason) {
+      log("web model overlay degraded; spawning with the fallback route", {
+        reason: modelOverlay.degradedReason,
+        reusedLastGood: modelOverlay.path !== undefined,
+      });
+    }
     const permissionControlFile = join(dataDir, `permission-control-${randomUUID()}.json`);
     const permissionCatalogFile = join(dataDir, `permission-catalog-${randomUUID()}.json`);
     const ptcEventFile = join(dataDir, `ptc-events-${randomUUID()}.jsonl`);
@@ -1091,6 +1457,8 @@ export function createDshConnector(
     const bridgeResponseDir = join(dataDir, `bridge-responses-${bridgeId}`);
     const commandCatalogFile = join(dataDir, `command-catalog-${randomUUID()}.json`);
     const planControlFile = join(dataDir, `plan-control-${randomUUID()}.json`);
+    const receiptFile = join(dataDir, `file-receipts-conn-${bridgeId}.jsonl`);
+    const persistentReceiptDir = join(dataDir, "file-receipts");
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(bridgeRequestDir, { recursive: true });
     mkdirSync(bridgeResponseDir, { recursive: true });
@@ -1099,6 +1467,7 @@ export function createDshConnector(
     writeFileSync(commandCatalogFile, "{}", { mode: 0o600 });
     writeFileSync(ptcEventFile, "", { mode: 0o600 });
     writeFileSync(eventFile, "", { mode: 0o600 });
+    writeFileSync(receiptFile, "", { mode: 0o600 });
     const env = { ...process.env };
     env.DSH_AGENT_PRESET = initialMode;
     env.DSH_PERMISSION_CONTROL_FILE = permissionControlFile;
@@ -1109,14 +1478,16 @@ export function createDshConnector(
     env.DSH_BRIDGE_RESPONSE_DIR = bridgeResponseDir;
     env.DSH_COMMAND_CATALOG_FILE = commandCatalogFile;
     env.DSH_PLAN_CONTROL_FILE = planControlFile;
+    env.DSH_RECEIPT_FILE = receiptFile;
     log("starting dsh acp", {
       node,
       script,
       cwd: launchContext?.cwd,
       agentPreset: initialMode,
-      webModels: modelIds,
+      webModels: modelOverlay.ids,
     });
-    const patchArgs = [...presetPatches, modelOverlayPath].flatMap((path) => ["--patch", path]);
+    const patchArgs = [...presetPatches, ...(modelOverlay.path ? [modelOverlay.path] : [])]
+      .flatMap((path) => ["--patch", path]);
     const child = spawn(node, [script, "--profile", "acp", ...patchArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
@@ -1160,8 +1531,10 @@ export function createDshConnector(
       rmSync(permissionCatalogFile, { force: true });
       rmSync(planControlFile, { force: true });
       rmSync(commandCatalogFile, { force: true });
+      rmSync(receiptFile, { force: true });
       rmSync(bridgeRequestDir, { recursive: true, force: true });
       rmSync(bridgeResponseDir, { recursive: true, force: true });
+      for (const sessionId of liveSessions) unregisterDshRevertHandler(sessionId);
       stopPtcMirror();
       stopEventMirror();
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -1212,7 +1585,10 @@ export function createDshConnector(
     let stopEventMirror: () => void = () => {};
     // Commands the bridge advertised for each dsh session.
     const sessionCommands = new Map<string, Set<string>>();
-    const FALLBACK_COMMANDS = new Set(["plan", "compact", "goal", "permission", "permissions", "model", "feedback"]);
+    const FALLBACK_COMMANDS = new Set(["plan", "compact", "goal", "permission", "permissions", "model", "feedback", "rewind", "revert-files"]);
+    // Mirror requestId -> synthetic tool-call id of the live question form, so
+    // a dsh-side wait timeout can dismiss the form Paseo is still showing.
+    const questionForms = new Map<string, string>();
 
     const writer = base.writable.getWriter();
     let writerClosed = false;
@@ -1241,12 +1617,21 @@ export function createDshConnector(
               ? params.prompt.map((part) => typeof part?.text === "string" ? part.text : "").join("")
               : "";
             const line = promptText.trim();
-            const match = /^\/([A-Za-z0-9_-]+)(?:\s+[\s\S]*)?$/.exec(line);
+            const match = /^\/([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(line);
             const name = match?.[1]?.toLowerCase();
+            const argumentText = match?.[2] ?? "";
             if (
               match && name && typeof params?.sessionId === "string" &&
               (sessionCommands.get(params.sessionId)?.has(name) === true || FALLBACK_COMMANDS.has(name))
             ) {
+              if (name === "rewind") {
+                void runRewindSlash(params.sessionId, argumentText, message.id);
+                return;
+              }
+              if (name === "revert-files") {
+                runRevertFilesSlash(params.sessionId, argumentText, message.id);
+                return;
+              }
               void runBridgeCommand(params.sessionId, line, message.id);
               return;
             }
@@ -1636,6 +2021,8 @@ export function createDshConnector(
                   : request.sessionId;
                 if (sessionId && !request.probe) {
                   liveSessions.add(sessionId);
+                  registerDshRevertHandler(sessionId, ({ token, scope }) =>
+                    runNativeRevert(sessionId, token, scope));
                   // Commands may already be in the bridge's catalog by the
                   // time the ACP session/new or resume response arrives. Send
                   // once now and once after Paseo has emitted session.ready.
@@ -1724,7 +2111,7 @@ export function createDshConnector(
      * transformer (see ptc-present.ts), which renders one detailed timeline
      * row per sub-call instead of a bare "Run code" aggregate.
      */
-    let ptcOffset = 0;
+    const ptcTail = new SidecarTail(ptcEventFile);
     const emitPtcRecord = (record: PtcMirrorRecord): boolean => {
       if (!fromAgentController) return false;
       if (typeof record.sessionId !== "string" || !liveSessions.has(record.sessionId)) return true;
@@ -1756,31 +2143,7 @@ export function createDshConnector(
       return true;
     };
     const drainPtcEvents = (): void => {
-      let text: string;
-      try {
-        text = readFileSync(ptcEventFile, "utf8");
-      } catch {
-        return;
-      }
-      if (text.length < ptcOffset) ptcOffset = 0; // the file was replaced
-      const chunk = text.slice(ptcOffset);
-      // Only consume up to the last complete line: a read racing the
-      // bridge's append can observe a partially written record.
-      const lastNewline = chunk.lastIndexOf("\n");
-      if (lastNewline === -1) return;
-      ptcOffset += lastNewline + 1;
-      let consumerAlive = true;
-      for (const line of chunk.slice(0, lastNewline).split("\n")) {
-        if (!line.trim() || !consumerAlive) continue;
-        let record: PtcMirrorRecord;
-        try {
-          record = JSON.parse(line) as PtcMirrorRecord;
-        } catch {
-          log("ptc mirror record was skipped", { record: line.slice(0, 200) });
-          continue;
-        }
-        consumerAlive = emitPtcRecord(record);
-      }
+      ptcTail.drain((record) => emitPtcRecord(record as PtcMirrorRecord));
     };
     const ptcWatcher: FSWatcher = watch(ptcEventFile, () => drainPtcEvents());
     // A vanished sidecar (crash cleanup) must not crash the daemon.
@@ -1800,8 +2163,8 @@ export function createDshConnector(
     // Mirrored dsh events (retries, compaction, jobs, subagents, goals,
     // questions, commands) are re-emitted as one vendor notification kind;
     // dsh-events.ts maps them onto Paseo timeline items and notices.
-    let eventOffset = 0;
-    const emitEventRecord = (record: { kind?: unknown; sessionId?: unknown; data?: unknown }): boolean => {
+    const eventTail = new SidecarTail(eventFile);
+    const emitEventRecord = (record: SidecarTailRecord): boolean => {
       if (!fromAgentController) return false;
       if (typeof record.sessionId !== "string" || !liveSessions.has(record.sessionId)) return true;
       if (typeof record.kind !== "string") return true;
@@ -1814,6 +2177,14 @@ export function createDshConnector(
       if (record.kind === "question") {
         void handleQuestionEvent(sessionId, data);
         return true;
+      }
+      if (record.kind === "question-cancelled") {
+        const toolCallId = questionForms.get(typeof data.requestId === "string" ? data.requestId : "");
+        if (toolCallId) {
+          questionForms.delete(typeof data.requestId === "string" ? data.requestId : "");
+          cancelDshQuestion(toolCallId);
+        }
+        // Fall through: the transformer also renders a timeout notice.
       }
       if (record.kind === "plan-mode") syncPlanSetting(sessionId, data);
       try {
@@ -1828,29 +2199,8 @@ export function createDshConnector(
       return true;
     };
     const drainDshEvents = (): void => {
-      let text: string;
-      try {
-        text = readFileSync(eventFile, "utf8");
-      } catch {
-        return;
-      }
-      if (text.length < eventOffset) eventOffset = 0; // the file was replaced
-      const chunk = text.slice(eventOffset);
-      const lastNewline = chunk.lastIndexOf("\n");
-      if (lastNewline === -1) return;
-      eventOffset += lastNewline + 1;
-      let consumerAlive = true;
-      for (const line of chunk.slice(0, lastNewline).split("\n")) {
-        if (!line.trim() || !consumerAlive) continue;
-        let record: { kind?: unknown; sessionId?: unknown; data?: unknown };
-        try {
-          record = JSON.parse(line) as { kind?: unknown; sessionId?: unknown; data?: unknown };
-        } catch {
-          log("dsh event record was skipped", { record: line.slice(0, 200) });
-          continue;
-        }
-        consumerAlive = emitEventRecord(record);
-      }
+      eventTail.drain((record) => emitEventRecord(record));
+      drainReceipts();
     };
     const eventWatcher: FSWatcher = watch(eventFile, () => drainDshEvents());
     eventWatcher.on("error", () => {});
@@ -2028,6 +2378,7 @@ export function createDshConnector(
         };
       });
       const toolCallId = `paseo-question-${requestId}`;
+      questionForms.set(requestId, toolCallId);
       const answersPromise = new Promise<Record<string, string> | undefined>((resolve) => {
         registerDshQuestion(toolCallId, { requestId, scope: bridgeId, resolve });
       });
@@ -2065,6 +2416,7 @@ export function createDshConnector(
         cancelDshQuestion(toolCallId);
       }
       const answerMap = await answersPromise;
+      questionForms.delete(requestId);
       const answers = questions.map((question, index) => {
         const header = headers[index]!;
         const raw = answerMap?.[header] ?? "";
@@ -2141,6 +2493,249 @@ export function createDshConnector(
           id: promptId,
           result: { stopReason: "end_turn" },
         });
+      } catch {
+        // The prompt is already gone with the stream.
+      }
+    }
+
+    // ---- Native session revert ------------------------------------------
+    // Conversation rewind appends dsh's own replace marker through the
+    // bridge; file revert restores byte snapshots the bridge checkpointed.
+    // Both are reachable from Paseo's revert affordances (revert tokens on
+    // timeline rows) and the /rewind, /revert-files slash commands.
+
+    interface FileReceipt {
+      sessionId?: string;
+      path?: string;
+      absentBefore?: boolean;
+      beforeB64?: string;
+      afterDigest?: string;
+      seq?: number;
+      time?: number;
+    }
+
+    const receiptTail = new SidecarTail(receiptFile);
+    const receiptLogPath = (sessionId: string): string => join(persistentReceiptDir, `${sessionId}.jsonl`);
+
+    /** Mirror bridge checkpoints into the per-dsh-session receipt log. */
+    const drainReceipts = (): void => {
+      receiptTail.drain((record) => {
+        const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined;
+        const path = typeof record.path === "string" ? record.path : undefined;
+        if (!sessionId || !path) return true;
+        try {
+          mkdirSync(persistentReceiptDir, { recursive: true });
+          appendFileSync(receiptLogPath(sessionId), `${JSON.stringify(record)}\n`);
+        } catch (error) {
+          log("file receipt could not be persisted", { sessionId, error: String(error) });
+        }
+        return true;
+      });
+    };
+
+    function loadReceipts(sessionId: string): FileReceipt[] {
+      const receipts: FileReceipt[] = [];
+      try {
+        const text = readFileSync(receiptLogPath(sessionId), "utf8");
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const parsed = JSON.parse(line) as FileReceipt;
+            if (parsed && typeof parsed === "object") receipts.push(parsed);
+          } catch {
+            // A partially written trailing line is ignored.
+          }
+        }
+      } catch {
+        // No receipts yet for this session.
+      }
+      return receipts;
+    }
+
+    /**
+     * Undo checkpointed write/edit calls newest-first. A digest mismatch
+     * stops the chain: reverting below an externally edited file could
+     * clobber user work, so the remaining receipts are reported skipped.
+     */
+    function revertFilesFor(
+      sessionId: string,
+      afterSeq: number | undefined,
+      count: number | undefined,
+    ): { undone: string[]; skipped: string[] } {
+      const eligible = loadReceipts(sessionId).filter((receipt) =>
+        typeof receipt.path === "string" &&
+        receipt.path.startsWith("/") &&
+        (afterSeq === undefined || typeof receipt.seq !== "number" || receipt.seq > afterSeq));
+      const targets = count !== undefined ? eligible.slice(-Math.max(1, count)) : eligible;
+      const undone: string[] = [];
+      const skipped: string[] = [];
+      let chainBroken = false;
+      for (const receipt of [...targets].reverse()) {
+        const path = receipt.path as string;
+        if (chainBroken) {
+          skipped.push(`${path}（前置文件已变化，链条中断）`);
+          continue;
+        }
+        try {
+          const current = existsSync(path)
+            ? createHash("sha256").update(readFileSync(path)).digest("hex")
+            : undefined;
+          if (receipt.afterDigest !== undefined && current !== receipt.afterDigest) {
+            chainBroken = true;
+            skipped.push(`${path}（内容已变化，未回滚）`);
+            continue;
+          }
+          if (receipt.absentBefore === true) {
+            if (current === undefined) {
+              skipped.push(`${path}（已不存在）`);
+              continue;
+            }
+            const backup = `${path}.dsh-backup-${Date.now().toString(36)}`;
+            renameSync(path, backup);
+            undone.push(`${path}（移至 ${backup}）`);
+            continue;
+          }
+          if (typeof receipt.beforeB64 !== "string") {
+            skipped.push(`${path}（无快照）`);
+            continue;
+          }
+          const staged = `${path}.dsh-restore-${randomUUID()}`;
+          writeFileSync(staged, Buffer.from(receipt.beforeB64, "base64"), { mode: 0o600 });
+          let backup: string | undefined;
+          if (current !== undefined) {
+            backup = `${path}.dsh-backup-${Date.now().toString(36)}`;
+            renameSync(path, backup);
+          }
+          try {
+            renameSync(staged, path);
+          } catch (error) {
+            if (backup) renameSync(backup, path);
+            throw error;
+          }
+          undone.push(path);
+        } catch (error) {
+          skipped.push(`${path}（${error instanceof Error ? error.message : String(error)}）`);
+        }
+      }
+      return { undone, skipped };
+    }
+
+    /** Ask the in-dsh bridge to append one rewind marker; see performRewind. */
+    async function requestBridgeRewind(
+      sessionId: string,
+      messageId: string | undefined,
+      back: number | undefined,
+    ): Promise<{ cut: number; summary: string }> {
+      const requestId = `rewind-${randomUUID()}`;
+      const requestFile = join(bridgeRequestDir, `${requestId}.json`);
+      const responseFile = join(bridgeResponseDir, `${requestId}.json`);
+      try {
+        writeFileSync(
+          requestFile,
+          JSON.stringify({ kind: "rewind", requestId, sessionId, messageId, back }),
+          { mode: 0o600 },
+        );
+      } catch (error) {
+        throw new Error(`回退请求无法排队：${error instanceof Error ? error.message : String(error)}`);
+      }
+      const deadline = Date.now() + 60_000;
+      let response: Record<string, unknown> | undefined;
+      while (!bridgeDisposed && Date.now() < deadline) {
+        try {
+          response = JSON.parse(readFileSync(responseFile, "utf8")) as Record<string, unknown>;
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      rmSync(responseFile, { force: true });
+      if (!response) throw new Error("回退请求超时，会话未改动");
+      if (response.ok !== true) {
+        const message = typeof response.error === "string" ? response.error : "回退失败，会话未改动";
+        log("rewind rejected", { sessionId, error: message });
+        throw new Error(message);
+      }
+      const result = response.result as { cut?: unknown; summary?: unknown } | undefined;
+      const summary = typeof result?.summary === "string" ? result.summary : "更早的消息";
+      log("rewind committed", { sessionId, cut: result?.cut, summary });
+      return {
+        cut: typeof result?.cut === "number" ? result.cut : -1,
+        summary,
+      };
+    }
+
+    /**
+     * Paseo cannot retract already-rendered rows, so after a successful
+     * conversation rewind the connector closes this connection; reopening
+     * replays the rewound log through history-replay's surface filtering.
+     */
+    function closeAfterRewind(sessionId: string, summary: string): void {
+      emitDshEvent(sessionId, "rewind-applied", { summary });
+      const timer = setTimeout(() => {
+        void toAgent.close();
+      }, 1_500);
+      timer.unref();
+    }
+
+    async function runNativeRevert(
+      sessionId: string,
+      token: { messageId?: string; seq?: number } | undefined,
+      scope: "conversation" | "files" | "both",
+    ): Promise<{ description: string }> {
+      const parts: string[] = [];
+      if (scope !== "files") {
+        const rewind = await requestBridgeRewind(sessionId, token?.messageId, token ? undefined : 1);
+        parts.push(`对话已回退到「${rewind.summary}」`);
+      }
+      if (scope !== "conversation") {
+        const files = revertFilesFor(sessionId, token?.seq, undefined);
+        if (files.undone.length) parts.push(`已还原 ${files.undone.length} 个文件`);
+        if (files.skipped.length) parts.push(`跳过 ${files.skipped.length} 个：${files.skipped.join("；")}`);
+        if (!files.undone.length && !files.skipped.length) parts.push("没有可回滚的文件改动");
+      }
+      if (scope !== "files") closeAfterRewind(sessionId, parts[0] ?? "");
+      return { description: parts.join("；") };
+    }
+
+    /** /rewind [n] — rewind the conversation to the n-th previous user message. */
+    async function runRewindSlash(sessionId: string, argumentText: string, promptId: string | number): Promise<void> {
+      const back = Number.parseInt(argumentText.trim(), 10);
+      try {
+        const rewind = await requestBridgeRewind(sessionId, undefined, Number.isFinite(back) && back >= 1 ? back : 1);
+        closeAfterRewind(sessionId, rewind.summary);
+      } catch (error) {
+        emitDshEvent(sessionId, "command-result", {
+          requestId: `rewind-${Date.now()}`,
+          line: "/rewind",
+          kind: "error",
+          text: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (!fromAgentController) return;
+      try {
+        fromAgentController.enqueue({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+      } catch {
+        // The prompt is already gone with the stream.
+      }
+    }
+
+    /** /revert-files [n] — undo the last n checkpointed write/edit calls. */
+    function runRevertFilesSlash(sessionId: string, argumentText: string, promptId: string | number): void {
+      const count = Number.parseInt(argumentText.trim(), 10);
+      const files = revertFilesFor(sessionId, undefined, Number.isFinite(count) && count >= 1 ? count : 1);
+      const text = [
+        files.undone.length ? `已还原：${files.undone.join("；")}` : "",
+        files.skipped.length ? `跳过：${files.skipped.join("；")}` : "",
+      ].filter(Boolean).join("\n") || "没有可回滚的文件改动";
+      emitDshEvent(sessionId, "command-result", {
+        requestId: `revert-files-${Date.now()}`,
+        line: "/revert-files",
+        kind: files.undone.length ? "success" : "error",
+        text,
+      });
+      if (!fromAgentController) return;
+      try {
+        fromAgentController.enqueue({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
       } catch {
         // The prompt is already gone with the stream.
       }

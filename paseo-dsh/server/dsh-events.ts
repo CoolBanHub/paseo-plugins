@@ -1,5 +1,6 @@
 import type { AcpTransformer, AcpVendorUpdate } from "@getpaseo/plugin/server/acp";
 import type { ProviderNotice, ProviderTimelineItem, ProviderToolCallDetail } from "@getpaseo/plugin/server/provider";
+import { dshFailurePresentation } from "./dsh-error-present.ts";
 
 /**
  * dsh events that the ACP bridge does not project onto its standard
@@ -52,7 +53,9 @@ function toolItem(
 
 function retryUpdate(data: Record<string, unknown>): AcpVendorUpdate[] {
   const failure = object(data.failure);
-  const message = text(failure?.message) ?? text(data.message) ?? "上游请求失败";
+  const mapped = dshFailurePresentation(failure);
+  const providerMessage = text(failure?.message) ?? text(data.message) ?? "";
+  const message = mapped !== providerMessage && providerMessage ? `${mapped}：${providerMessage}` : mapped;
   const retry = typeof data.retry === "number" ? data.retry : undefined;
   const max = typeof data.maxRetries === "number" ? data.maxRetries : undefined;
   const delay = typeof data.delayMs === "number" ? data.delayMs : undefined;
@@ -64,6 +67,124 @@ function retryUpdate(data: Record<string, unknown>): AcpVendorUpdate[] {
     "模型请求重试",
     `${attempt}${wait}${attempt || wait ? "：" : ""}${message}`,
   )];
+}
+
+/**
+ * dsh's ACP bridge maps every failed turn to `end_turn`, so Paseo currently
+ * learns nothing when a turn dies on quota, credentials or the context
+ * window. The mirrored `turn/end` reason carries the structured failure;
+ * render its stable code as a Chinese row instead.
+ */
+function turnEndUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
+  const reason = object(data.reason);
+  const turn = typeof data.turn === "number" ? data.turn : undefined;
+  if (!reason) return [];
+  if (text(reason.kind) === "error") {
+    const presentation = dshFailurePresentation(object(reason.error));
+    return [{
+      type: "timeline",
+      item: {
+        type: "error",
+        id: `dsh:turn-error:${sessionId}:${turn ?? "?"}`,
+        message: presentation,
+      },
+    }];
+  }
+  if (text(reason.kind) === "max-tokens") {
+    return [notice(`dsh:turn-max-tokens:${sessionId}:${turn ?? "?"}`, "warning", "达到输出上限", "本轮已按 max tokens 截断，可继续提问让它接着写")];
+  }
+  if (text(reason.kind) === "blocked") {
+    return [notice(`dsh:turn-blocked:${sessionId}:${turn ?? "?"}`, "warning", "本轮被阻塞", "回合未产生输出，请检查权限设置或重试")];
+  }
+  return [];
+}
+
+function formatCount(value: number): string {
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}k` : String(value);
+}
+
+/** Per-step token accounting from `assistant/message` usage snapshots. */
+function usageUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
+  const usage = object(data.usage);
+  if (!usage) return [];
+  const input = typeof usage.inputTokens === "number" ? usage.inputTokens : undefined;
+  const output = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
+  const cacheRead = typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined;
+  const cacheWrite = typeof usage.cacheWriteTokens === "number" ? usage.cacheWriteTokens : undefined;
+  const parts: string[] = [];
+  if (input !== undefined) parts.push(`输入 ${formatCount(input)}`);
+  if (cacheRead !== undefined) parts.push(`缓存读 ${formatCount(cacheRead)}`);
+  if (cacheWrite !== undefined) parts.push(`缓存写 ${formatCount(cacheWrite)}`);
+  if (output !== undefined) parts.push(`输出 ${formatCount(output)}`);
+  if (!parts.length) return [];
+  const turn = typeof data.turn === "number" ? data.turn : undefined;
+  const step = typeof data.step === "number" ? data.step : undefined;
+  return [notice(
+    `dsh:usage:${sessionId}:${turn ?? "?"}:${step ?? "?"}`,
+    "info",
+    "Token 用量",
+    parts.join(" · "),
+  )];
+}
+
+/**
+ * Live assistant streaming preview. The connector accumulates mirrored
+ * `agent/assistant-stream` chunks and only emits rows for attempts that run
+ * longer than a moment, so quick replies do not grow extra rows; the settled
+ * row is a compact marker because the real assistant message follows it.
+ */
+function streamRowUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
+  const attemptId = text(data.attemptId);
+  if (!attemptId) return [];
+  const id = `dsh:stream:${sessionId}:${attemptId}`;
+  const phase = text(data.phase) === "completed" ? "completed" : "running";
+  const chars = typeof data.chars === "number" ? data.chars : undefined;
+  const preview = (text(data.text) ?? "").slice(-600);
+  return [{
+    type: "timeline",
+    item: toolItem(
+      id,
+      id,
+      "stream",
+      phase,
+      {
+        type: "plain_text",
+        label: phase === "completed" ? `已生成${chars !== undefined ? ` ${formatCount(chars)} 字` : ""}` : "正在生成…",
+        text: preview,
+        icon: "brain",
+      },
+    ),
+  }];
+}
+
+/**
+ * One revertible user message. The row carries the revert token Paseo's
+ * native revert affordance needs; conversation rewind appends a native
+ * replace marker through the bridge and file revert restores checkpoints
+ * recorded after this event.
+ */
+function revertPointUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
+  const messageId = text(data.messageId);
+  if (!messageId) return [];
+  const seq = typeof data.seq === "number" ? data.seq : undefined;
+  const id = `dsh:revert:${sessionId}:${messageId}`;
+  const label = (text(data.text) ?? "").slice(0, 80);
+  const item: ProviderTimelineItem = {
+    type: "tool_call",
+    id,
+    callId: id,
+    name: "rewind-point",
+    status: "completed",
+    error: null,
+    detail: {
+      type: "plain_text",
+      label: "可回退",
+      ...(label ? { text: label } : {}),
+      icon: "pencil",
+    },
+    revertToken: { v: 1, kind: "dsh-rewind", messageId, ...(seq !== undefined ? { seq } : {}) },
+  };
+  return [{ type: "timeline", item }];
 }
 
 function compactionUpdate(kind: string, data: Record<string, unknown>): AcpVendorUpdate[] {
@@ -246,6 +367,27 @@ export function dshEventUpdates(
   switch (kind) {
     case "llm-retry":
       return retryUpdate(data);
+    case "turn-end":
+      return turnEndUpdate(sessionId, data);
+    case "usage":
+      return usageUpdate(sessionId, data);
+    case "stream-row":
+      return streamRowUpdate(sessionId, data);
+    case "revert-point":
+      return revertPointUpdate(sessionId, data);
+    case "question-cancelled": {
+      const requestId = text(data.requestId) ?? "?";
+      return [notice(`dsh:question-cancelled:${sessionId}:${requestId}`, "info", "提问已取消", "dsh 等待回答超时，该问题已跳过")];
+    }
+    case "rewind-applied": {
+      const summary = text(data.summary);
+      return [notice(
+        `dsh:rewind:${sessionId}:${Date.now()}`,
+        "info",
+        "会话已回退",
+        `${summary ? `回退到「${summary}」。` : ""}正在结束本次连接，重新打开会话即可看到回退后的时间线`,
+      )];
+    }
     case "compaction-start":
     case "compaction-summary":
     case "compaction-end":
