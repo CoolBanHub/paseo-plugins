@@ -1799,6 +1799,12 @@ export function createZcodeProvider(): ProviderRegistration {
             const turnState = resultType === "success"
               ? "completed"
               : resultType === "cancelled" ? "canceled" : "failed";
+            // The app-server does not project a finish frame for every
+            // request, so the completed turn is the final segment boundary.
+            // Emit the usage row before the turn settles so it belongs to the
+            // turn's timeline rather than trailing after its terminal event.
+            closeDecodeWindow(turn, event.timestamp);
+            emitTurnUsage(emit, state, turn, usage);
             emit({
               type: "session.turn",
               sessionId: state.paseoSessionId,
@@ -1821,10 +1827,6 @@ export function createZcodeProvider(): ProviderRegistration {
                 contextWindowUsedTokens: state.contextUsed,
               },
             });
-            // The app-server does not project a finish frame for every
-            // request, so the completed turn is the final segment boundary.
-            closeDecodeWindow(turn, event.timestamp);
-            emitTurnUsage(emit, state, turn, usage);
             state.turns.delete(event.turnId);
             if (state.goalActive) scheduleGoalRefresh(state);
             scheduleSubagentSync(state, subagentSyncTiming.settledMs);

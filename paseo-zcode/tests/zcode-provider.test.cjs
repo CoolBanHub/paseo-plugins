@@ -1512,6 +1512,10 @@ test("delta-only streams close the decode window at turn completion and tool cal
     payload: { response: "SPEED_OK", resultType: "success", usage: { outputTokens: 5 } },
   });
   assert.match(f.notifications().at(-1).item.message, /输出 5 · 速度 5 tok\/s/);
+  const noticeIndex = f.events.findIndex((event) => event.type === "timeline.item" && event.item.id.includes(":usage:turn-deltas"));
+  const settledIndex = f.events.findIndex((event) => event.type === "session.turn" && event.turnId === "turn-deltas" && event.state === "completed");
+  assert.ok(noticeIndex >= 0 && settledIndex >= 0 && noticeIndex < settledIndex,
+    "the usage row lands before the turn terminal event");
 
   // A tool call closes the current model segment; the next delta reopens it.
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_000, payload: { kind: "text_delta", delta: "a" } });
