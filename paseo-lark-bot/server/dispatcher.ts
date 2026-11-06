@@ -7,9 +7,10 @@ import {
   resolveFfmpeg,
   toImageAttachment,
 } from "./media.ts";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { SessionImage } from "./sessions.ts";
 import {
   appendFooter,
@@ -26,6 +27,12 @@ export type TurnEndedEvent = PluginLifecycleEvents["agent.turn_ended"];
 export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"];
 
 export interface DispatcherOptions {
+  /**
+   * Path of the persisted message-id dedup log. When set, the newest 1,000
+   * seen ids survive a daemon restart, so at-least-once event redelivery
+   * right after a restart does not answer the same message twice.
+   */
+  dedupStorePath?: string;
   paseo: SessionPaseoApi;
   readValues: () => Promise<BotValues>;
   /** Normalizes bare provider ids to provider/model for agents.create(). */
@@ -101,6 +108,39 @@ export function createDispatcher(options: DispatcherOptions) {
   // Event delivery is at-least-once; message_id is the documented dedup key.
   const seenMessageIds = new Set<string>();
   const seenMessageOrder: string[] = [];
+  // Optional persistence of the dedup window across daemon restarts.
+  const dedupStorePath = options.dedupStorePath;
+  let dedupFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  if (dedupStorePath) {
+    try {
+      const parsed = JSON.parse(readFileSync(dedupStorePath, "utf8")) as { ids?: unknown };
+      if (Array.isArray(parsed.ids)) {
+        for (const id of parsed.ids.slice(-1_000)) {
+          if (typeof id === "string" && id) {
+            seenMessageIds.add(id);
+            seenMessageOrder.push(id);
+          }
+        }
+      }
+    } catch {
+      // Absent or unreadable store; start empty.
+    }
+  }
+  const scheduleDedupFlush = (): void => {
+    if (!dedupStorePath || dedupFlushTimer) return;
+    dedupFlushTimer = setTimeout(() => {
+      dedupFlushTimer = null;
+      try {
+        mkdirSync(dirname(dedupStorePath), { recursive: true });
+        const temporary = `${dedupStorePath}.tmp`;
+        writeFileSync(temporary, JSON.stringify({ ids: seenMessageOrder.slice(-1_000) }), { mode: 0o600 });
+        renameSync(temporary, dedupStorePath);
+      } catch (error) {
+        log("去重记录写入失败", error instanceof Error ? error.message : String(error));
+      }
+    }, 5_000);
+    dedupFlushTimer.unref?.();
+  };
   // Serialize preprocessing per topic so a slow root lookup cannot let a later
   // message overtake an earlier one.
   const topicChains = new Map<string, Promise<void>>();
@@ -171,6 +211,7 @@ export function createDispatcher(options: DispatcherOptions) {
       const oldest = seenMessageOrder.shift();
       if (oldest) seenMessageIds.delete(oldest);
     }
+    scheduleDedupFlush();
     return true;
   }
 
@@ -651,10 +692,32 @@ export function createDispatcher(options: DispatcherOptions) {
   ): Promise<void> {
     const { text: clipped, clipped: wasClipped } = clipReply(text, values.maxReplyChars);
     const finalText = appendFooter(clipped, wasClipped);
-    try {
-      await reply({ cliPath, messageId, text: finalText, format, replyInThread: values.replyInThread });
-    } catch (error) {
-      log("回复消息失败", error instanceof Error ? error.message : String(error));
+    // A dropped reply means the user saw an ack but never got the answer.
+    // Retryable failures (rate limit, transient transport) retry with backoff
+    // under one idempotency key, so a retry can never duplicate a message.
+    const key = `lb-${createHash("sha256").update(`${messageId}:${finalText}`).digest("hex").slice(0, 40)}`;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await reply({
+          cliPath,
+          messageId,
+          text: finalText,
+          format,
+          replyInThread: values.replyInThread,
+          idempotencyKey: key,
+        });
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const retryable = attempt < 3 && /429|rate\s*limit|too many requests|频率|限流|timeout|timed out|ETIMEDOUT|ECONNRESET|network|temporarily/i.test(message);
+        if (!retryable) {
+          log("回复消息失败", message);
+          return;
+        }
+        const backoffMs = /429|rate\s*limit|too many requests|频率|限流/i.test(message) ? 5_000 : 1_000 * attempt;
+        log(`回复消息失败，${Math.round(backoffMs / 1000)}s 后重试（第 ${attempt} 次）`, message.slice(0, 200));
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
     }
   }
 

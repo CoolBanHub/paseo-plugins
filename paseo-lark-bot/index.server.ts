@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   larkBotChatMembersRpc,
@@ -86,6 +88,12 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
   paseo = api;
   if (!dispatcher) {
     dispatcher = createDispatcher({
+      dedupStorePath: join(
+        process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
+        "plugin-data",
+        "lark-bot",
+        "seen-message-ids.json",
+      ),
       paseo: api,
       readValues,
       resolveProvider: resolveProviderModel,

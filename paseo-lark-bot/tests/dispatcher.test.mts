@@ -4,6 +4,9 @@ import { createDispatcher } from "../server/dispatcher.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
 import type { SessionAgentHandle, SessionPaseoApi } from "../server/sessions.ts";
 import type { BotValues } from "../shared/settings.ts";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const BOT = "ou_bot";
 
@@ -603,5 +606,88 @@ describe("p2p and delivery hygiene", () => {
     });
     await flush();
     assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_a");
+  });
+});
+
+describe("delivery reliability", () => {
+  it("retries a rate-limited reply under one idempotency key", async () => {
+    const values = baseValues();
+    const attempts: Array<string | undefined> = [];
+    let failures = 1;
+    let current: SessionAgentHandle | undefined;
+    const paseoStub = {
+      connect: async () => current!,
+      create: async () => {
+        current = { id: "agent-1", send: async () => {}, run: async () => ({ status: "idle", error: null, lastMessage: "ok" }) };
+        return current;
+      },
+      ref: (id: string) => {
+        if (!current || current.id !== id) throw new Error("unexpected ref");
+        return current;
+      },
+    } as unknown as SessionPaseoApi;
+    const dispatch = createDispatcher({
+      paseo: paseoStub,
+      readValues: async () => values,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async (options) => {
+        attempts.push(options.idempotencyKey);
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("发送消息失败：lark API 429 too many requests");
+        }
+        return null;
+      },
+      log: () => {},
+    });
+    await dispatch.handleMessageEvent(groupEvent());
+    // The rate-limit class backs off 5s before its retry.
+    await new Promise((resolve) => setTimeout(resolve, 6_000));
+    assert.ok(attempts.length >= 2, `expected a retry, saw ${attempts.length}`);
+    assert.ok(attempts.every((key) => key && key === attempts[0]), "retries reuse the idempotency key");
+  });
+
+  it("keeps the message-id dedup window across a dispatcher restart", async () => {
+    const store = join(tmpdir(), `lark-bot-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const values = baseValues();
+    const paseoStub = () => {
+      let current: SessionAgentHandle | undefined;
+      return {
+        connect: async () => current!,
+        create: async () => {
+          current = { id: "agent-1", send: async () => {}, run: async () => ({ status: "idle", error: null, lastMessage: "ok" }) };
+          return current;
+        },
+        ref: (id: string) => {
+          if (!current || current.id !== id) throw new Error("unexpected ref");
+          return current;
+        },
+      } as unknown as SessionPaseoApi;
+    };
+    const first = createDispatcher({
+      dedupStorePath: store,
+      paseo: paseoStub(),
+      readValues: async () => values,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async () => null,
+      log: () => {},
+    });
+    await first.handleMessageEvent(groupEvent({ message_id: "om_dedup_1" }));
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    // The store now holds the id; a fresh dispatcher must treat redelivery
+    // of the same message as already-seen instead of starting a new turn.
+    const second = createDispatcher({
+      dedupStorePath: store,
+      paseo: paseoStub(),
+      readValues: async () => values,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async () => null,
+      log: () => {},
+    });
+    await second.handleMessageEvent(groupEvent({ message_id: "om_dedup_1" }));
+    rmSync(store, { force: true });
   });
 });

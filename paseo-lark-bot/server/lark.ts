@@ -342,6 +342,8 @@ export async function listChatMembers(cliPath: string, chatId: string): Promise<
 }
 
 export interface ReplyOptions {
+  /** Stable per logical reply; lets a retry never duplicate a send. */
+  idempotencyKey?: string;
   cliPath: string;
   /** The @-mention message the reply attaches to (om_…). */
   messageId: string;
@@ -357,6 +359,7 @@ export interface ReplyOptions {
 export async function replyMessage(options: ReplyOptions): Promise<string | null> {
   const args = ["im", "+messages-reply", "--message-id", options.messageId, "--as", "bot"];
   if (options.replyInThread) args.push("--reply-in-thread");
+  if (options.idempotencyKey) args.push("--idempotency-key", options.idempotencyKey.slice(0, 50));
   let stdin: string;
   if (options.format === "markdown") {
     // "-" reads the body from stdin, keeping the reply out of `ps` output.
