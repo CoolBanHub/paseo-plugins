@@ -1148,6 +1148,15 @@ export function createZcodeProvider(): ProviderRegistration {
         }
       };
 
+      /**
+       * Resolve the state for one ZCode session and keep it bound to the Paseo
+       * session using it now. A ZCode session can outlive the Paseo provider
+       * session that opened it (a failed open, a fast close/reopen, or an agent
+       * reload). Child subsessions carry `state.paseoSessionId` as their parent,
+       * and Paseo kills the whole provider connection when a child references a
+       * parent session it no longer has negotiated. Rebinding at every open is
+       * what keeps that id current.
+       */
       const stateFor = (paseoSessionId: string, zcodeSessionId: string): SessionState => {
         let state = sessions.get(zcodeSessionId);
         if (!state) {
@@ -1160,8 +1169,32 @@ export function createZcodeProvider(): ProviderRegistration {
           };
           sessions.set(zcodeSessionId, state);
           zcodeIdFor.set(paseoSessionId, zcodeSessionId);
+          return state;
+        }
+        if (state.paseoSessionId !== paseoSessionId) {
+          const previous = state.paseoSessionId;
+          // Children and pending adoptions belong to the superseded Paseo
+          // session. Detach them before the new owner starts so they can never
+          // announce a parent session Paseo has already closed.
+          log("session rebound to a new Paseo session", { zcodeSessionId, previous, paseoSessionId });
+          closeSubagents(state);
+          state.paseoSessionId = paseoSessionId;
+          state.closed = false;
+          state.ready = false;
+          state.revision = undefined;
+          state.modeEventSeq = undefined;
+          state.planEnabled = undefined;
+          if (zcodeIdFor.get(previous) === zcodeSessionId) zcodeIdFor.delete(previous);
+          zcodeIdFor.set(paseoSessionId, zcodeSessionId);
         }
         return state;
+      };
+
+      const stateByPaseoId = (paseoSessionId: string): SessionState | undefined => {
+        for (const state of sessions.values()) {
+          if (state.paseoSessionId === paseoSessionId) return state;
+        }
+        return undefined;
       };
 
       const applyOfficialState = (state: SessionState, snapshot: Partial<CreateOrResumeResult>): void => {
@@ -2132,7 +2165,7 @@ export function createZcodeProvider(): ProviderRegistration {
        * request a reconciliation pass before the parent is announced.
        */
       const canAttachSubagents = (parent: SessionState): boolean =>
-        !parent.child && parent.ready && !parent.closed;
+        !parent.child && parent.ready && !parent.closed && subsessionsNegotiated();
 
       /**
        * Register a ZCode subagent child session as a Paseo subsession nested
@@ -2405,11 +2438,52 @@ export function createZcodeProvider(): ProviderRegistration {
             ? (input.persistence.data as { zcodeSessionId?: string })?.zcodeSessionId : undefined;
           const sessionId = "sessionId" in input ? input.sessionId
             : archivedId ? sessions.get(archivedId)?.paseoSessionId ?? archivedId : undefined;
-          const pending = sessionId ? sessionInputs.get(sessionId) : undefined;
-          const handled = (pending ?? Promise.resolve()).then(() => handleInput(input)).catch((error) => {
+          // Serialize inputs for one ZCode session even when Paseo uses
+          // different provider session ids for them: a close for the old
+          // session and the open that replaces it must never run concurrently,
+          // or they race on the same SessionState and leak events under the
+          // already-closed parent id. The Paseo id stays in the key set so
+          // prompts still queue behind the open that created them.
+          const zcodeForInput = (candidate: ProviderInput): string | undefined => {
+            if (candidate.type === "session.archive" || candidate.type === "session.unarchive") {
+              return (candidate.persistence.data as { zcodeSessionId?: string })?.zcodeSessionId;
+            }
+            if (candidate.type === "session.open") {
+              const persisted = (candidate.persistence?.data as { zcodeSessionId?: string } | undefined)?.zcodeSessionId;
+              return typeof persisted === "string" ? persisted : undefined;
+            }
+            return "sessionId" in candidate ? zcodeIdFor.get(candidate.sessionId) : undefined;
+          };
+          const serialKeys: string[] = [];
+          if (sessionId) serialKeys.push(sessionId);
+          const zcodeKey = zcodeForInput(input);
+          if (zcodeKey && !serialKeys.includes(zcodeKey)) serialKeys.push(zcodeKey);
+          const pending = serialKeys
+            .map((key) => sessionInputs.get(key))
+            .filter((entry): entry is Promise<void> => entry !== undefined);
+          const handled = (pending.length ? Promise.all(pending).then(() => undefined) : Promise.resolve())
+            .then(() => handleInput(input)).catch((error) => {
             const message = error instanceof Error
               ? (zcodeFailurePresentation(error as Error & { code?: number }) || error.message)
               : String(error);
+            if (input.type === "session.open") {
+              // A failed open must not leave its Paseo session id behind: the
+              // next open gets a new id, and a stale binding would make child
+              // subsessions reference a parent Paseo never registered.
+              const persisted = input.persistence?.data as { zcodeSessionId?: string } | undefined;
+              const state = (persisted?.zcodeSessionId ? sessions.get(persisted.zcodeSessionId) : undefined)
+                ?? stateByPaseoId(input.sessionId);
+              if (state && state.paseoSessionId === input.sessionId) {
+                log("discarding state from a failed open", { zcodeSessionId: state.zcodeSessionId, paseoSessionId: input.sessionId });
+                state.ready = false;
+                state.closed = true;
+                closeSubagents(state);
+                sessions.delete(state.zcodeSessionId);
+                if (zcodeIdFor.get(input.sessionId) === state.zcodeSessionId) {
+                  zcodeIdFor.delete(input.sessionId);
+                }
+              }
+            }
             if (input.type === "session.prompt") {
               const state = sessions.get(zcodeIdFor.get(input.sessionId) ?? input.sessionId);
               if (state) state.pendingClientMessageId = undefined;
@@ -2425,10 +2499,10 @@ export function createZcodeProvider(): ProviderRegistration {
               else log("input failed", message);
             }
           });
-          if (sessionId) sessionInputs.set(sessionId, handled);
+          for (const key of serialKeys) sessionInputs.set(key, handled);
           await handled;
-          if (sessionId && sessionInputs.get(sessionId) === handled) {
-            sessionInputs.delete(sessionId);
+          for (const key of serialKeys) {
+            if (sessionInputs.get(key) === handled) sessionInputs.delete(key);
           }
         },
         onEvent: (next) => {
@@ -2485,6 +2559,17 @@ export function createZcodeProvider(): ProviderRegistration {
             await ensureAccountProviders();
             const persisted = input.persistence?.data as { zcodeSessionId?: string } | undefined;
             const existingId = persisted?.zcodeSessionId;
+            // Close the subagent gate before the first await. Events replayed by
+            // the app-server during resume must not attach children against a
+            // state whose new parent session Paseo has not announced yet.
+            if (existingId && existingId.startsWith("sess_")) {
+              const pendingState = stateFor(input.sessionId, existingId);
+              pendingState.ready = false;
+              pendingState.closed = false;
+              pendingState.revision = undefined;
+              pendingState.modeEventSeq = undefined;
+              pendingState.planEnabled = undefined;
+            }
             let result: CreateOrResumeResult;
             let resuming = false;
             if (existingId && existingId.startsWith("sess_")) {
@@ -2705,15 +2790,30 @@ export function createZcodeProvider(): ProviderRegistration {
             return;
           }
           case "session.close": {
-            const zcodeSessionId = zcodeIdFor.get(input.sessionId) ?? input.sessionId;
-            const state = sessions.get(zcodeSessionId);
+            const mapped = zcodeIdFor.get(input.sessionId);
+            const state = (mapped ? sessions.get(mapped) : undefined) ?? stateByPaseoId(input.sessionId);
+            if (state && state.paseoSessionId !== input.sessionId) {
+              // A newer Paseo session already owns this ZCode session. This
+              // close is for a superseded provider session, so shutting down
+              // the app-server session would break the live one.
+              zcodeIdFor.delete(input.sessionId);
+              emit({ type: "session.closed", sessionId: input.sessionId });
+              emit({ type: "request.completed", requestId: input.requestId });
+              return;
+            }
+            const zcodeSessionId = state?.zcodeSessionId ?? mapped ?? input.sessionId;
             if (state) {
               state.closed = true;
+              state.ready = false;
               closeSubagents(state);
             }
             await client.request("session/close", { sessionId: zcodeSessionId }).catch(() => undefined);
-            sessions.delete(zcodeSessionId);
-            zcodeIdFor.delete(input.sessionId);
+            // An open for a new Paseo session may have rebound the state while
+            // the app-server was closing; never delete the new owner's state.
+            if (!state || state.paseoSessionId === input.sessionId) {
+              sessions.delete(zcodeSessionId);
+              zcodeIdFor.delete(input.sessionId);
+            }
             emit({ type: "session.closed", sessionId: input.sessionId });
             emit({ type: "request.completed", requestId: input.requestId });
             return;

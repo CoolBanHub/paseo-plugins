@@ -67,6 +67,7 @@ async function fixture(t, options = {}) {
   let rejectModel;
   let beforeSet;
   let beforeSubagents;
+  let beforeClose;
   let rejectSend = false;
   const snapshot = (sessionId) => {
     const state = states.get(sessionId);
@@ -170,6 +171,10 @@ async function fixture(t, options = {}) {
       return { result: snapshot(params.sessionId) };
     }
     if (method === "session/subscribe") states.get(params.sessionId).subscribed = true;
+    if (method === "session/close") {
+      if (beforeClose) await beforeClose();
+      return { result: {} };
+    }
     if (method === "session/send" && rejectSend) return { error: { code: -1, message: "send rejected" } };
     if (method === "session/compact") {
       const state = states.get(params.sessionId);
@@ -253,11 +258,12 @@ async function fixture(t, options = {}) {
   t.after(() => connection.close());
   const events = [];
   connection.onEvent((event) => events.push(structuredClone(event)));
-  const open = (config = {}, persistence, history = "skip") => connection.send({
-    type: "session.open", requestId: "open", sessionId: "paseo-session", persistence,
+  const open = (config = {}, persistence, history = "skip", sessionId = "paseo-session") => connection.send({
+    type: "session.open", requestId: "open", sessionId, persistence,
     history,
     config: { cwd: "/mock/workspace", env: {}, mcpServers: {}, settings: {}, persist: true, ...config },
   });
+  const close = (sessionId = "paseo-session") => connection.send({ type: "session.close", requestId: "close", sessionId });
   const configure = (changes) => connection.send({ type: "session.configure", requestId: "configure", sessionId: "paseo-session", changes });
   const prompt = (delivery = "auto", content = [{ type: "text", text: "hello" }]) => connection.send({
     type: "session.prompt", sessionId: "paseo-session",
@@ -268,7 +274,7 @@ async function fixture(t, options = {}) {
     prompt: { clientMessageId, delivery: "auto", input: { type: "command", name, arguments: args } },
   });
   return {
-    events, open, configure, prompt, command, connection, archiveCalls,
+    events, open, close, configure, prompt, command, connection, archiveCalls,
     session: (sessionId, patch) => {
       let state = states.get(sessionId);
       if (!state) { state = {}; states.set(sessionId, state); }
@@ -307,6 +313,7 @@ async function fixture(t, options = {}) {
     rejectModel: (id) => { rejectModel = id; },
     beforeSet: (fn) => { beforeSet = fn; },
     beforeSubagents: (fn) => { beforeSubagents = fn; },
+    beforeClose: (fn) => { beforeClose = fn; },
     rejectSend: () => { rejectSend = true; },
     commandList: () => events.filter((event) => event.type === "session.commands").at(-1)?.commands,
     goalItems: () => events.filter((event) => event.type === "timeline.item" && event.item.type === "tool_call" && event.item.id.endsWith(":goal")),
@@ -1175,6 +1182,96 @@ test("in-flight subagent adoption stops when the parent session closes", async (
   releaseListing(); await flush();
   t.mock.timers.tick(subagentSyncTiming.spawnFollowUpMs); await flush();
   assert.ok(!f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_late"));
+});
+
+test("a failed open does not leave the next open bound to the failed Paseo session", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  const parentSessionId = "sess_retry_parent";
+  f.setSubagents(parentSessionId, {
+    revision: 1,
+    childSessionIds: ["sess_retry_child"],
+    running: [{
+      childSessionId: "sess_retry_child", toolCallId: "agent-call-retry",
+      subagentType: "Explore", title: "重试后挂载", status: "running",
+    }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_retry_child", { sessionStatus: "running", messages: [] });
+  f.rejectModel("GLM-5.3");
+
+  await f.open({ model: BINGLM }, { version: 1, data: { zcodeSessionId: parentSessionId } }, "replay");
+  assert.ok(f.events.some((event) => event.type === "request.failed" && event.requestId === "open"));
+  assert.ok(!f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_retry_child"));
+  await f.open({ model: FLASH }, { version: 1, data: { zcodeSessionId: parentSessionId } }, "replay", "paseo-retry");
+  t.mock.timers.tick(0); await flush();
+
+  const opened = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_retry_child");
+  assert.ok(opened, "the subagent must attach after the successful retry");
+  assert.equal(opened.parentSessionId, "paseo-retry", "subsessions must use the retried Paseo session id");
+  assert.ok(
+    !f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_retry_child"
+      && event.parentSessionId === "paseo-session"),
+    "the failed open's Paseo session id must never appear as a parent",
+  );
+});
+
+test("reopening while the previous Paseo session is closing binds new subsessions to the new parent", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  const parentSessionId = "sess_switch_parent";
+  const persistence = { version: 1, data: { zcodeSessionId: parentSessionId } };
+  f.setSubagents(parentSessionId, {
+    revision: 1,
+    childSessionIds: ["sess_switch_child_1"],
+    running: [{
+      childSessionId: "sess_switch_child_1", toolCallId: "agent-call-switch-1",
+      subagentType: "Explore", status: "running",
+    }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_switch_child_1", { sessionStatus: "running", messages: [] });
+
+  await f.open({}, persistence, "replay");
+  t.mock.timers.tick(0); await flush();
+  const firstOpen = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_switch_child_1");
+  assert.equal(firstOpen.parentSessionId, "paseo-session");
+
+  let releaseClose;
+  f.beforeClose(() => new Promise((resolve) => { releaseClose = resolve; }));
+  const closing = f.close("paseo-session");
+  await flush();
+  assert.ok(releaseClose, "the close must be in flight");
+
+  // A second child appears while the old parent is still closing; it can only
+  // be adopted by the reopened parent.
+  f.setSubagents(parentSessionId, {
+    revision: 2,
+    childSessionIds: ["sess_switch_child_1", "sess_switch_child_2"],
+    running: [
+      { childSessionId: "sess_switch_child_1", toolCallId: "agent-call-switch-1", subagentType: "Explore", status: "running" },
+      { childSessionId: "sess_switch_child_2", toolCallId: "agent-call-switch-2", subagentType: "Explore", status: "running" },
+    ],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_switch_child_2", { sessionStatus: "running", messages: [] });
+  const reopening = f.open({}, persistence, "replay", "paseo-second");
+  await flush();
+
+  releaseClose();
+  await closing;
+  await reopening;
+  t.mock.timers.tick(0); await flush();
+
+  const secondChild = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_switch_child_2");
+  assert.ok(secondChild, "the new subagent must attach after the reopen");
+  assert.equal(secondChild.parentSessionId, "paseo-second", "it must belong to the reopened Paseo session");
+  assert.ok(
+    !f.events.some((event) => event.type === "session.opened" && event.sessionId === "sess_switch_child_2"
+      && event.parentSessionId === "paseo-session"),
+    "a child must never attach to the Paseo session that is being closed",
+  );
+  assert.ok(f.events.some((event) => event.type === "session.closed" && event.sessionId === "paseo-session"));
 });
 
 test("without session.subsession, subagents stay on the legacy background card", async (t) => {

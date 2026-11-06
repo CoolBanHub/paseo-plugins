@@ -115,6 +115,13 @@ local ZCode sessions are listed in Paseo's session picker.
   render. Hosts that do not negotiate `session.subsession` keep the previous
   rendering: an Agent tool card with the final summary plus a generic
   background-task card.
+- Each ZCode session is rebound to the Paseo session that opens it now, and
+  close/open inputs are serialized per ZCode session. A failed open discards
+  its state instead of leaving the next open bound to the failed Paseo session;
+  otherwise a re-attached child could announce a parent Paseo already closed,
+  and Paseo responds by terminating the whole provider connection (every ZCode
+  agent on it shows `Provider parent session did not negotiate
+  session.subsession`).
 - Tool rows recover their arguments from ZCode's scheduled tool events and
   persisted `state.raw` data when no streaming `tool_call` was delivered, so
   Shell/Read rows keep the command or path instead of rendering as bare
