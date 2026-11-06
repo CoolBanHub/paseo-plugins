@@ -317,6 +317,8 @@ interface SessionState {
   pendingClientMessageId?: string;
   modelSelection?: ZcodeModelSelection;
   mode?: string;
+  /** Plan is an overlay on ZCode's permission mode, reported only by session.updated. */
+  planEnabled?: boolean;
   ready: boolean;
   /** Set once Paseo closed the session; late async work must not emit events. */
   closed?: boolean;
@@ -1188,9 +1190,12 @@ export function createZcodeProvider(): ProviderRegistration {
         }
         // The session projection can retain the mode from its last message;
         // settings.mode.current is the live selection confirmed by ZCode.
+        // Plan is not a snapshot mode: ZCode stores it as planEnabled on top
+        // of the permission mode (which may be "build" or "yolo"), so keep
+        // the plan overlay until session.updated explicitly clears it.
         const snapshotMode = settings?.mode?.current ?? snapshot.projection?.mode ?? snapshot.session?.mode;
-        if (snapshotMode && !(state.mode === "plan" && snapshotMode === "build")) {
-          state.mode = snapshotMode;
+        if (snapshotMode) {
+          state.mode = state.planEnabled === true ? "plan" : snapshotMode;
         }
         if (settings?.model?.available) {
           const incoming = buildCatalog({ session: { sessionId: state.zcodeSessionId }, settings }).models;
@@ -1643,7 +1648,8 @@ export function createZcodeProvider(): ProviderRegistration {
           case "session.updated": {
             if (typeof payload.mode === "string"
               && (state.modeEventSeq === undefined || event.seq > state.modeEventSeq)) {
-              const mode = payload.planEnabled === true ? "plan" : payload.mode;
+              state.planEnabled = payload.planEnabled === true;
+              const mode = state.planEnabled ? "plan" : payload.mode;
               if (ZCODE_MODES.some((candidate) => candidate.id === mode)) {
                 state.mode = mode;
                 state.modeEventSeq = event.seq;
@@ -1917,6 +1923,11 @@ export function createZcodeProvider(): ProviderRegistration {
         const snapshot = await client.requestOk("session/setMode", {
           sessionId: state.zcodeSessionId, mode, expectedRevision: state.revision,
         });
+        // ZCode normalizes "plan" to planEnabled on top of the current
+        // permission mode, so its snapshot reports that permission mode
+        // (often "yolo") even when plan was accepted. Track the overlay from
+        // the request; session.updated confirms or clears it afterwards.
+        state.planEnabled = mode === "plan";
         applyOfficialState(state, snapshot as unknown as CreateOrResumeResult);
         if (state.mode !== mode) throw new Error(`ZCode did not apply mode "${mode}"; current mode is "${state.mode}"`);
       };
@@ -2494,6 +2505,7 @@ export function createZcodeProvider(): ProviderRegistration {
             state.closed = false;
             state.revision = undefined;
             state.modeEventSeq = undefined;
+            state.planEnabled = undefined;
             state.cwd = input.config.cwd || bridgeDir;
             const catalog = await ensureCatalog();
             state.catalog = catalog;

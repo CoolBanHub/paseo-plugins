@@ -150,14 +150,21 @@ async function fixture(t, options = {}) {
     if (method === "session/setMode") {
       const state = states.get(params.sessionId);
       if (!options.ignoreModeChange) {
-        state.mode = params.mode === "plan" ? "build" : params.mode;
-        state.runtimeMode = params.mode === "plan" ? "build" : params.mode;
+        const baseMode = params.mode === "plan" ? options.planBaseMode ?? "build" : params.mode;
+        state.mode = baseMode;
+        state.runtimeMode = baseMode;
         state.planEnabled = params.mode === "plan";
         state.eventSeq++;
-        if (state.subscribed) eventListener({
-          type: "session.updated", sessionId: params.sessionId, seq: state.eventSeq,
-          payload: { mode: state.mode, planEnabled: state.planEnabled },
+        const payload = { mode: state.mode, planEnabled: state.planEnabled };
+        const seq = state.eventSeq;
+        const notifyMode = () => eventListener({
+          type: "session.updated", sessionId: params.sessionId, seq,
+          payload,
         });
+        if (state.subscribed) {
+          if (options.deferModeEvent) setImmediate(notifyMode);
+          else notifyMode();
+        }
       }
       state.revision++;
       return { result: snapshot(params.sessionId) };
@@ -517,6 +524,23 @@ test("resuming without an override preserves the saved model and reasoning", asy
   await f.prompt();
   assert.equal(f.config().model, BINGLM);
   assert.equal(f.calls("session/send").at(-1).modelSelection.options.reasoningLevel, "high");
+});
+
+test("resuming a plan session accepts the underlying permission mode from the setMode snapshot", async (t) => {
+  const f = await fixture(t, { initialMode: "yolo", planBaseMode: "yolo", deferModeEvent: true });
+  await f.open({ mode: "plan" }, { version: 1, data: { zcodeSessionId: "sess_plan" } });
+  assert.equal(f.calls("session/setMode").at(-1).mode, "plan");
+  assert.equal(f.config().mode, "plan");
+  assert.ok(f.events.some((event) => event.type === "session.ready"));
+  assert.ok(!f.events.some((event) => event.type === "request.failed"));
+  await flush();
+  assert.equal(f.config().mode, "plan");
+  await f.prompt();
+  assert.equal(f.calls("session/send").length, 1);
+  assert.equal(f.config().mode, "plan");
+  await f.configure({ mode: "yolo" });
+  assert.equal(f.config().mode, "yolo");
+  assert.ok(!f.events.some((event) => event.type === "request.failed"));
 });
 
 test("resuming replays visible ZCode history before session.ready when requested", async (t) => {
@@ -952,7 +976,7 @@ test("archived desktop sessions are excluded from the import picker", async (t) 
 test("a mode change that the runtime does not apply reports failure and retains official state", async (t) => {
   const f = await fixture(t, { ignoreModeChange: true });
   await f.open({ model: BINGLM });
-  await f.configure({ mode: "plan" });
+  await f.configure({ mode: "guarded" });
   assert.equal(f.config().mode, "build");
   const failure = f.events.find((event) => event.type === "request.failed" && event.requestId === "configure");
   assert.match(failure.error.message, /did not apply mode/);
