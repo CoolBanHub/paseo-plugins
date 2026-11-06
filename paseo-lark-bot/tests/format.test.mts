@@ -76,6 +76,29 @@ describe("formatTurnOutcome", () => {
     assert.equal(formatTurnOutcome("failed", "boom"), "处理失败：boom");
   });
 
+  it("replaces an upstream HTML 403 with an actionable hint", () => {
+    const text = formatTurnOutcome(
+      "failed",
+      "Internal error: turn failed: 403 <html> <head><title>403 Forbidden</title></head> <body><center><h1>403 Forbidden</h1></center></body></html>",
+    );
+    assert.ok(text.includes("HTTP 403"), text);
+    assert.ok(text.includes("API Key"), text);
+    assert.ok(text.includes("Paseo"), text);
+    assert.ok(!text.includes("<html>"), text);
+    assert.ok(!text.includes("Internal error"), text);
+  });
+
+  it("maps common HTTP failures without dumping the raw body", () => {
+    assert.ok(formatTurnOutcome("failed", "HTTP 401 Unauthorized").includes("认证失败"));
+    assert.ok(formatTurnOutcome("failed", "HTTP 403 Forbidden").includes("拒绝访问"));
+    assert.ok(formatTurnOutcome("failed", "HTTP 429 Too Many Requests").includes("限流"));
+    assert.ok(formatTurnOutcome("failed", "HTTP 503 Service Unavailable").includes("暂时不可用"));
+  });
+
+  it("strips HTML from non-HTTP errors", () => {
+    assert.equal(formatTurnOutcome("failed", "<b>boom</b>\n<html>bad</html>"), "处理失败：boom bad");
+  });
+
   it("describes cancellations", () => {
     assert.equal(formatTurnOutcome("canceled", null), "本轮处理已取消。");
   });
