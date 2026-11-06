@@ -68,29 +68,50 @@ type WholeBodyStream = {
   readonly usage: { inputTokens: number; outputTokens: number; cachedTokens: number };
 };
 
+/** A buffered gateway JSON document larger than this is refused, not hoarded. */
+const MAX_WHOLE_JSON_CHARS = 32 * 1024 * 1024;
+
 /**
  * A gateway may ignore stream:true and answer with one JSON document (a whole
  * completion or an error envelope). The bridge always streams to a client that
  * asked to stream, so this buffers such a body and replays it as the SSE the
- * converter expects; a real SSE body passes straight through.
+ * converter expects; a real SSE body passes straight through. A "JSON" body
+ * that grows past the cap is discarded and surfaces as an error event instead
+ * of buffering unbounded bytes from a misbehaving gateway.
  */
 export function acceptWholeJsonBody<T extends WholeBodyStream>(inner: T, asSse: (body: Record<string, any>) => string): WholeBodyStream {
-  let mode: "undecided" | "sse" | "json" = "undecided";
+  let mode: "undecided" | "sse" | "json" | "oversized" = "undecided";
   let raw = "";
   return {
     push(chunk: string) {
       if (mode === "sse") return inner.push(chunk);
+      if (mode === "oversized") return "";
       raw += chunk;
-      if (mode === "json") return "";
+      if (mode === "json") {
+        if (raw.length > MAX_WHOLE_JSON_CHARS) {
+          mode = "oversized";
+          raw = "";
+        }
+        return "";
+      }
       const head = raw.replace(/^[\s﻿]+/, "");
       if (!head) return "";
       mode = head[0] === "{" ? "json" : "sse";
-      if (mode === "json") return "";
+      if (mode === "json") {
+        if (raw.length > MAX_WHOLE_JSON_CHARS) {
+          mode = "oversized";
+          raw = "";
+        }
+        return "";
+      }
       const text = raw;
       raw = "";
       return inner.push(text);
     },
     end() {
+      if (mode === "oversized") {
+        return inner.push(`data: ${JSON.stringify({ error: { type: "api_error", message: "The model route answered with an oversized non-streaming body" } })}\n\n`) + inner.end();
+      }
       if (mode !== "json") return inner.end();
       const body = parseJson(raw.replace(/^[\s﻿]+/, ""));
       raw = "";

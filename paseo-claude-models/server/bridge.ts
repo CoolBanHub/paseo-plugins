@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -77,7 +77,11 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 const capabilityDigest = (capability: string) => createHash("sha256").update(capability).digest();
-const sameDigest = (left: Buffer, right: Buffer) => left.length === right.length && left.equals(right);
+// Constant-time comparison: the capability token authenticates every request
+// to the loopback bridge, so the comparison must not leak a matching prefix
+// through timing even though the token is random per session.
+const sameDigest = (left: Buffer, right: Buffer) =>
+  left.length === right.length && timingSafeEqual(left, right);
 
 class LocalFailure extends Error {
   readonly status: number;
@@ -109,6 +113,26 @@ function readBody(request: IncomingMessage, signal: AbortSignal): Promise<Buffer
     request.on("end", () => resolve(Buffer.concat(chunks)));
     request.on("error", (error) => reject(error instanceof LocalFailure ? error : new LocalFailure(400, "请求内容无效", "invalid_request_error")));
   });
+}
+
+/** Read at most `limit` bytes of a fetch Response body as text. */
+async function readCapped(response: Response, limit: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.length;
+      if (size > limit) break;
+      chunks.push(Buffer.from(chunk.value));
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
@@ -168,8 +192,18 @@ export function createBridge(options: BridgeOptions) {
 
   // -- State kept across a plugin reload -----------------------------------
   let stateWrites: Promise<unknown> = Promise.resolve();
-  const savedState: Promise<SavedState> = readFile(statePath, "utf8")
-    .then((content) => parseSavedState(JSON.parse(content)), () => parseSavedState(null));
+  // A corrupt state file (disk fault, hand edit, failed migration) must not
+  // brick every custom-model session: quarantine it next to the original and
+  // continue from an empty state, exactly like a missing file. The evidence
+  // stays on disk for inspection and the next successful write replaces it.
+  const savedState: Promise<SavedState> = readFile(statePath, "utf8").then((content) => {
+    try {
+      return parseSavedState(JSON.parse(content));
+    } catch {
+      rename(statePath, `${statePath}.corrupt-${Date.now().toString(36)}`).catch(() => undefined);
+      return parseSavedState(null);
+    }
+  }, () => parseSavedState(null));
   const updateSaved = (change: (state: SavedState) => void) => {
     const task = stateWrites.then(async () => {
       const state = await savedState;
@@ -379,7 +413,9 @@ export function createBridge(options: BridgeOptions) {
   };
 
   async function upstreamFailure(upstream: Response, bridge: ProtocolBridge | null): Promise<LocalFailure> {
-    const text = await upstream.text().catch(() => "");
+    // Cap the error body read: a misbehaving gateway must not be able to
+    // buffer unbounded bytes through the failure path.
+    const text = await readCapped(upstream, 8 * 1024).catch(() => "");
     let parsed: unknown = null;
     try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
     if (bridge && isRecord(parsed)) {

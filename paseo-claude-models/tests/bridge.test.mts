@@ -370,3 +370,69 @@ test("routes survive a bridge restart on the same port", async () => {
     await new Promise<void>((resolve) => upstream.server.close(() => resolve()));
   }
 });
+
+test("a corrupt bridge-state.json is quarantined instead of bricking the bridge", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "custom-models-corrupt-"));
+  const registry = createModelRegistry({ directory });
+  const saved = await registry.save({
+    label: "GLM", baseUrl: "http://127.0.0.1:9", protocol: "anthropic", authHeader: "bearer",
+    enabled: true, models: [{ id: "glm-4.6", label: "glm-4.6" }], apiKey: "sk-key-1234567890",
+  });
+  // A hand edit / partial write leaves unparsable JSON behind.
+  const { writeFileSync, readdirSync, readFileSync } = await import("node:fs");
+  writeFileSync(join(directory, "bridge-state.json"), "{ this is not json");
+  const bridge = createBridge({ registry, directory });
+  try {
+    const { address, capability } = await bridge.openRoute("agent-corrupt", menuModelId(saved.id, "glm-4.6"));
+    assert.ok(address.startsWith("http://127.0.0.1:"));
+    assert.ok(capability.length > 0);
+    // The evidence file was kept for inspection next to the original.
+    const quarantined = readdirSync(directory).find((name) => /^bridge-state\.json\.corrupt-/.test(name));
+    assert.ok(quarantined, "the corrupt state file is quarantined, not silently dropped");
+    assert.match(readFileSync(join(directory, quarantined!), "utf8"), /not json/);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("an oversized gateway JSON body surfaces as an SSE error, not unbounded buffering", async () => {
+  const { acceptWholeJsonBody } = await import("../server/protocol/sse.ts");
+  const pushed: string[] = [];
+  const inner = {
+    push(chunk: string) { pushed.push(chunk); return ""; },
+    end() { return "inner-end"; },
+    usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+  };
+  const wrapped = acceptWholeJsonBody(inner, () => "data: replayed\n\n");
+  // A "JSON" body that grows past the cap: chunks keep arriving, nothing may
+  // accumulate without bound.
+  const filler = "{\"fill\":\"" + "a".repeat(1024 * 1024);
+  wrapped.push(filler);
+  for (let round = 0; round < 32; round += 1) wrapped.push("a".repeat(1024 * 1024));
+  const tail = wrapped.end();
+  const replay = pushed.join("") + tail;
+  assert.match(replay, /oversized non-streaming body/);
+  assert.ok(!replay.includes("replayed"), "the oversized body is never replayed as a completion");
+});
+
+test("upstream failure bodies are read capped and the message is truncated", async () => {
+  const world = await fixture([{ label: "GLM", protocol: "anthropic", models: ["glm-4.6"] }]);
+  try {
+    world.upstream.respond(() => ({
+      status: 500,
+      type: "application/json",
+      body: JSON.stringify({ type: "api_error", message: "x".repeat(200_000) }),
+    }));
+    const glm = menuModelId(world.idOf("GLM"), "glm-4.6");
+    const { address, capability } = await world.bridgeUrl(glm);
+    const response = await post(`${address}/v1/messages`, {
+      model: glm, stream: false, max_tokens: 16, messages: [],
+    }, { authorization: `Bearer ${capability}` });
+    assert.equal(response.status, 500);
+    const parsed = JSON.parse(await response.text()) as { error?: { message?: string } };
+    assert.ok((parsed.error?.message?.length ?? 0) <= 600, "the failure message is truncated");
+  } finally {
+    world.upstream.respond(() => ({ status: 200, body: anthropicSse, type: "text/event-stream" }));
+    await world.cleanup();
+  }
+});
