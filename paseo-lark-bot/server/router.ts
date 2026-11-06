@@ -10,7 +10,11 @@ export interface RoutingDecision {
   reason: "ok" | "unmatched" | "ignored" | "blocked";
 }
 
-/** True when this sender may drive the bot in the chat. Empty = everyone. */
+/**
+ * True when this sender may drive the bot in the chat. Empty = everyone.
+ * Dispatchers still record unmentioned messages from disallowed senders as
+ * context; only their @-mentions are rejected.
+ */
 export function isSenderAllowed(binding: ChatBinding, senderId: string): boolean {
   return (
     binding.allowedUsers.length === 0 ||

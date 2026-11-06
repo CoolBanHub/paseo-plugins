@@ -225,7 +225,7 @@ export function BindingEditor({
       </Card>
 
       <Card>
-        <CardTitle text="允许 @ 的成员" hint="留空 = 所有人可触发；非指定成员 @ 时会收到提示，消息不会进入话题上下文" />
+        <CardTitle text="允许 @ 的成员" hint="留空 = 所有人可触发；非指定成员 @ 时只提示、不触发，其未 @ 的发言仍会进入话题上下文" />
         {binding.allowedUsers.length === 0 ? (
           <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
             当前所有人都可以 @ 我处理。

@@ -66,6 +66,8 @@ export const chatBindingSchema = z.object({
   /**
    * Who may @ the bot in this chat. Empty means everyone (default). Feishu
    * sender_id is an open_id, so entries are matched against `openId`.
+   * This only gates triggering: unmentioned messages from other members still
+   * contribute thread context, and a disallowed member's @ is not recorded.
    */
   allowedUsers: z.array(allowedUserSchema).default([]),
   /**

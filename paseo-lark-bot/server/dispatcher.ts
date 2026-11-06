@@ -455,12 +455,17 @@ export function createDispatcher(options: DispatcherOptions) {
 
       // Record/ingest before routing so unmentioned messages in a bound chat
       // still contribute thread context; awaiting the download keeps a fast
-      // follow-up @ from reading an empty image cache. Disallowed senders are
-      // stopped here so their text/media never enters the topic transcript.
-      if (!isSenderAllowed(binding, event.sender_id)) {
-        const triggered =
-          event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
-        if (triggered && event.sender_type !== "bot") {
+      // follow-up @ from reading an empty image cache.
+      //
+      // allowedUsers only gates who may *trigger* a turn. A disallowed
+      // member's mention is rejected before it can enter the transcript, but
+      // their unmentioned messages stay as context for an allowed member's
+      // later @ — otherwise the bot loses the discussion around the request.
+      const allowed = isSenderAllowed(binding, event.sender_id);
+      const triggered =
+        event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
+      if (!allowed && triggered) {
+        if (event.sender_type !== "bot") {
           log(`会话 ${event.chat_id} 收到未授权成员 ${event.sender_id} 的 @，已拒绝处理`);
           await send(cliPath, event.message_id, BLOCKED_HINT, values, "text");
         }
@@ -468,6 +473,7 @@ export function createDispatcher(options: DispatcherOptions) {
       }
       recordHistory(event);
       await ingestMedia(cliPath, event);
+      if (!allowed) return;
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {

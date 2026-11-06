@@ -224,6 +224,107 @@ describe("createDispatcher", () => {
     assert.ok(!h.created[0].prompt?.includes("机密讨论"), "blocked text must stay out of thread history");
   });
 
+  it("keeps unmentioned messages from non-allowlisted members as context", async () => {
+    const base = baseValues();
+    const first = base.chats[0];
+    assert.ok(first);
+    const h = makeHarness(
+      baseValues({
+        chats: [{ ...first, allowedUsers: [{ openId: "ou_boss", name: "指定人" }] }],
+      }),
+    );
+
+    // Root and an in-thread note come from members outside the allowlist.
+    // They cannot trigger a turn, but an allowed member's later @ must see
+    // the discussion that led to the request.
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_root",
+        sender_id: "ou_member",
+        content: "打手罚单申诉添加上传图片证据的功能",
+        mentions: [],
+      }),
+    );
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_mid",
+        root_id: "om_root",
+        sender_id: "ou_other",
+        content: "功能应该已有，只要接口和前端加一下",
+        mentions: [],
+      }),
+    );
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_trigger",
+        root_id: "om_root",
+        sender_id: "ou_boss",
+        content: "@_user_1 你加一下",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("打手罚单申诉添加上传图片证据的功能"), prompt);
+    assert.ok(prompt.includes("只要接口和前端加一下"), prompt);
+    assert.ok(prompt.includes("你加一下"), prompt);
+  });
+
+  it("ingests media from non-allowlisted members as context", async () => {
+    const base = baseValues();
+    const first = base.chats[0];
+    assert.ok(first);
+    const h = makeHarness();
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () =>
+        baseValues({
+          chats: [{ ...first, allowedUsers: [{ openId: "ou_boss", name: "指定人" }] }],
+        }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) => (id === "om_img" ? { image_key: "img_v3_abc" } : null),
+      download: async ({ fileKey }) => ({ bytes: Buffer.from("fake-jpeg-" + fileKey), extension: ".jpg" }),
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_root",
+        sender_id: "ou_member",
+        content: "看看这个报错",
+        mentions: [],
+      }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_img",
+        root_id: "om_root",
+        sender_id: "ou_other",
+        message_type: "image",
+        content: "",
+        mentions: [],
+      }),
+    );
+    await flush();
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_trigger",
+        root_id: "om_root",
+        sender_id: "ou_boss",
+        content: "@_user_1 图里什么情况",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const createdImages = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(createdImages?.length, 1, "image from a non-allowlisted member should be attached");
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("成员B: [图片]"), prompt);
+    assert.ok(prompt.includes("【附图】"), prompt);
+  });
+
   it("notifies the chat about permission requests for its own agents only", async () => {
     const h = makeHarness(baseValues({ notifyPermission: true }));
     await h.dispatch.handleMessageEvent(groupEvent());
