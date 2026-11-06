@@ -293,9 +293,9 @@ interface TurnState {
   reasoning: string;
   assistantMessageId?: string;
   emittedAssistant: Set<string>;
-  /** First text/reasoning event of the model request currently streaming. */
+  /** First generated content (text, reasoning or tool input) of the open decode window. */
   firstContentAt?: number;
-  /** Summed first-content → finish time across this turn's model requests. */
+  /** Summed generated-content time across this turn's model requests. */
   decodeMs: number;
   tools: Map<string, {
     name: string;
@@ -820,15 +820,27 @@ function formatTokenCount(value: number): string {
 
 /**
  * Generation throughput for one turn: ZCode reports aggregate output tokens in
- * `turn.completed`, while the plugin accumulates each model request's
- * first-content → finish time. This is the same decode-only definition ZCode's
- * own `tokensPerSecond` debug figure uses (`durationMs - timeToFirstContentMs`).
+ * `turn.completed`, while the plugin accumulates each generated segment's
+ * first-content → boundary time. This is the same decode-only definition
+ * ZCode's own `tokensPerSecond` debug figure uses (`durationMs -
+ * timeToFirstContentMs`); because the app-server forwards only delta frames,
+ * a tool call or the turn completion closes the segment.
  */
 function formatGenerationSpeed(outputTokens: number | undefined, decodeMs: number): string | undefined {
   if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
   const tps = outputTokens / (decodeMs / 1000);
   if (!Number.isFinite(tps) || tps <= 0) return undefined;
   return `${tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10} tok/s`;
+}
+
+function openDecodeWindow(turn: TurnState, at: number): void {
+  if (turn.firstContentAt === undefined) turn.firstContentAt = at;
+}
+
+function closeDecodeWindow(turn: TurnState, at: number): void {
+  if (turn.firstContentAt === undefined) return;
+  turn.decodeMs += Math.max(0, at - turn.firstContentAt);
+  turn.firstContentAt = undefined;
 }
 
 /** One compact per-turn token accounting row, including the decode speed. */
@@ -1581,26 +1593,21 @@ export function createZcodeProvider(): ProviderRegistration {
             const kind = payload.kind;
             if (typeof payload.assistantMessageId === "string") turn.assistantMessageId = payload.assistantMessageId;
             if (kind === "start") {
+              // A new request; the previous window should already have been
+              // closed by a finish/tool call, so drop only an incomplete one.
               turn.firstContentAt = undefined;
-            } else if (kind === "text_start" || kind === "reasoning_start") {
-              if (turn.firstContentAt === undefined) turn.firstContentAt = event.timestamp;
-            } else if (kind === "finish") {
-              if (turn.firstContentAt !== undefined) {
-                turn.decodeMs += Math.max(0, event.timestamp - turn.firstContentAt);
-                turn.firstContentAt = undefined;
-              }
-            } else if (kind === "error") {
-              turn.firstContentAt = undefined;
-            } else if ((kind === "text_delta" || kind === "reasoning_delta") && turn.firstContentAt === undefined) {
-              // Streams resumed from a replay may omit the start marker; the
-              // first visible delta is then the earliest content boundary.
-              turn.firstContentAt = event.timestamp;
+            } else if (kind === "finish" || kind === "error") {
+              closeDecodeWindow(turn, event.timestamp);
+            } else if (kind === "text_start" || kind === "reasoning_start" || kind === "tool_input_start"
+              || kind === "text_delta" || kind === "reasoning_delta" || kind === "tool_input_delta") {
+              openDecodeWindow(turn, event.timestamp);
             }
             if (kind === "reasoning_delta" && typeof payload.delta === "string") {
               turn.reasoning += payload.delta;
             } else if (kind === "text_delta" && typeof payload.delta === "string") {
               turn.text += payload.delta;
             } else if (kind === "tool_call") {
+              closeDecodeWindow(turn, event.timestamp);
               flushReasoning(state, turn);
               const toolCallId = String(payload.toolCallId ?? "");
               const toolName = String(payload.toolName ?? "tool");
@@ -1808,6 +1815,9 @@ export function createZcodeProvider(): ProviderRegistration {
                 contextWindowUsedTokens: state.contextUsed,
               },
             });
+            // The app-server does not project a finish frame for every
+            // request, so the completed turn is the final segment boundary.
+            closeDecodeWindow(turn, event.timestamp);
             emitTurnUsage(emit, state, turn, usage);
             state.turns.delete(event.turnId);
             if (state.goalActive) scheduleGoalRefresh(state);

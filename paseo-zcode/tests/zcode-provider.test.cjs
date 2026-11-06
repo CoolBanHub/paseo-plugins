@@ -1474,6 +1474,35 @@ test("decode speed aggregates every model request and skips tool-only requests",
   assert.match(f.notifications().at(-1).item.message, /速度 10 tok\/s/);
 });
 
+test("delta-only streams close the decode window at turn completion and tool calls", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  // The app-server forwards content as delta frames only: no start/finish.
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-deltas", timestamp: 1_000, payload: { kind: "text_delta", delta: "S" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-deltas", timestamp: 1_100, payload: { kind: "reasoning_delta", delta: "R" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-deltas", timestamp: 2_000,
+    payload: { response: "SPEED_OK", resultType: "success", usage: { outputTokens: 5 } },
+  });
+  assert.match(f.notifications().at(-1).item.message, /输出 5 · 速度 5 tok\/s/);
+
+  // A tool call closes the current model segment; the next delta reopens it.
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_000, payload: { kind: "text_delta", delta: "a" } });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_500,
+    payload: { kind: "tool_call", toolCallId: "tool-1", toolName: "bash", input: {} },
+  });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 4_500, payload: { kind: "text_delta", delta: "b" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-tool-split", timestamp: 5_000,
+    payload: { response: "done", resultType: "success", usage: { outputTokens: 10 } },
+  });
+  assert.match(f.notifications().at(-1).item.message, /速度 10 tok\/s/);
+});
+
 test("compaction state updates render loading and completed rows", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });
