@@ -27,7 +27,6 @@ import { DSH_EVENT_METHOD } from "./dsh-events.ts";
 import { dshSessionLastActivity, dshSessionPlanActive, dshSessionTitle } from "./dsh-projections.ts";
 import { cancelAllDshQuestions, cancelDshQuestion, registerDshQuestion } from "./dsh-questions.ts";
 import { SidecarTail, type SidecarTailRecord } from "./sidecar-tail.ts";
-import { registerDshRevertHandler, unregisterDshRevertHandler } from "./dsh-revert.ts";
 import {
   DEFAULT_PERMISSION_OPTIONS,
   DSH_MODES,
@@ -482,14 +481,6 @@ function eventMirror(ctx) {
         return;
       }
       if (event.type === "user/message") {
-        const source = data.source || {};
-        if (source.kind === "user" && typeof data.id === "string") {
-          appendEvent("revert-point", sessionId, {
-            messageId: data.id,
-            seq: typeof event.seq === "number" ? event.seq : undefined,
-            text: textOf(data.content).slice(0, 120),
-          });
-        }
         return;
       }
       if (event.type === "assistant/message") {
@@ -1578,7 +1569,6 @@ export function createDshConnector(
       rmSync(receiptFile, { force: true });
       rmSync(bridgeRequestDir, { recursive: true, force: true });
       rmSync(bridgeResponseDir, { recursive: true, force: true });
-      for (const sessionId of liveSessions) unregisterDshRevertHandler(sessionId);
       stopPtcMirror();
       stopEventMirror();
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -2065,8 +2055,6 @@ export function createDshConnector(
                   : request.sessionId;
                 if (sessionId && !request.probe) {
                   liveSessions.add(sessionId);
-                  registerDshRevertHandler(sessionId, ({ token, scope }) =>
-                    runNativeRevert(sessionId, token, scope));
                   // Commands may already be in the bridge's catalog by the
                   // time the ACP session/new or resume response arrives. Send
                   // once now and once after Paseo has emitted session.ready.
@@ -2542,11 +2530,10 @@ export function createDshConnector(
       }
     }
 
-    // ---- Native session revert ------------------------------------------
+    // ---- Session revert --------------------------------------------------
     // Conversation rewind appends dsh's own replace marker through the
     // bridge; file revert restores byte snapshots the bridge checkpointed.
-    // Both are reachable from Paseo's revert affordances (revert tokens on
-    // timeline rows) and the /rewind, /revert-files slash commands.
+    // Both are reachable from the /rewind and /revert-files slash commands.
 
     interface FileReceipt {
       sessionId?: string;
@@ -2719,26 +2706,6 @@ export function createDshConnector(
         void toAgent.close();
       }, 1_500);
       timer.unref();
-    }
-
-    async function runNativeRevert(
-      sessionId: string,
-      token: { messageId?: string; seq?: number } | undefined,
-      scope: "conversation" | "files" | "both",
-    ): Promise<{ description: string }> {
-      const parts: string[] = [];
-      if (scope !== "files") {
-        const rewind = await requestBridgeRewind(sessionId, token?.messageId, token ? undefined : 1);
-        parts.push(`对话已回退到「${rewind.summary}」`);
-      }
-      if (scope !== "conversation") {
-        const files = revertFilesFor(sessionId, token?.seq, undefined);
-        if (files.undone.length) parts.push(`已还原 ${files.undone.length} 个文件`);
-        if (files.skipped.length) parts.push(`跳过 ${files.skipped.length} 个：${files.skipped.join("；")}`);
-        if (!files.undone.length && !files.skipped.length) parts.push("没有可回滚的文件改动");
-      }
-      if (scope !== "files") closeAfterRewind(sessionId, parts[0] ?? "");
-      return { description: parts.join("；") };
     }
 
     /** /rewind [n] — rewind the conversation to the n-th previous user message. */

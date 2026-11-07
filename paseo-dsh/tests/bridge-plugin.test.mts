@@ -301,8 +301,6 @@ test("the bridge mirrors usage, turn ends, revert points and stream previews", a
   fake.emit("agent/assistant-stream", { agent: streamAgent, frame: { type: "end", attemptId: "at-2", revision: 3, index: 1, outcome: { kind: "abandoned" } } });
 
   const events = readEvents();
-  const revertPoint = events.find((event) => event.kind === "revert-point");
-  assert.deepEqual(revertPoint?.data, { messageId: "user-11", seq: 11, text: "Fix it" });
   const usage = events.find((event) => event.kind === "usage");
   assert.deepEqual(usage?.data, {
     turn: 3,

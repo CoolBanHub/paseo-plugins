@@ -105,28 +105,24 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
 
   const items = dshHistoryTimelineItems("history-a", ptcEvents);
   assert.deepEqual(items.map((item) => item.type), [
-    "user_message", "tool_call", "reasoning", "assistant_message",
+    "user_message", "reasoning", "assistant_message",
     "tool_call", "tool_call", "tool_call", "tool_call", "todo",
     "tool_call", "tool_call", "compaction", "compaction", "tool_call",
   ]);
   assert.equal(items[0]?.id, "user-id");
-  assert.deepEqual(
-    items[1]?.type === "tool_call" ? items[1].revertToken : undefined,
-    { v: 1, kind: "dsh-rewind", messageId: "user-id", seq: 1 },
-    "every visible user message carries a native revert token",
-  );
   assert.equal(items[0]?.type === "user_message" ? items[0].text : "", "Hello");
-  assert.equal(items[2]?.type === "reasoning" ? items[2].text : "", "Thinking");
-  assert.equal(items[3]?.type === "assistant_message" ? items[3].text : "", "Hi there");
+  assert.ok(!items.some((item) => item.id.includes("revert")), "user messages render without revert marker rows");
+  assert.equal(items[1]?.type === "reasoning" ? items[1].text : "", "Thinking");
+  assert.equal(items[2]?.type === "assistant_message" ? items[2].text : "", "Hi there");
+  assert.equal(items[3]?.id, "tool-1");
+  assert.equal(items[3]?.type === "tool_call" ? items[3].status : "", "running");
   assert.equal(items[4]?.id, "tool-1");
-  assert.equal(items[4]?.type === "tool_call" ? items[4].status : "", "running");
-  assert.equal(items[5]?.id, "tool-1");
-  assert.equal(items[5]?.type === "tool_call" ? items[5].status : "", "completed");
+  assert.equal(items[4]?.type === "tool_call" ? items[4].status : "", "completed");
+  assert.equal(items[5]?.id, "sub-1");
   assert.equal(items[6]?.id, "sub-1");
-  assert.equal(items[7]?.id, "sub-1");
   assert.deepEqual(
-    items[8]?.type === "todo"
-      ? items[8].items.map(({ text, status }) => ({ text, status }))
+    items[7]?.type === "todo"
+      ? items[7].items.map(({ text, status }) => ({ text, status }))
       : undefined,
     [
       { text: "scan the repo", status: "completed" },
@@ -134,17 +130,17 @@ test("maps visible dsh conversation, generic tools and PTC sub-calls to stable t
     ],
     "the durable todo/write event restores the native plan list",
   );
-  const job = items[9];
+  const job = items[8];
   assert.equal(job?.type === "tool_call" && job.name, "Build");
   assert.deepEqual(
     job?.type === "tool_call" && job.detail,
     { type: "shell", command: "pwd" },
     "a background job restores with its originating command",
   );
-  assert.equal(items[10]?.type === "tool_call" && items[10].status, "completed");
-  assert.equal(items[11]?.type === "compaction" && items[11].status, "loading");
-  assert.equal(items[12]?.type === "compaction" && items[12].status, "completed");
-  assert.equal(items[13]?.id, "dsh:goal");
+  assert.equal(items[9]?.type === "tool_call" && items[9].status, "completed");
+  assert.equal(items[10]?.type === "compaction" && items[10].status, "loading");
+  assert.equal(items[11]?.type === "compaction" && items[11].status, "completed");
+  assert.equal(items[12]?.id, "dsh:goal");
   assert.ok(!items.some((item) => item.id === "run-1"), "a run_code call with mirrored dispatches is not shown twice");
   assert.ok(!items.some((item) => item.type === "user_message" && item.text.includes("Do not display")));
 });
@@ -167,13 +163,12 @@ test("surface replace ops hide shadowed events and rewind markers render as noti
   const texts = items.map((item) => item.type === "user_message" || item.type === "assistant_message" ? item.text : item.type);
   // seq 1-2 survive (only 3..4 are replaced); the rewound prompt, its answer
   // and the marker's own user row never render as conversation messages.
-  assert.deepEqual(texts, ["Keep me", "tool_call", "Old answer", "notification"]);
+  assert.deepEqual(texts, ["Keep me", "Old answer", "notification"]);
   assert.ok(!texts.includes("Gone answer"), "the replaced assistant message is gone");
   assert.ok(!texts.includes("Rewound prompt"), "the replaced user message is gone");
   const notice = items.find((item) => item.type === "notification");
   assert.equal(notice?.type === "notification" ? notice.message : "", "会话已回退到此处");
-  // The shadowed user message leaves no revert marker either.
-  assert.equal(items.filter((item) => item.id.includes("revert")).length, 1);
+  assert.ok(!items.some((item) => item.id.includes("revert")), "no revert marker rows render");
 });
 
 test("a tool call whose result was shadowed does not dangle as running", () => {
@@ -283,7 +278,7 @@ test("history replay is emitted before ready only for restored sessions requesti
 
   await open("replay", "replay");
   assert.deepEqual(events.map((event) => event.type), [
-    "timeline.item", "timeline.item", "timeline.item", "timeline.item",
+    "timeline.item", "timeline.item", "timeline.item",
     "timeline.item", "timeline.item", "session.ready",
   ]);
   assert.deepEqual(seenInputs.map((input) => input.type), ["session.open"]);

@@ -169,20 +169,6 @@ export function dshHistoryTimelineItems(
       const text = textContent(message?.content);
       const id = typeof message?.id === "string" ? message.id : identity;
       if (text) items.push({ type: "user_message", id, messageId: id, text });
-      // One revert marker per visible user message, matching the live rows
-      // the connector emits (see dsh-events.ts revertPointUpdate).
-      if (typeof message?.id === "string" && typeof event.seq === "number") {
-        items.push({
-          type: "tool_call",
-          id: `dsh:revert:${sessionId}:${message.id}`,
-          callId: `dsh:revert:${sessionId}:${message.id}`,
-          name: "rewind-point",
-          status: "completed",
-          error: null,
-          detail: { type: "plain_text", label: "可回退", ...(text ? { text: text.slice(0, 80) } : {}), icon: "pencil" },
-          revertToken: { v: 1, kind: "dsh-rewind", messageId: message.id, seq: event.seq },
-        });
-      }
       continue;
     }
 

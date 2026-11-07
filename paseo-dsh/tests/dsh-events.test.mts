@@ -211,17 +211,6 @@ test("stream preview rows update one stable id and settle compactly", () => {
   );
 });
 
-test("revert points carry the native revert token", () => {
-  const updates = map("revert-point", { messageId: "m1", seq: 5, text: "Fix the parser" });
-  const item = updates[0]?.type === "timeline" ? updates[0].item : undefined;
-  assert.equal(item?.type === "tool_call" && item.id, "dsh:revert:paseo-session:m1");
-  assert.deepEqual(
-    item?.type === "tool_call" ? item.revertToken : undefined,
-    { v: 1, kind: "dsh-rewind", messageId: "m1", seq: 5 },
-  );
-  assert.equal(map("revert-point", {}).length, 0);
-});
-
 test("question timeouts and rewind completions become notices", () => {
   const cancelled = map("question-cancelled", { requestId: "q1" });
   assert.equal((cancelled[0] as { notice?: { title?: string } })?.notice?.title, "提问已取消");

@@ -173,36 +173,6 @@ function streamRowUpdate(sessionId: string, data: Record<string, unknown>): AcpV
   }];
 }
 
-/**
- * One revertible user message. The row carries the revert token Paseo's
- * native revert affordance needs; conversation rewind appends a native
- * replace marker through the bridge and file revert restores checkpoints
- * recorded after this event.
- */
-function revertPointUpdate(sessionId: string, data: Record<string, unknown>): AcpVendorUpdate[] {
-  const messageId = text(data.messageId);
-  if (!messageId) return [];
-  const seq = typeof data.seq === "number" ? data.seq : undefined;
-  const id = `dsh:revert:${sessionId}:${messageId}`;
-  const label = (text(data.text) ?? "").slice(0, 80);
-  const item: ProviderTimelineItem = {
-    type: "tool_call",
-    id,
-    callId: id,
-    name: "rewind-point",
-    status: "completed",
-    error: null,
-    detail: {
-      type: "plain_text",
-      label: "可回退",
-      ...(label ? { text: label } : {}),
-      icon: "pencil",
-    },
-    revertToken: { v: 1, kind: "dsh-rewind", messageId, ...(seq !== undefined ? { seq } : {}) },
-  };
-  return [{ type: "timeline", item }];
-}
-
 function compactionUpdate(kind: string, data: Record<string, unknown>): AcpVendorUpdate[] {
   const compactionId = text(data.compactionId);
   if (!compactionId) return [];
@@ -389,8 +359,6 @@ export function dshEventUpdates(
       return usageUpdate(sessionId, data);
     case "stream-row":
       return streamRowUpdate(sessionId, data);
-    case "revert-point":
-      return revertPointUpdate(sessionId, data);
     case "question-cancelled": {
       const requestId = text(data.requestId) ?? "?";
       return [notice(`dsh:question-cancelled:${sessionId}:${requestId}`, "info", "提问已取消", "dsh 等待回答超时，该问题已跳过")];

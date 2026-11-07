@@ -191,24 +191,24 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   commands that start their own turn settle the ACP prompt when the command
   returns. When a timed `ask_user_question` expires, the Paseo form is
   dismissed with a notice instead of waiting forever; dsh does not re-ask.
-- Session revert is implemented natively. Every user message carries a
-  revert token (a slim 可回退 marker row), and Paseo's revert affordances
-  send `session.revert` with a conversation/files/both scope:
-  - **Conversation rewind** appends one marker user message through the
-    in-dsh bridge under dsh's exclusive maintenance lock; its native
+- Session revert is slash-command driven; the native `session.revert`
+  protocol path and the 可回退 revert-token marker rows are not advertised
+  (the marker rows added timeline noise without a usable entry point):
+  - **Conversation rewind** (`/rewind [n]`, rewind to the n-th previous
+    user message) appends one marker user message through the in-dsh
+    bridge under dsh's exclusive maintenance lock; its native
     `surfaceOp replace` shadows everything after the chosen message, and a
     successful flush confirms durability. The connector then closes the
     connection (Paseo cannot retract rendered rows); reopening replays the
-    rewound transcript. `/rewind [n]` (rewind to the n-th previous user
-    message) does the same from the prompt box.
-  - **File revert** restores byte-level before-snapshots the bridge
-    checkpointed for `write`/`edit` tool calls (≤256 KiB each, persisted
-    per dsh session under `plugin-data/dsh/file-receipts/`). Receipts are
-    undone newest-first with the current file digest verified against what
-    the tool produced; a mismatch stops the chain instead of clobbering
-    divergent files, replaced inodes are kept as `*.dsh-backup-*`, and files
-    the call created are moved aside rather than deleted. `/revert-files [n]`
-    undoes the last n checkpointed writes.
+    rewound transcript.
+  - **File revert** (`/revert-files [n]`) restores byte-level before-snapshots
+    the bridge checkpointed for `write`/`edit` tool calls (≤256 KiB each,
+    persisted per dsh session under `plugin-data/dsh/file-receipts/`).
+    Receipts are undone newest-first with the current file digest verified
+    against what the tool produced; a mismatch stops the chain instead of
+    clobbering divergent files, replaced inodes are kept as
+    `*.dsh-backup-*`, and files the call created are moved aside rather
+    than deleted. `/revert-files [n]` undoes the last n checkpointed writes.
   - Rewind planning is deliberately conservative (mirrors dsh-web's own
     rules): only plain exchanges and fully settled `read`/`write`/`edit`
     calls can be rewound; sessions that used bash, background jobs, goals,

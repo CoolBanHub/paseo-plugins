@@ -8,7 +8,6 @@ import { dshEventTransformer } from "./server/dsh-events";
 import { currentDshSessionLaunchContext, withDshSessionLaunchContext } from "./server/session-launch-context";
 import { withDshHistoryReplay } from "./server/history-replay";
 import { withDshQuestions } from "./server/dsh-questions";
-import { withDshRevert } from "./server/dsh-revert";
 
 export default function contribute(server: PluginServerContext) {
   const acpProvider = runAcpProvider({
@@ -27,9 +26,9 @@ export default function contribute(server: PluginServerContext) {
     ),
   });
 
-  server.registerProvider(withDshRevert(withDshQuestions(withDshHistoryReplay(withDshSessionLaunchContext({
+  server.registerProvider(withDshQuestions(withDshHistoryReplay(withDshSessionLaunchContext({
     ...acpProvider,
     getCatalogCacheKey: async (options) => dshCatalogCacheKey(options),
-  })))));
+  }))));
   return () => {};
 }
