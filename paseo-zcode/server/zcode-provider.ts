@@ -38,6 +38,7 @@ import {
 import { resolveAccountRequestAuth } from "./zcode-account-oauth";
 import { ZcodeTaskIndex } from "./zcode-task-index";
 import { zcodeCatalogCacheKey } from "./zcode-catalog-key";
+import { recordTurnUsage, readTurnUsages, type TurnUsageEntry } from "./turn-usage-store";
 
 const SUPPORTED_CAPABILITIES = [
   "prompt.message",
@@ -829,9 +830,19 @@ function formatTokenCount(value: number): string {
  * a tool call or the turn completion closes the segment.
  */
 function formatGenerationSpeed(outputTokens: number | undefined, decodeMs: number): string | undefined {
+  const tps = decodeTokPerSec(outputTokens, decodeMs);
+  return tps === undefined ? undefined : formatTokPerSec(tps);
+}
+
+/** Numeric core of the decode figure, persisted for replay reconstruction. */
+function decodeTokPerSec(outputTokens: number | undefined, decodeMs: number): number | undefined {
   if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
   const tps = outputTokens / (decodeMs / 1000);
   if (!Number.isFinite(tps) || tps <= 0) return undefined;
+  return tps;
+}
+
+function formatTokPerSec(tps: number): string {
   return `${tps >= 10 ? Math.round(tps) : Math.round(tps * 10) / 10} tok/s`;
 }
 
@@ -845,34 +856,55 @@ function closeDecodeWindow(turn: TurnState, at: number): void {
   turn.firstContentAt = undefined;
 }
 
-/** One compact per-turn token accounting row, including the decode speed. */
+/** One compact per-turn token accounting row, shared by live emission and replay. */
+function turnUsageNoticeItem(paseoSessionId: string, entry: TurnUsageEntry): ProviderTimelineItem | undefined {
+  const parts: string[] = [];
+  if (typeof entry.inputTokens === "number") parts.push(`输入 ${formatTokenCount(entry.inputTokens)}`);
+  if (typeof entry.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(entry.cacheReadTokens)}`);
+  if (typeof entry.cacheWriteTokens === "number" && entry.cacheWriteTokens > 0) {
+    parts.push(`缓存写 ${formatTokenCount(entry.cacheWriteTokens)}`);
+  }
+  if (typeof entry.outputTokens === "number") parts.push(`输出 ${formatTokenCount(entry.outputTokens)}`);
+  if (typeof entry.speedTokPerSec === "number") parts.push(`速度 ${formatTokPerSec(entry.speedTokPerSec)}`);
+  if (!parts.length) return undefined;
+  return {
+    type: "notification",
+    id: `zcode:${paseoSessionId}:usage:${entry.turnId}`,
+    level: "info",
+    message: `Token 用量：${parts.join(" · ")}`,
+  };
+}
+
+/**
+ * Emit the turn's usage row and persist it for replay. Both happen on the
+ * same condition — a computable decode speed — so a replayed session shows
+ * exactly the rows the live stream showed.
+ */
 function emitTurnUsage(
   emit: (event: ProviderEvent) => void,
   state: SessionState,
   turn: TurnState,
   usage: Record<string, unknown>,
+  turnUsageDir: string,
 ): void {
   const output = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
-  const speed = formatGenerationSpeed(output, turn.decodeMs);
-  if (!speed) return;
-  const parts: string[] = [];
-  if (typeof usage.inputTokens === "number") parts.push(`输入 ${formatTokenCount(usage.inputTokens)}`);
-  if (typeof usage.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(usage.cacheReadTokens)}`);
-  if (typeof usage.cacheWriteTokens === "number" && usage.cacheWriteTokens > 0) {
-    parts.push(`缓存写 ${formatTokenCount(usage.cacheWriteTokens)}`);
-  }
-  if (output !== undefined) parts.push(`输出 ${formatTokenCount(output)}`);
-  parts.push(`速度 ${speed}`);
-  emit({
-    type: "timeline.item",
-    sessionId: state.paseoSessionId,
-    item: {
-      type: "notification",
-      id: `zcode:${state.paseoSessionId}:usage:${turn.turnId}`,
-      level: "info",
-      message: `Token 用量：${parts.join(" · ")}`,
-    },
-  });
+  const speed = decodeTokPerSec(output, turn.decodeMs);
+  if (speed === undefined) return;
+  const entry: TurnUsageEntry = {
+    turnId: turn.turnId,
+    recordedAt: Date.now(),
+    ...(typeof usage.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
+    ...(typeof usage.cacheReadTokens === "number" ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+    ...(typeof usage.cacheWriteTokens === "number" && usage.cacheWriteTokens > 0
+      ? { cacheWriteTokens: usage.cacheWriteTokens }
+      : {}),
+    ...(output !== undefined ? { outputTokens: output } : {}),
+    speedTokPerSec: speed,
+  };
+  recordTurnUsage(turnUsageDir, state.zcodeSessionId, entry);
+  const item = turnUsageNoticeItem(state.paseoSessionId, entry);
+  if (!item) return;
+  emit({ type: "timeline.item", sessionId: state.paseoSessionId, item });
 }
 
 function historyOutput(value: unknown): string | undefined {
@@ -890,9 +922,20 @@ export function zcodeHistoryTimelineItems(
   messages: unknown,
   sessionId: string,
   childSessionIds?: Map<string, string>,
+  turnUsages?: readonly TurnUsageEntry[],
 ): ProviderTimelineItem[] {
   if (!Array.isArray(messages)) return [];
   const items: ProviderTimelineItem[] = [];
+  // Persisted usage rows replay in settle order; each belongs after its own
+  // turn's content, so one row is closed out right before the next visible
+  // user message and any remainder trails the last replayed message.
+  const pendingUsage = (turnUsages ?? [])
+    .map((entry) => turnUsageNoticeItem(sessionId, entry))
+    .filter((item): item is ProviderTimelineItem => item !== undefined);
+  let usageHead = 0;
+  const flushOneUsage = () => {
+    if (usageHead < pendingUsage.length) items.push(pendingUsage[usageHead++]);
+  };
   for (const [messageIndex, raw] of messages.entries()) {
     if (!raw || typeof raw !== "object") continue;
     const message = raw as Record<string, unknown>;
@@ -967,6 +1010,9 @@ export function zcodeHistoryTimelineItems(
       }
     }
     if (role === "user") {
+      // A visible user message opens the next turn; close out exactly the
+      // previous turn's usage row. The opening message has none before it.
+      if (messageIndex > 0) flushOneUsage();
       const text = parts
         .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
         .map((part) => part.type === "text" && typeof part.text === "string" ? part.text
@@ -1021,6 +1067,8 @@ export function zcodeHistoryTimelineItems(
     }
     flushText();
   }
+  // Usage of the newest turns trails after the last replayed message.
+  while (usageHead < pendingUsage.length) items.push(pendingUsage[usageHead++]);
   return items;
 }
 
@@ -1051,6 +1099,7 @@ export function createZcodeProvider(): ProviderRegistration {
 
       const dataDir = join(process.env.PASEO_HOME ?? join(process.env.HOME ?? "~", ".paseo"), "plugin-data", "zcode");
       const bridgeDir = join(dataDir, "bridge");
+      const turnUsageDir = join(dataDir, "turn-usage");
       mkdirSync(bridgeDir, { recursive: true });
 
       const client = new ZcodeProtocolClient({ cliPath, nodePath: resolveNodePath(), cwd: bridgeDir, onLog: log });
@@ -1837,7 +1886,7 @@ export function createZcodeProvider(): ProviderRegistration {
             // Emit the usage row before the turn settles so it belongs to the
             // turn's timeline rather than trailing after its terminal event.
             closeDecodeWindow(turn, event.timestamp);
-            emitTurnUsage(emit, state, turn, usage);
+            emitTurnUsage(emit, state, turn, usage, turnUsageDir);
             emit({
               type: "session.turn",
               sessionId: state.paseoSessionId,
@@ -2663,9 +2712,51 @@ export function createZcodeProvider(): ProviderRegistration {
             emit({ type: "session.persistence", sessionId: input.sessionId, persistence });
             emitSessionConfig(state, state.catalog ?? catalog);
             if (resuming && input.history === "replay") {
-              for (const item of zcodeHistoryTimelineItems(historyMessages, zcodeSessionId, childSessionIds)) {
+              // Rebuild the settled per-turn usage rows (ids match the live
+              // stream) so desktop clients reopening the session keep them.
+              const turnUsages = readTurnUsages(turnUsageDir, zcodeSessionId);
+              for (const item of zcodeHistoryTimelineItems(historyMessages, input.sessionId, childSessionIds, turnUsages)) {
                 emit({ type: "timeline.item", sessionId: input.sessionId, item });
               }
+              // Sessions predating the usage log have no rows; surface the
+              // ZCode-reported session totals once, after the open settles.
+              void (async () => {
+                try {
+                  const totals = await client.requestOk("session/usage", { sessionId: zcodeSessionId }, 5_000);
+                  if (state.closed) return;
+                  emit({
+                    type: "session.usage",
+                    sessionId: input.sessionId,
+                    usage: {
+                      ...(typeof totals.inputTokens === "number" ? { inputTokens: totals.inputTokens } : {}),
+                      ...(typeof totals.outputTokens === "number" ? { outputTokens: totals.outputTokens } : {}),
+                      ...(typeof totals.cacheReadTokens === "number" ? { cachedInputTokens: totals.cacheReadTokens } : {}),
+                      ...(state.contextWindow !== undefined ? { contextWindowMaxTokens: state.contextWindow } : {}),
+                      ...(state.contextUsed !== undefined ? { contextWindowUsedTokens: state.contextUsed } : {}),
+                    },
+                  });
+                  if (!turnUsages.length) {
+                    const parts: string[] = [];
+                    if (typeof totals.inputTokens === "number") parts.push(`输入 ${formatTokenCount(totals.inputTokens)}`);
+                    if (typeof totals.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(totals.cacheReadTokens)}`);
+                    if (typeof totals.outputTokens === "number") parts.push(`输出 ${formatTokenCount(totals.outputTokens)}`);
+                    if (parts.length) {
+                      emit({
+                        type: "timeline.item",
+                        sessionId: input.sessionId,
+                        item: {
+                          type: "notification",
+                          id: `zcode:${input.sessionId}:usage:cumulative`,
+                          level: "info",
+                          message: `Token 用量（本会话累计）：${parts.join(" · ")}`,
+                        },
+                      });
+                    }
+                  }
+                } catch {
+                  // Totals are a replay nicety; an unavailable API must not fail the reopen.
+                }
+              })();
             }
             emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
             emit({ type: "request.completed", requestId: input.requestId });

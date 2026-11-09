@@ -1,5 +1,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 const ts = require("typescript");
 
@@ -38,6 +40,17 @@ const available = [
 }));
 
 async function fixture(t, options = {}) {
+  // The provider derives its plugin-data directory from PASEO_HOME at connect
+  // time; pin it to a scratch home so usage persistence never touches the
+  // developer's real ~/.paseo.
+  const previousHome = process.env.PASEO_HOME;
+  const paseoHome = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-provider-test-"));
+  process.env.PASEO_HOME = paseoHome;
+  t.after(() => {
+    fs.rmSync(paseoHome, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = previousHome;
+  });
   t.mock.method(console, "log", () => {});
   t.mock.method(protocol, "resolveZcodeCliPath", () => "/mock/zcode.cjs");
   t.mock.method(accounts, "readAccountProviders", () => []);
@@ -580,13 +593,16 @@ test("resuming replays visible ZCode history before session.ready when requested
   });
 
   await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
+  // The replayed history precedes session.ready; the session-total fallback
+  // row arrives asynchronously after it.
+  await flush();
 
   const history = f.events.filter((event) => event.type === "timeline.item");
   assert.deepEqual(history.map((event) => event.item.type), [
-    "user_message", "reasoning", "assistant_message", "tool_call",
+    "user_message", "reasoning", "assistant_message", "tool_call", "notification",
   ]);
   assert.deepEqual(history.map((event) => event.item.id), [
-    "user-1", "reasoning-1", "assistant-1:text:0", "tool-1",
+    "user-1", "reasoning-1", "assistant-1:text:0", "tool-1", "zcode:paseo-session:usage:cumulative",
   ]);
   assert.equal(history[0].item.text, "Question");
   assert.equal(history[2].item.text, "Answer");
@@ -1643,6 +1659,119 @@ test("decode speed aggregates every model request and skips tool-only requests",
     payload: { response: "done", resultType: "success", usage: { outputTokens: 10 } },
   });
   assert.match(f.notifications().at(-1).item.message, /速度 10 tok\/s/);
+});
+
+test("settled turn usage is persisted for replay", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-persist", timestamp: 1_000 });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-persist", timestamp: 1_100, payload: { kind: "text_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-persist", timestamp: 2_100, payload: { kind: "finish" } });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-persist", timestamp: 2_200,
+    payload: {
+      resultType: "success",
+      usage: { inputTokens: 1_200, outputTokens: 100, cacheReadTokens: 45_000 },
+    },
+  });
+
+  const file = path.join(process.env.PASEO_HOME, "plugin-data", "zcode", "turn-usage", `${sessionId}.jsonl`);
+  const entries = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].turnId, "turn-persist");
+  assert.equal(entries[0].inputTokens, 1_200);
+  assert.equal(entries[0].outputTokens, 100);
+  assert.equal(entries[0].cacheReadTokens, 45_000);
+  assert.equal(entries[0].speedTokPerSec, 100);
+
+  // A turn without a decode figure emits no row and persists nothing.
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-no-stream", timestamp: 2_500 });
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-no-stream", timestamp: 3_000,
+    payload: { resultType: "success", usage: { inputTokens: 5, outputTokens: 1 } },
+  });
+  assert.equal(fs.readFileSync(file, "utf8").trim().split("\n").length, 1);
+});
+
+test("replayed sessions rebuild persisted usage rows per turn", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "user", messageId: "user-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p1", text: "First" }],
+      },
+      {
+        info: { role: "assistant", messageId: "assistant-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p2", text: "Answer 1" }],
+      },
+      {
+        info: { role: "user", messageId: "user-2", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p3", text: "Second" }],
+      },
+      {
+        info: { role: "assistant", messageId: "assistant-2", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p4", text: "Answer 2" }],
+      },
+    ],
+  });
+  const usageDir = path.join(process.env.PASEO_HOME, "plugin-data", "zcode", "turn-usage");
+  fs.mkdirSync(usageDir, { recursive: true });
+  fs.writeFileSync(path.join(usageDir, "sess_history.jsonl"), [
+    JSON.stringify({ turnId: "turn-a", recordedAt: 1, inputTokens: 1_000, outputTokens: 40, cacheReadTokens: 300, speedTokPerSec: 20 }),
+    JSON.stringify({ turnId: "turn-b", recordedAt: 2, inputTokens: 2_000, outputTokens: 80, speedTokPerSec: 8.5 }),
+    "",
+  ].join("\n"));
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
+  await flush();
+
+  const rows = f.events.filter((event) => event.type === "timeline.item").map((event) => event.item);
+  assert.deepEqual(rows.map((item) => `${item.type}:${item.id}`), [
+    "user_message:user-1",
+    "assistant_message:assistant-1:text:0",
+    "notification:zcode:paseo-session:usage:turn-a",
+    "user_message:user-2",
+    "assistant_message:assistant-2:text:0",
+    "notification:zcode:paseo-session:usage:turn-b",
+  ]);
+  assert.match(rows[2].message, /Token 用量：输入 1k · 缓存读 300 · 输出 40 · 速度 20 tok\/s/);
+  assert.match(rows.at(-1).message, /Token 用量：输入 2k · 输出 80 · 速度 8\.5 tok\/s/);
+  // Per-turn rows exist, so no cumulative fallback row appears.
+  assert.ok(!f.notifications().some((event) => event.item.id.endsWith(":usage:cumulative")));
+  // Session totals still reach the client as one usage event.
+  const totals = f.events.filter((event) => event.type === "session.usage").at(-1);
+  assert.equal(totals.usage.inputTokens, 1_000);
+  assert.equal(totals.usage.cachedInputTokens, 50);
+  assert.equal(totals.usage.contextWindowMaxTokens, 500_000);
+});
+
+test("replayed sessions without persisted rows fall back to session totals", async (t) => {
+  const f = await fixture(t, {
+    historyMessages: [
+      {
+        info: { role: "user", messageId: "user-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p1", text: "Only" }],
+      },
+      {
+        info: { role: "assistant", messageId: "assistant-1", semantics: { transcriptVisibility: "visible" } },
+        parts: [{ type: "text", partId: "p2", text: "Answer" }],
+      },
+    ],
+  });
+
+  await f.open({}, { version: 1, data: { zcodeSessionId: "sess_totals" } }, "replay");
+  await flush();
+
+  assert.equal(f.calls("session/usage").length, 1);
+  const fallback = f.notifications().find((event) => event.item.id.endsWith(":usage:cumulative"));
+  assert.ok(fallback, "a cumulative usage row was emitted");
+  assert.match(fallback.item.message, /Token 用量（本会话累计）：输入 1k · 缓存读 50 · 输出 234/);
+  const totals = f.events.filter((event) => event.type === "session.usage").at(-1);
+  assert.equal(totals.usage.inputTokens, 1_000);
+  assert.equal(totals.usage.outputTokens, 234);
 });
 
 test("delta-only streams close the decode window at turn completion and tool calls", async (t) => {

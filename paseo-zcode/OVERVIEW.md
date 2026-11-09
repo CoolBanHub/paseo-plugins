@@ -61,7 +61,13 @@ local ZCode sessions are listed in Paseo's session picker.
   requests, the same decode-only definition ZCode's own `tokensPerSecond`
   uses; the app-server forwards only delta frames, so a tool call or the turn
   completion closes each segment, and a turn without content timing omits the
-  notice.
+  notice. Each emitted row is also appended to
+  `~/.paseo/plugin-data/zcode/turn-usage/<zcodeSessionId>.jsonl` (newest 400
+  entries kept), so a reopened session replays the rows with the same ids and
+  placement — before the next visible user message — instead of losing them
+  with the live stream. Sessions predating that log (or without rows) get one
+  `Token 用量（本会话累计）` fallback row plus a `session.usage` event built
+  from ZCode's `session/usage` totals when the session reopens.
 - ZCode's generic `AskUserQuestion` flow uses Paseo's native question form.
   The plugin answers `interaction/requestUserInput` as a `question`
   permission, maps Paseo's form answers back to ZCode's
