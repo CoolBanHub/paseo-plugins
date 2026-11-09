@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { accessSync, constants, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -160,4 +160,34 @@ export function toImageAttachment(bytes: Buffer, mimeType: string): { data: stri
   const MAX_BYTES = 5 * 1024 * 1024;
   if (bytes.length === 0 || bytes.length > MAX_BYTES) return null;
   return { data: bytes.toString("base64"), mimeType };
+}
+
+/** Keep a path segment safe for the on-disk media layout. */
+function safeSegment(value: string): string {
+  const cleaned = value.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return cleaned.slice(0, 80) || "topic";
+}
+
+/**
+ * Persist an ingested image under `<root>/<topicKey>/<messageId>-<n><ext>`
+ * and return the absolute path; failures return null (the base64 attachment
+ * still reaches the provider, only the file copy is skipped).
+ */
+export function persistMediaFile(
+  root: string,
+  topicKey: string,
+  messageId: string,
+  index: number,
+  bytes: Buffer,
+  extension: string,
+): string | null {
+  try {
+    const dir = join(root, safeSegment(topicKey));
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${safeSegment(messageId)}-${index}${extension}`);
+    writeFileSync(path, bytes);
+    return path;
+  } catch {
+    return null;
+  }
 }

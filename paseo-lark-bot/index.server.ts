@@ -87,13 +87,10 @@ async function resolveProviderModel(provider: string, model = ""): Promise<strin
 function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotValues>): Dispatcher {
   paseo = api;
   if (!dispatcher) {
+    const pluginDataRoot = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "plugin-data", "lark-bot");
     dispatcher = createDispatcher({
-      dedupStorePath: join(
-        process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
-        "plugin-data",
-        "lark-bot",
-        "seen-message-ids.json",
-      ),
+      dedupStorePath: join(pluginDataRoot, "seen-message-ids.json"),
+      mediaStoreDir: join(pluginDataRoot, "media"),
       paseo: api,
       readValues,
       resolveProvider: resolveProviderModel,

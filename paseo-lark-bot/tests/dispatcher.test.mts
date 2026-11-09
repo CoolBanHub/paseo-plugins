@@ -4,7 +4,7 @@ import { createDispatcher } from "../server/dispatcher.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
 import type { SessionAgentHandle, SessionPaseoApi } from "../server/sessions.ts";
 import type { BotValues } from "../shared/settings.ts";
-import { rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -639,6 +639,36 @@ describe("p2p and delivery hygiene", () => {
     assert.equal(prompt, "继续", "the agent already has the previous p2p turn");
   });
 
+  it("ingests p2p images and attaches them to the next turn", async () => {
+    const h = makeHarness(p2pValues);
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => p2pValues,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) => (id === "om_pimg" ? { image_key: "img_p2p" } : null),
+      download: async () => ({ bytes: Buffer.from("p2p-image"), extension: ".jpg" }),
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        chat_id: "oc_p2p",
+        chat_type: "p2p",
+        message_id: "om_pimg",
+        message_type: "image",
+        content: "",
+        mentions: [],
+      }),
+    );
+    await dispatch.handleMessageEvent(p2pEvent("om_ptext", "这张图是什么意思"));
+    await flush();
+    assert.equal(h.created.length, 1);
+    const images = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(images?.length, 1, "p2p images must reach the turn");
+    assert.ok((h.created[0].prompt ?? "").includes("【附图】"));
+  });
+
   it("ignores duplicate deliveries of the same message_id", async () => {
     const h = makeHarness();
     const event = groupEvent({ message_id: "om_same" });
@@ -680,7 +710,7 @@ describe("p2p and delivery hygiene", () => {
       readValues: async () => baseValues(),
       resolveCli: () => "/fake/lark-cli",
       readOpenId: async () => BOT,
-      readRaw: async () => ({ image_key: "img_slow" }),
+      readRaw: async (_cli, id) => (id === "om_img" ? { image_key: "img_slow" } : { text: "根消息" }),
       download: async () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         return { bytes: Buffer.from("late-jpeg"), extension: ".jpg" };
@@ -818,5 +848,84 @@ describe("delivery reliability", () => {
     });
     await second.handleMessageEvent(groupEvent({ message_id: "om_dedup_1" }));
     rmSync(store, { force: true });
+  });
+});
+
+describe("thread-root media backfill", () => {
+  it("backfills root images on the first reference and persists them to disk", async () => {
+    const h = makeHarness();
+    const downloads: string[] = [];
+    const mediaDir = mkdtempSync(join(tmpdir(), "lark-bot-media-"));
+    try {
+      const dispatch = createDispatcher({
+        paseo: h.paseoRef,
+        readValues: async () => baseValues({ aiTitle: false }),
+        resolveCli: () => "/fake/lark-cli",
+        readOpenId: async () => BOT,
+        mediaStoreDir: mediaDir,
+        readThreadRootDetail: async (_cli, id) =>
+          id === "om_root"
+            ? { text: "![Image](img_v2_a) 需求草图", senderOpenId: "ou_user", senderName: "张三" }
+            : null,
+        readRaw: async (_cli, id) => (id === "om_root" ? { image_key: "img_v2_a" } : null),
+        download: async ({ fileKey }) => {
+          downloads.push(fileKey);
+          return { bytes: Buffer.from("fake-png"), extension: ".png" };
+        },
+        extractFrames: async () => [],
+        reply: async () => null,
+      });
+      // Only the reply's event arrives: the image-bearing root predates the
+      // bot (restart / pre-binding), so its media must be backfilled.
+      await dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 看图实现" }),
+      );
+      await flush();
+      assert.deepEqual(downloads, ["img_v2_a"], "root images must be backfilled on first reference");
+      assert.equal(h.created.length, 1);
+      const images = (h.created[0] as { images?: unknown[] }).images;
+      assert.equal(images?.length, 1);
+      const saved = join(mediaDir, "om_root", "om_root-1.png");
+      assert.ok(existsSync(saved), "image bytes must be persisted");
+      const prompt = h.created[0].prompt ?? "";
+      assert.ok(prompt.includes("【附图】"), prompt);
+      assert.ok(prompt.includes(saved), "the attachment note quotes the file path");
+      // A later message in the same topic must not download the root again.
+      await dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_reply2", root_id: "om_root", content: "@测试机器人 再看一次" }),
+      );
+      await flush();
+      assert.equal(downloads.length, 1, "backfill is deduped per root message");
+    } finally {
+      rmSync(mediaDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not re-download root images that were ingested live", async () => {
+    const h = makeHarness();
+    const downloads: string[] = [];
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues(),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) => (id === "om_root" ? { image_key: "img_live" } : null),
+      download: async ({ fileKey }) => {
+        downloads.push(fileKey);
+        return { bytes: Buffer.from("live-png"), extension: ".png" };
+      },
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", message_type: "image", content: "", mentions: [] }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_at", root_id: "om_root", content: "@测试机器人 处理" }),
+    );
+    await flush();
+    assert.deepEqual(downloads, ["img_live"], "live ingestion wins; no backfill duplicate");
+    const images = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(images?.length, 1);
   });
 });

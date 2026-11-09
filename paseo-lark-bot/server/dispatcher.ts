@@ -4,6 +4,7 @@ import { readBotOpenId, readMessageDetail, readRawContent, replyMessage, resolve
 import {
   downloadMessageResource,
   extractVideoFrames,
+  persistMediaFile,
   resolveFfmpeg,
   toImageAttachment,
 } from "./media.ts";
@@ -34,6 +35,12 @@ export interface DispatcherOptions {
    * right after a restart does not answer the same message twice.
    */
   dedupStorePath?: string;
+  /**
+   * Directory where ingested topic media is persisted as files. The paths
+   * are quoted in the prompt's attachment note so users (and file-capable
+   * providers) can open the images outside Feishu.
+   */
+  mediaStoreDir?: string;
   paseo: SessionPaseoApi;
   readValues: () => Promise<BotValues>;
   /** Normalizes bare provider ids to provider/model for agents.create(). */
@@ -79,6 +86,11 @@ const MEDIA_LABELS: Record<string, string> = {
   system: "系统消息",
 };
 const UNMATCHED_HINT = "这个会话还没有绑定 provider，请先在 Paseo 的「飞书机器人」设置里配置。";
+
+/** A cached topic image plus its persisted file path, when enabled. */
+interface TopicImage extends SessionImage {
+  file?: string;
+}
 const BLOCKED_HINT = "当前会话仅允许指定成员 @ 我处理，请让指定成员发起请求，或联系会话管理员。";
 const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
@@ -160,7 +172,12 @@ export function createDispatcher(options: DispatcherOptions) {
   /** Last message that actually triggered a bot turn, per topic. */
   const lastTriggerMessage = new Map<string, string>();
   /** Images collected per topic (downloads of image posts + video frames). */
-  const topicImages = new Map<string, SessionImage[]>();
+  const topicImages = new Map<string, TopicImage[]>();
+  /**
+   * Messages whose media was already ingested (live event or root backfill);
+   * guards the backfill from re-downloading on every in-thread message.
+   */
+  const ingestedMessages = new Map<string, true>();
   /**
    * Stable per-sender labels for the transcript: real names when known
    * (thread-root lookups carry them), otherwise 成员A/成员B/… assigned by
@@ -295,11 +312,46 @@ export function createDispatcher(options: DispatcherOptions) {
     for (const item of Object.values(record)) collectImageKeys(item, output, depth + 1);
   }
 
-  function cacheImages(key: string, buffers: { bytes: Buffer; mime: string }[]): void {
+  /**
+   * The attachment note appended to prompts that carry images. Persisted
+   * file paths are quoted so the user can open them in Paseo/Finder and
+   * file-capable providers can read the images directly.
+   */
+  function describeAttachments(images: TopicImage[]): string {
+    if (images.length === 0) return "";
+    const lead = "【附图】本消息附加 " + images.length + " 张图片（含视频关键帧）";
+    const files = images
+      .map((image) => image.file)
+      .filter((file): file is string => Boolean(file));
+    if (files.length === 0) return lead + "，请结合图片内容回答。";
+    return lead + "，已保存到：" + files.join("、") + "，请结合图片内容回答。";
+  }
+
+  function markIngested(messageId: string): void {
+    if (ingestedMessages.has(messageId)) return;
+    ingestedMessages.set(messageId, true);
+    if (ingestedMessages.size > 500) {
+      const oldest = ingestedMessages.keys().next().value;
+      if (oldest) ingestedMessages.delete(oldest);
+    }
+  }
+
+  function cacheImages(key: string, messageId: string, buffers: { bytes: Buffer; mime: string }[]): void {
     const images = topicImages.get(key) ?? [];
-    for (const buffer of buffers) {
+    for (const [index, buffer] of buffers.entries()) {
       const attachment = toImageAttachment(buffer.bytes, buffer.mime);
-      if (attachment) images.push(attachment);
+      if (!attachment) continue;
+      const file = options.mediaStoreDir
+        ? persistMediaFile(
+            options.mediaStoreDir,
+            key,
+            messageId,
+            images.length + index + 1,
+            buffer.bytes,
+            buffer.mime === "image/png" ? ".png" : ".jpg",
+          )
+        : null;
+      images.push(file ? { ...attachment, file } : attachment);
     }
     if (images.length > MAX_TOPIC_IMAGES) images.splice(0, images.length - MAX_TOPIC_IMAGES);
     topicImages.set(key, images);
@@ -313,7 +365,7 @@ export function createDispatcher(options: DispatcherOptions) {
    * degrade to placeholders.
    */
   async function ingestMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
-    if (event.chat_type !== "group") return;
+    markIngested(event.message_id);
     const kind =
       event.message_type === "image" ? "image" : event.message_type === "media" ? "video" : null;
     if (!kind && event.message_type !== "post") return;
@@ -342,7 +394,7 @@ export function createDispatcher(options: DispatcherOptions) {
             type: "image",
             maxBytes: 5 * 1024 * 1024,
           });
-          cacheImages(key, [
+          cacheImages(key, event.message_id, [
             { bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" },
           ]);
           return;
@@ -364,7 +416,7 @@ export function createDispatcher(options: DispatcherOptions) {
           for (const frame of await extractFrames(videoPath, ffmpeg, 3)) {
             buffers.push({ bytes: frame, mime: "image/jpeg" });
           }
-          cacheImages(key, buffers);
+          cacheImages(key, event.message_id, buffers);
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -382,9 +434,48 @@ export function createDispatcher(options: DispatcherOptions) {
         });
         buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
       }
-      cacheImages(key, buffers);
+      cacheImages(key, event.message_id, buffers);
     } catch (error) {
       log("处理话题媒体失败", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * The thread root's images are only cached when the root's own event was
+   * delivered live; a restart, a pre-binding root, or a missed download loses
+   * them. On the first message that references the root, backfill its images
+   * (plain image or post-embedded) so the topic always carries them. The
+   * ingested-messages marker dedupes this against the live path.
+   */
+  async function ensureRootMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
+    if (event.chat_type !== "group") return;
+    const rootId = event.root_id || event.reply_to;
+    if (!rootId || ingestedMessages.has(rootId)) return;
+    markIngested(rootId);
+    try {
+      const raw = await readRaw(cliPath, rootId);
+      if (!raw) return;
+      const keys = new Set<string>();
+      if (typeof raw.image_key === "string" && raw.image_key.startsWith("img_")) {
+        keys.add(raw.image_key);
+      } else {
+        collectImageKeys(raw, keys);
+      }
+      if (keys.size === 0) return;
+      const buffers: { bytes: Buffer; mime: string }[] = [];
+      for (const fileKey of [...keys].slice(0, MAX_IMAGES_PER_TURN)) {
+        const resource = await download({
+          cliPath,
+          messageId: rootId,
+          fileKey,
+          type: "image",
+          maxBytes: 5 * 1024 * 1024,
+        });
+        buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
+      }
+      cacheImages(topicKeyFor(event), rootId, buffers);
+    } catch (error) {
+      log("补拉话题根消息图片失败", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -476,6 +567,7 @@ export function createDispatcher(options: DispatcherOptions) {
       }
       recordHistory(event);
       await ingestMedia(cliPath, event);
+      await ensureRootMedia(cliPath, event);
       if (!allowed) return;
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;
@@ -505,9 +597,10 @@ export function createDispatcher(options: DispatcherOptions) {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
       const { text: prompt, topicRootText } = await withThreadContext(cliPath, event, instruction);
+      const attachmentsNote = describeAttachments(images);
       const finalPrompt =
         images.length > 0
-          ? prompt + "\n\n【附图】本消息附加 " + images.length + " 张图片（含视频关键帧），请结合图片内容回答。"
+          ? prompt + "\n\n" + attachmentsNote
           : prompt;
       if (
         sessions.enqueue(
