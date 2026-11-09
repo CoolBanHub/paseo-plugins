@@ -673,7 +673,7 @@ describe("session titles", () => {
     h.finishRun({ status: "idle", error: null, lastMessage: "“分析图片内容”" });
     await flush();
     assert.equal(h.created.length, 2);
-    assert.equal(h.created[1].title, "飞书 · 测试群 · 分析图片内容");
+    assert.equal(h.created[1].title, "飞书 · 分析图片内容");
     assert.equal(h.created[1].prompt, "【话题主题】看图\n\n【本次消息】帮我分析");
   });
 
@@ -692,7 +692,7 @@ describe("session titles", () => {
     h.finishRun({ status: "error", error: "provider down", lastMessage: null });
     await flush();
     assert.equal(h.created.length, 2);
-    assert.equal(h.created[1].title, "飞书 · 测试群 · [图片]");
+    assert.equal(h.created[1].title, "飞书 · [图片]");
   });
 
   it("skips the naming turn and clips the instruction when disabled", async () => {
@@ -701,10 +701,10 @@ describe("session titles", () => {
     await flush();
     assert.equal(h.created.length, 1);
     assert.equal(h.runCalls.length, 0);
-    assert.equal(h.created[0].title, "飞书 · 测试群 · 帮我修这个 bug");
+    assert.equal(h.created[0].title, "飞书 · 帮我修这个 bug");
   });
 
-  it("clips a long chat name in the prefix so the task description survives", async () => {
+  it("leaves the chat name out of the title so the task description gets full width", async () => {
     const h = makeHarness({ aiTitle: true });
     const longNameBinding: ChatBinding = { ...binding, chatName: "电竞需求对接专用讨论群" };
     h.registry.enqueue(
@@ -717,11 +717,10 @@ describe("session titles", () => {
       "算账",
     );
     await flush();
-    // A descriptive title from the naming turn stays intact after the prefix.
     h.finishRun({ status: "idle", error: null, lastMessage: "计算 1-100 求和并输出汇总" });
     await flush();
     assert.equal(h.created.length, 2);
-    assert.equal(h.created[1].title, "飞书 · 电竞需求对接专用讨… · 计算 1-100 求和并输出汇总");
+    assert.equal(h.created[1].title, "飞书 · 计算 1-100 求和并输出汇总");
   });
 });
 
@@ -737,7 +736,7 @@ describe("shared workspace", () => {
     // The agent goes through the workspace handle; no standalone create.
     assert.equal(h.wsAgentCreates.length, 1);
     assert.equal(h.wsAgentCreates[0].prompt, "第一条");
-    assert.equal(h.wsAgentCreates[0].title, "飞书 · 测试群 · 第一条");
+    assert.equal(h.wsAgentCreates[0].title, "飞书 · 第一条");
     assert.deepEqual(h.wsAgentCreates[0].labels, { "lark-bot-chat": "oc_group", "lark-bot-topic": "om_1" });
     assert.equal(h.created.length, 0);
   });

@@ -283,12 +283,6 @@ const MAX_TOPICS = 500;
  * clip so both paths leave the task description readable after the prefix.
  */
 const TITLE_FALLBACK_SNIPPET = 60;
-/**
- * Chat-name clip inside the "飞书 · <chat> · " prefix. Workspace tabs cut the
- * title at a fixed width; without this cap a long group name alone fills it
- * and the task description never shows.
- */
-const TITLE_CHAT_NAME_CHARS = 10;
 
 export interface SessionCallbacks {
   /**
@@ -858,9 +852,8 @@ export function createSessionRegistry(options: {
 
   /**
    * Prefer an AI one-line title; anything less becomes the sanitized text.
-   * The "飞书 · <chat> · " prefix keeps sessions attributable to their group,
-   * with the chat name clipped so the task description after it survives the
-   * workspace tab's width cut.
+   * The fixed "飞书 · " prefix marks the session's origin; the group name is
+   * deliberately left out so the task description gets the tab's full width.
    */
   async function resolveTitle(
     topicKey: string,
@@ -868,11 +861,7 @@ export function createSessionRegistry(options: {
     provider: string,
   ): Promise<string> {
     const state = stateFor(topicKey, "");
-    const chatName = sanitizeTopicText(
-      item.binding.chatName || state.chatId,
-      TITLE_CHAT_NAME_CHARS,
-    );
-    const prefix = `飞书 · ${chatName} · `;
+    const prefix = "飞书 · ";
     if (getAiTitle()) {
       const generated = await generateTopicTitle({
         paseo: options.paseo,
