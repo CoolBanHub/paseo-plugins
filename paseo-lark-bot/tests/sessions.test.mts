@@ -703,6 +703,26 @@ describe("session titles", () => {
     assert.equal(h.runCalls.length, 0);
     assert.equal(h.created[0].title, "飞书 · 测试群 · 帮我修这个 bug");
   });
+
+  it("clips a long chat name in the prefix so the task description survives", async () => {
+    const h = makeHarness({ aiTitle: true });
+    const longNameBinding: ChatBinding = { ...binding, chatName: "电竞需求对接专用讨论群" };
+    h.registry.enqueue(
+      "om_1",
+      "oc_group",
+      "om_1",
+      "【话题主题】算账\n\n【本次消息】计算 1-100 求和",
+      longNameBinding,
+      undefined,
+      "算账",
+    );
+    await flush();
+    // A descriptive title from the naming turn stays intact after the prefix.
+    h.finishRun({ status: "idle", error: null, lastMessage: "计算 1-100 求和并输出汇总" });
+    await flush();
+    assert.equal(h.created.length, 2);
+    assert.equal(h.created[1].title, "飞书 · 电竞需求对接专用讨… · 计算 1-100 求和并输出汇总");
+  });
 });
 
 describe("shared workspace", () => {

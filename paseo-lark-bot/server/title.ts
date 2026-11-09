@@ -3,7 +3,14 @@ import { sanitizeTopicText } from "./format.ts";
 
 /** Hard stop for the one-shot naming turn; the caller falls back on timeout. */
 const TITLE_TIMEOUT_MS = 45_000;
-const TITLE_MAX_CHARS = 40;
+/** Upper bound asked from the naming model in the prompt below. */
+const TITLE_TARGET_CHARS = 40;
+/**
+ * Hard clip for the AI title itself. The session title prepends the
+ * "飞书 · <chat> · " prefix and workspace tabs cut whatever overflows their
+ * width, so the description must stay meaningful but compact.
+ */
+const TITLE_MAX_CHARS = 60;
 
 /**
  * One-shot agent turn that names a Feishu topic session. It runs on the
@@ -32,7 +39,8 @@ export async function generateTopicTitle(options: {
   const prompt =
     "以下是一轮飞书对话的素材，请为对应的智能体会话起一个标题。\n\n" +
     parts.join("\n") +
-    "\n\n要求：不超过 20 个字；概括用户想让智能体做什么；直接输出标题文字本身，不要引号、序号或任何解释；不要使用任何工具。";
+    `\n\n要求：不超过 ${TITLE_TARGET_CHARS} 个字；标题要直接描述用户想让智能体完成的具体任务（做什么、对象是什么），保留请求中的关键名词与数字，` +
+    "让只看到标题的人也能明白这轮任务；不要用「计算」「处理」「任务」这类空泛词单独成题；直接输出标题文字本身，不要引号、序号或任何解释；不要使用任何工具。";
   try {
     const handle = await options.paseo.agents.create({
       config: { provider: options.provider },
