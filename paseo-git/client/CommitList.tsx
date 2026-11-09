@@ -200,73 +200,159 @@ export function buildRefBadges(refs: readonly string[]): { isHead: boolean; bran
   return { isHead, branches: badges, tags };
 }
 
+// Inline chip budget: extra branches/tags collapse into a "+N" chip and the
+// full list moves to the hover popover, so multi-ref commits stop crowding
+// the commit message.
+const MAX_BRANCH_CHIPS = 2;
+const MAX_TAG_CHIPS = 1;
+
 function RefBadges({ refs, theme }: { refs: string[]; theme: PanelTheme }) {
   const { isHead, branches, tags } = useMemo(() => buildRefBadges(refs), [refs]);
-  const chips = branches.slice(0, 3);
-  if (!isHead && chips.length === 0 && tags.length === 0) return null;
+  const [hovered, setHovered] = useState(false);
+  if (!isHead && branches.length === 0 && tags.length === 0) return null;
+  const visibleBranches = branches.slice(0, MAX_BRANCH_CHIPS);
+  const visibleTags = tags.slice(0, MAX_TAG_CHIPS);
+  const overflowCount = branches.length - visibleBranches.length + (tags.length - visibleTags.length);
+  const chipDots = (kind: RefBadge["kind"], size: number) => (
+    <>
+      {kind !== "remote" ? <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: REF_COLORS.local }} /> : null}
+      {kind !== "local" ? <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: REF_COLORS.remote }} /> : null}
+    </>
+  );
   return (
-    <View style={{ flexDirection: "row", gap: 3, flexShrink: 1, minWidth: 0, alignItems: "center" }}>
-      {isHead ? (
+    <HoverPressable
+      accessibilityLabel={`此提交的引用：${[...(isHead ? ["HEAD"] : []), ...branches.map((badge) => badge.label), ...tags].join("、")}`}
+      onHoverIn={() => setHovered(true)}
+      onHoverOut={() => setHovered(false)}
+      style={() => ({
+        position: "relative",
+        flexDirection: "row",
+        gap: 3,
+        flexShrink: 1,
+        minWidth: 0,
+        alignItems: "center",
+      })}
+    >
+      <View style={{ flexDirection: "row", gap: 3, flexShrink: 1, minWidth: 0, alignItems: "center", overflow: "hidden" }}>
+        {isHead ? (
+          <View
+            style={{
+              borderRadius: 4,
+              backgroundColor: mixWithBackground(REF_COLORS.head, theme.colors.surface0, 0.78),
+              paddingHorizontal: 4,
+              justifyContent: "center",
+            }}
+          >
+            <Text style={{ color: REF_COLORS.head, fontSize: 9, fontFamily: MONO_FONT, fontWeight: "700" }}>HEAD</Text>
+          </View>
+        ) : null}
+        {visibleBranches.map((chip) => (
+          <View
+            key={chip.label}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 3,
+              borderRadius: 4,
+              backgroundColor: mixWithBackground(
+                chip.kind === "remote" ? REF_COLORS.remote : REF_COLORS.local,
+                theme.colors.surface0,
+                0.82,
+              ),
+              paddingHorizontal: 4,
+              paddingVertical: 0.5,
+              justifyContent: "center",
+              maxWidth: 110,
+            }}
+          >
+            {chipDots(chip.kind, 5)}
+            <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 9, fontFamily: MONO_FONT }}>
+              {chip.label}
+            </Text>
+          </View>
+        ))}
+        {visibleTags.map((tag) => (
+          <View
+            key={tag}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 3,
+              borderRadius: 4,
+              backgroundColor: mixWithBackground(REF_COLORS.tag, theme.colors.surface0, 0.82),
+              paddingHorizontal: 4,
+              paddingVertical: 0.5,
+              maxWidth: 110,
+            }}
+          >
+            <Icon name="Tag" size={8} color={REF_COLORS.tag} />
+            <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 9, fontFamily: MONO_FONT }}>
+              {tag}
+            </Text>
+          </View>
+        ))}
+        {overflowCount > 0 ? (
+          <View
+            style={{
+              borderRadius: 4,
+              backgroundColor: theme.colors.surface2,
+              paddingHorizontal: 4,
+              paddingVertical: 0.5,
+              justifyContent: "center",
+            }}
+          >
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 9, fontFamily: MONO_FONT, fontWeight: "700" }}>
+              +{overflowCount}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+      {hovered ? (
         <View
           style={{
-            borderRadius: 4,
-            backgroundColor: mixWithBackground(REF_COLORS.head, theme.colors.surface0, 0.78),
-            paddingHorizontal: 4,
-            justifyContent: "center",
+            position: "absolute",
+            left: -2,
+            top: "100%",
+            marginTop: 6,
+            zIndex: 50,
+            minWidth: 150,
+            maxWidth: 340,
+            borderRadius: 8,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            backgroundColor: theme.colors.surface2,
+            paddingHorizontal: 9,
+            paddingVertical: 6,
+            gap: 5,
+            shadowColor: "#000000",
+            shadowOpacity: 0.28,
+            shadowRadius: 10,
+            shadowOffset: { width: 0, height: 4 },
           }}
         >
-          <Text style={{ color: REF_COLORS.head, fontSize: 9, fontFamily: MONO_FONT, fontWeight: "700" }}>HEAD</Text>
+          {isHead ? (
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <View style={{ width: 7, height: 7, borderRadius: 2, backgroundColor: REF_COLORS.head }} />
+              <Text style={{ color: theme.colors.foreground, fontSize: 10.5, fontFamily: MONO_FONT, fontWeight: "700" }}>
+                HEAD
+              </Text>
+            </View>
+          ) : null}
+          {branches.map((badge) => (
+            <View key={badge.label} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>{chipDots(badge.kind, 7)}</View>
+              <Text style={{ color: theme.colors.foreground, fontSize: 10.5, fontFamily: MONO_FONT }}>{badge.label}</Text>
+            </View>
+          ))}
+          {tags.map((tag) => (
+            <View key={tag} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Icon name="Tag" size={9} color={REF_COLORS.tag} />
+              <Text style={{ color: theme.colors.foreground, fontSize: 10.5, fontFamily: MONO_FONT }}>{tag}</Text>
+            </View>
+          ))}
         </View>
       ) : null}
-      {chips.map((chip) => (
-        <View
-          key={chip.label}
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            gap: 3,
-            borderRadius: 4,
-            backgroundColor: mixWithBackground(
-              chip.kind === "remote" ? REF_COLORS.remote : REF_COLORS.local,
-              theme.colors.surface0,
-              0.82,
-            ),
-            paddingHorizontal: 4,
-            paddingVertical: 0.5,
-            justifyContent: "center",
-            maxWidth: 130,
-          }}
-        >
-          <View style={{ width: 5, height: 5, borderRadius: 2.5, backgroundColor: REF_COLORS.local }} />
-          {chip.kind !== "local" ? (
-            <View style={{ width: 5, height: 5, borderRadius: 2.5, backgroundColor: REF_COLORS.remote }} />
-          ) : null}
-          <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 9, fontFamily: MONO_FONT }}>
-            {chip.label}
-          </Text>
-        </View>
-      ))}
-      {tags.slice(0, 2).map((tag) => (
-        <View
-          key={tag}
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            gap: 3,
-            borderRadius: 4,
-            backgroundColor: mixWithBackground(REF_COLORS.tag, theme.colors.surface0, 0.82),
-            paddingHorizontal: 4,
-            paddingVertical: 0.5,
-            maxWidth: 110,
-          }}
-        >
-          <Icon name="Tag" size={8} color={REF_COLORS.tag} />
-          <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 9, fontFamily: MONO_FONT }}>
-            {tag}
-          </Text>
-        </View>
-      ))}
-    </View>
+    </HoverPressable>
   );
 }
 
