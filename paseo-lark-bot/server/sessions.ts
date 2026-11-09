@@ -7,6 +7,7 @@ import {
 } from "../shared/settings.ts";
 import { sanitizeTopicText } from "./format.ts";
 import { generateTopicTitle } from "./title.ts";
+import { ensureSharedWorkspace } from "./workspace.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
 function resolveCwd(cwd: string): string {
@@ -108,9 +109,45 @@ export interface SessionPaseoApi {
     }): Promise<SessionAgentHandle>;
     ref(id: string): SessionAgentHandle & { timeline?: SessionTimelineHandle };
   };
+  /**
+   * Optional slice for placing topic agents in one shared workspace. Agents
+   * created through a workspace handle inherit the workspace directory as
+   * their cwd. Absent on older daemons (and plain test fakes): the registry
+   * then falls back to a plain agents.create() with the binding cwd.
+   */
+  workspaces?: {
+    list(): Promise<{
+      entries?: { id: string; name?: string | null; title?: string | null }[];
+    }>;
+    ref(id: string): SessionWorkspaceHandle;
+    create(options: {
+      title?: string;
+      source: { kind: "directory"; path: string };
+    }): Promise<SessionWorkspaceHandle>;
+  };
   /** Optional slice used to normalize bare provider ids to provider/model. */
   providers?: {
     waitForReady(options?: { timeoutMs?: number }): Promise<SessionProviderSnapshot>;
+  };
+}
+
+/** Minimal workspace slice: create agents inside an existing workspace. */
+export interface SessionWorkspaceHandle {
+  readonly id: string;
+  agents: {
+    create(options: {
+      config: {
+        provider: string;
+        systemPrompt?: string;
+        modeId?: string;
+        thinkingOptionId?: string;
+        featureValues?: Record<string, unknown>;
+      };
+      title?: string;
+      labels?: Record<string, string>;
+      prompt?: string;
+      images?: SessionImage[];
+    }): Promise<SessionAgentHandle>;
   };
 }
 
@@ -241,6 +278,21 @@ export function createSessionRegistry(options: {
   const now = options.now ?? Date.now;
   const turnFallbackMs = options.turnFallbackMs ?? DEFAULT_TURN_FALLBACK_MS;
   const getAiTitle = options.getAiTitle ?? (() => true);
+  // Cached shared workspace handle; null (unavailable) is retried on the
+  // next ensureAgent so a recovered daemon heals the shared-workspace path.
+  let sharedWorkspace: SessionWorkspaceHandle | null = null;
+
+  function workspaceForAgent(item: QueueItem): Promise<SessionWorkspaceHandle | null> {
+    if (sharedWorkspace) return Promise.resolve(sharedWorkspace);
+    return ensureSharedWorkspace({
+      paseo: options.paseo,
+      directory: resolveCwd(item.binding.cwd),
+      log: options.callbacks.log,
+    }).then((workspace) => {
+      sharedWorkspace = workspace;
+      return workspace;
+    });
+  }
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
   /** turn_ended can arrive before agents.create() resolves and maps the id. */
@@ -493,14 +545,21 @@ export function createSessionRegistry(options: {
 
     if (state.agentId) agentToTopic.delete(state.agentId);
     const provider = await resolveProvider(item.binding.provider, item.binding.model);
-    const handle = await options.paseo.agents.create({
+    // Topic agents share one "飞书任务" workspace when the daemon supports
+    // it; the agent cwd then comes from the workspace directory. Without the
+    // workspaces slice (older daemon / failure), fall back to a standalone
+    // agents.create() with the binding cwd.
+    const workspace = await workspaceForAgent(item);
+    const agentOptions = {
       config: providerCreateConfig(provider, item.binding),
-      cwd: resolveCwd(item.binding.cwd),
       title: await resolveTitle(topicKey, item, provider),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
       images: item.images,
-    });
+    };
+    const handle = workspace
+      ? await workspace.agents.create(agentOptions)
+      : await options.paseo.agents.create({ ...agentOptions, cwd: resolveCwd(item.binding.cwd) });
     state.agentId = handle.id;
     state.handle = handle;
     return { handle, created: true };

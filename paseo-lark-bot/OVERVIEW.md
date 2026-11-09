@@ -81,6 +81,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - 话题历史中不同发送者用稳定标签区分（能从话题根消息拿到真名时用真名，否则按出场顺序记为 成员A/成员B/…，机器人固定为「机器人」）；图片、视频、文件、语音等非文本消息以 `[图片]`、`[视频]` 等占位记入历史。
 - **图片与视频会传给智能体**：话题内出现的图片（包括 post 内嵌图片）自动下载缓存；视频用 ffmpeg 在整段视频上均匀抽 3 帧（有 ffprobe 时按 15%/50%/85%  seek，缩至 640px 宽），下次 @ 机器人时随消息附加（每次最多 4 张、每话题缓存 8 张，超过丢最老），prompt 末尾附「【附图】」说明。图片下载上限 5MB、视频 50MB；需要本机可访问 `/opt/homebrew/bin/ffmpeg` 或 `/usr/local/bin/ffmpeg`（无则视频退化为占位）。能否真正识图取决于所选 provider 的视觉能力，请以实际 provider 为准。
 - 创建的智能体会话标题为「飞书 · 会话名 · 标题」，带 `lark-bot-chat` / `lark-bot-topic` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。标题默认由 **AI 生成**（`aiTitle`）：创建会话前先跑一个一次性的命名轮次（用该会话绑定的 provider/model，带 `lark-bot-purpose: title` 标签、`autoArchive`、后台运行，不进入交互工作区），生成一句不超过 20 字的摘要作为标题；失败、超时（45 秒）或关闭该设置时，回退为清洗后的话题根文本（截 40 字）。注意：在 Paseo 里手动给该 agent 发消息产生的轮次也可能被当作插件轮次回复到飞书；建议在独立话题/会话中使用。
+- **所有话题 agent 统一放在一个共享 workspace「飞书任务」里**：按名字在 `workspaces.list` 中查找，没有则用当时绑定的 `cwd` 创建（避免每个话题各占一个 workspace 淹没侧边栏）。进入该 workspace 后，agent 的工作目录固定为 workspace 目录；守护进程不支持 workspaces API 或创建失败时，自动回退为「每话题独立 workspace」的旧行为并写日志。旧版本留下的散落 workspace 不会被自动清理，可在 Paseo 中手动归档。
 
 ## 开发与验证
 
@@ -109,6 +110,7 @@ npm run typecheck
 - 视频抽帧依赖 ffmpeg/ffprobe；没有时退化为占位。图片/视频大小超过上限会跳过。
 - 机器人自己发起的回复不会触发其他会话轮次，但若 post 回复中 @ 了其他机器人，对方 agent 的响应由对方的接入方处理；双向接力可能形成循环。
 - 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）；一次性命名会话带 `lark-bot-purpose: title` 标签，lark-notify 会自动跳过它们的通知。
+- 共享 workspace 的目录取**首次创建时**绑定的 `cwd`：之后再修改绑定 `cwd`、或存在多个不同 `cwd` 的绑定，都不会产生新的「飞书任务」workspace——所有话题 agent 仍落在第一个 workspace（工作目录以它为准）。如需换目录，可归档旧 workspace 后让插件重建。
 - 仅支持飞书中国区（`open.feishu.cn`、`--brand feishu`），不计划支持国际版 Lark。
 - daemon 重启后的缓冲上限为 50 条；超过上限或缓冲期间插件始终未拿到 PaseoApi 时，旧消息会丢失。
 

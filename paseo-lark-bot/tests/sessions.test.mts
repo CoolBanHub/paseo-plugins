@@ -33,10 +33,26 @@ interface Harness {
       featureValues?: Record<string, unknown>;
     };
   }[];
+  /** agents created through the shared-workspace handle (no cwd field). */
+  wsAgentCreates: {
+    prompt?: string;
+    title?: string;
+    labels?: Record<string, string>;
+    provider: string;
+  }[];
+  /** workspaces.create requests issued by ensureSharedWorkspace. */
+  wsCreated: { title?: string; source: { kind: string; path: string } }[];
+  /** workspace ids handed back via workspaces.ref(). */
+  wsRefs: string[];
   runCalls: { agentId: string; text: string }[];
   agentCounter: number;
   currentAgent: () => SessionAgentHandle;
   finishRun: (result: SessionRunResult) => void;
+}
+
+interface WorkspacesFakeOptions {
+  entries: { id: string; name?: string | null; title?: string | null }[];
+  failCreate?: boolean;
 }
 
 const binding: ChatBinding = {
@@ -52,19 +68,58 @@ const binding: ChatBinding = {
   replyFormat: "markdown",
 };
 
-function makeHarness(options?: { idleMinutes?: number; aiTitle?: boolean }): Harness {
+function makeHarness(
+  options?: { idleMinutes?: number; aiTitle?: boolean; workspaces?: WorkspacesFakeOptions },
+): Harness {
   const replies: ReplyCall[] = [];
   const notices: Harness["notices"] = [];
   const created: Harness["created"] = [];
+  const wsAgentCreates: Harness["wsAgentCreates"] = [];
+  const wsCreated: Harness["wsCreated"] = [];
+  const wsRefs: string[] = [];
   const runCalls: Harness["runCalls"] = [];
   let agentCounter = 0;
   let current: SessionAgentHandle | null = null;
   let pendingRun: ((result: SessionRunResult) => void) | null = null;
 
+  const spawnAgent = (): SessionAgentHandle => {
+    agentCounter += 1;
+    current = {
+      id: `agent-${agentCounter}`,
+      send: async () => {},
+      run: (text) => {
+        runCalls.push({ agentId: current!.id, text });
+        return new Promise<SessionRunResult>((resolve) => {
+          pendingRun = resolve;
+        });
+      },
+    };
+    return current;
+  };
+
+  const workspaceHandle = (id: string) => ({
+    id,
+    agents: {
+      create: async (request: {
+        prompt?: string;
+        title?: string;
+        labels?: Record<string, string>;
+        config: { provider: string };
+      }) => {
+        wsAgentCreates.push({
+          prompt: request.prompt,
+          title: request.title,
+          labels: request.labels,
+          provider: request.config.provider,
+        });
+        return spawnAgent();
+      },
+    },
+  });
+
   const paseo: SessionPaseoApi = {
     agents: {
       create: async (request) => {
-        agentCounter += 1;
         created.push({
           prompt: request.prompt,
           title: request.title,
@@ -75,17 +130,7 @@ function makeHarness(options?: { idleMinutes?: number; aiTitle?: boolean }): Har
           cwd: request.cwd,
           config: request.config,
         });
-        current = {
-          id: `agent-${agentCounter}`,
-          send: async () => {},
-          run: (text) => {
-            runCalls.push({ agentId: current!.id, text });
-            return new Promise<SessionRunResult>((resolve) => {
-              pendingRun = resolve;
-            });
-          },
-        };
-        return current;
+        return spawnAgent();
       },
       ref: (id) => {
         if (!current || current.id !== id) throw new Error("unexpected ref " + id);
@@ -95,7 +140,24 @@ function makeHarness(options?: { idleMinutes?: number; aiTitle?: boolean }): Har
   };
 
   const registry = createSessionRegistry({
-    paseo,
+    paseo: options?.workspaces
+      ? {
+          ...paseo,
+          workspaces: {
+            list: async () => ({ entries: options.workspaces!.entries }),
+            ref: (id: string) => {
+              wsRefs.push(id);
+              return workspaceHandle(id);
+            },
+            create: async (request: { title?: string; source: { kind: string; path: string } }) => {
+              if (options.workspaces!.failCreate) throw new Error("workspace create failed");
+              wsCreated.push(request);
+              options.workspaces!.entries.push({ id: "ws-new", title: request.title ?? null });
+              return workspaceHandle("ws-new");
+            },
+          },
+        }
+      : paseo,
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
     callbacks: {
@@ -109,6 +171,9 @@ function makeHarness(options?: { idleMinutes?: number; aiTitle?: boolean }): Har
     replies,
     notices,
     created,
+    wsAgentCreates,
+    wsCreated,
+    wsRefs,
     runCalls,
     agentCounter,
     currentAgent: () => {
@@ -625,5 +690,66 @@ describe("session titles", () => {
     assert.equal(h.created.length, 1);
     assert.equal(h.runCalls.length, 0);
     assert.equal(h.created[0].title, "飞书 · 测试群 · 帮我修这个 bug");
+  });
+});
+
+describe("shared workspace", () => {
+  it("creates the shared 飞书任务 workspace and places topic agents inside it", async () => {
+    const h = makeHarness({ workspaces: { entries: [] } });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    // The workspace is created once with the binding cwd as its directory.
+    assert.equal(h.wsCreated.length, 1);
+    assert.equal(h.wsCreated[0].title, "飞书任务");
+    assert.deepEqual(h.wsCreated[0].source, { kind: "directory", path: "/tmp/project" });
+    // The agent goes through the workspace handle; no standalone create.
+    assert.equal(h.wsAgentCreates.length, 1);
+    assert.equal(h.wsAgentCreates[0].prompt, "第一条");
+    assert.equal(h.wsAgentCreates[0].title, "飞书 · 测试群 · 第一条");
+    assert.deepEqual(h.wsAgentCreates[0].labels, { "lark-bot-chat": "oc_group", "lark-bot-topic": "om_1" });
+    assert.equal(h.created.length, 0);
+  });
+
+  it("reuses the shared workspace for a second topic", async () => {
+    const h = makeHarness({ workspaces: { entries: [] } });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    h.registry.handleTurnEnded("agent-1", completed("第一轮答复"));
+    await flush();
+    h.registry.enqueue("om_2", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    assert.equal(h.wsCreated.length, 1, "workspace must be created exactly once");
+    assert.equal(h.wsAgentCreates.length, 2);
+    assert.deepEqual(h.wsAgentCreates[1].labels, { "lark-bot-chat": "oc_group", "lark-bot-topic": "om_2" });
+  });
+
+  it("reuses an existing same-named workspace instead of creating one", async () => {
+    const byTitle = makeHarness({
+      workspaces: { entries: [{ id: "ws-existing", name: "别的目录", title: "飞书任务" }] },
+    });
+    byTitle.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(byTitle.wsCreated.length, 0);
+    assert.deepEqual(byTitle.wsRefs, ["ws-existing"]);
+    assert.equal(byTitle.wsAgentCreates.length, 1);
+
+    const byName = makeHarness({
+      workspaces: { entries: [{ id: "ws-named", name: "飞书任务", title: null }] },
+    });
+    byName.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(byName.wsCreated.length, 0);
+    assert.deepEqual(byName.wsRefs, ["ws-named"]);
+    assert.equal(byName.wsAgentCreates.length, 1);
+  });
+
+  it("falls back to a standalone agents.create when the workspace create fails", async () => {
+    const h = makeHarness({ workspaces: { entries: [], failCreate: true } });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(h.wsAgentCreates.length, 0);
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].cwd, "/tmp/project");
+    assert.equal(h.created[0].prompt, "第一条");
   });
 });
