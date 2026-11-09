@@ -17,6 +17,40 @@ const MAX_SEEN = 500;
 const MAX_AGENTS = 500;
 const RETRY_DELAY_MS = 3_000;
 
+/** Helper sessions carry this label; their lifecycle stays silent. */
+const HELPER_PURPOSE_LABEL = "lark-bot-purpose";
+const HELPER_PURPOSE_VALUE = "title";
+
+/**
+ * Minimal PaseoApi slice for label lookups; supplied per event by the host
+ * wiring so tests can inject fakes.
+ */
+export interface NotifyPaseoApi {
+  agents: {
+    ref(agentId: string): {
+      refresh(): Promise<{ agent: { labels?: Record<string, string> } | null } | null>;
+    };
+  };
+}
+
+/**
+ * True for one-shot helper sessions (e.g. lark-bot's topic-naming agents):
+ * their turns would only produce noise. Lookup failures fail open — the
+ * notification still goes out.
+ */
+async function isHelperSession(
+  paseo: NotifyPaseoApi | undefined,
+  agentId: string,
+): Promise<boolean> {
+  if (!paseo) return false;
+  try {
+    const result = await paseo.agents.ref(agentId).refresh();
+    return result?.agent?.labels?.[HELPER_PURPOSE_LABEL] === HELPER_PURPOSE_VALUE;
+  } catch {
+    return false;
+  }
+}
+
 interface AgentState {
   turns: number;
   /** When the last turn-end notification was actually delivered. */
@@ -194,7 +228,8 @@ export function createNotifier(options: NotifierOptions) {
     state.flushTimer.unref?.();
   };
 
-  async function handleTurnEnded(event: TurnEndedEvent): Promise<void> {
+  async function handleTurnEnded(event: TurnEndedEvent, paseo?: NotifyPaseoApi): Promise<void> {
+    if (await isHelperSession(paseo, event.agent.id)) return;
     const state = ensureAgent(event.agent.id);
     state.turns += 1;
     const summary = summarizeTimeline(event.timeline);
@@ -236,8 +271,9 @@ export function createNotifier(options: NotifierOptions) {
     }
   }
 
-  async function handlePermission(event: PermissionEvent): Promise<void> {
+  async function handlePermission(event: PermissionEvent, paseo?: NotifyPaseoApi): Promise<void> {
     try {
+      if (await isHelperSession(paseo, event.agent.id)) return;
       const values = await options.readValues();
       if (!values.notifyPermission) return;
       if (seenPermissions.has(event.request.id)) return;

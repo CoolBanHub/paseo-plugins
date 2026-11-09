@@ -15,7 +15,7 @@ import {
   summarizeTimeline,
 } from "../server/format.ts";
 import { resolveLarkCli } from "../server/lark.ts";
-import { createNotifier } from "../server/notifier.ts";
+import { createNotifier, type NotifyPaseoApi } from "../server/notifier.ts";
 import { DEFAULT_NOTIFY_VALUES } from "../server/settings.ts";
 
 const agent = {
@@ -241,6 +241,37 @@ test("honours the turn-completion notification toggle", async () => {
   const { notifier, sent } = fixture({ notifySessionEnd: false });
   await notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never);
   assert.equal(sent.length, 0);
+});
+
+test("skips one-shot lark-bot title sessions and fails open on lookup errors", async () => {
+  const paseoWith = (labels: Record<string, string> | null, fail = false): NotifyPaseoApi => ({
+    agents: {
+      ref: () => ({
+        refresh: async () => {
+          if (fail) throw new Error("daemon gone");
+          return labels === null ? null : { agent: { labels } };
+        },
+      }),
+    },
+  });
+
+  // A titled helper session notifies for neither turn ends nor permissions.
+  const helper = fixture();
+  const helperPaseo = paseoWith({ "lark-bot-purpose": "title" });
+  helper.notifier.handleCreated({ agent } as never);
+  await helper.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, helperPaseo);
+  await helper.notifier.handlePermission({ agent, request } as never, helperPaseo);
+  assert.equal(helper.sent.length, 0);
+
+  // A refresh failure must not swallow real notifications.
+  const failing = fixture();
+  await failing.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, paseoWith(null, true));
+  assert.equal(failing.sent.length, 1);
+
+  // Sessions without the label keep notifying.
+  const normal = fixture();
+  await normal.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, paseoWith({}));
+  assert.equal(normal.sent.length, 1);
 });
 
 test("resolves the recipient from lark-cli when openId is empty", async () => {
