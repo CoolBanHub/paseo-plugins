@@ -206,7 +206,16 @@ export function buildRefBadges(refs: readonly string[]): { isHead: boolean; bran
 const MAX_BRANCH_CHIPS = 2;
 const MAX_TAG_CHIPS = 1;
 
-function RefBadges({ refs, theme }: { refs: string[]; theme: PanelTheme }) {
+function RefBadges({
+  refs,
+  theme,
+  onPopoverChange,
+}: {
+  refs: string[];
+  theme: PanelTheme;
+  /** Notifies the owning row so it can raise its zIndex while the popover is open. */
+  onPopoverChange?: (open: boolean) => void;
+}) {
   const { isHead, branches, tags } = useMemo(() => buildRefBadges(refs), [refs]);
   const [hovered, setHovered] = useState(false);
   if (!isHead && branches.length === 0 && tags.length === 0) return null;
@@ -222,8 +231,14 @@ function RefBadges({ refs, theme }: { refs: string[]; theme: PanelTheme }) {
   return (
     <HoverPressable
       accessibilityLabel={`此提交的引用：${[...(isHead ? ["HEAD"] : []), ...branches.map((badge) => badge.label), ...tags].join("、")}`}
-      onHoverIn={() => setHovered(true)}
-      onHoverOut={() => setHovered(false)}
+      onHoverIn={() => {
+        setHovered(true);
+        onPopoverChange?.(true);
+      }}
+      onHoverOut={() => {
+        setHovered(false);
+        onPopoverChange?.(false);
+      }}
       style={() => ({
         position: "relative",
         flexDirection: "row",
@@ -324,6 +339,7 @@ function RefBadges({ refs, theme }: { refs: string[]; theme: PanelTheme }) {
             paddingHorizontal: 9,
             paddingVertical: 6,
             gap: 5,
+            elevation: 8,
             shadowColor: "#000000",
             shadowOpacity: 0.28,
             shadowRadius: 10,
@@ -422,6 +438,107 @@ interface ColumnWidths {
   time: number;
   hash: number;
   author: number;
+}
+
+/**
+ * One commit row. Rows are siblings of each other and zIndex only orders
+ * siblings, so while the ref popover is open this row raises its zIndex to
+ * make the popover paint over the rows below it instead of under them.
+ */
+function CommitRow({
+  commit,
+  row,
+  isLast,
+  knownHashes,
+  selected,
+  theme,
+  width,
+  showColumns,
+  colWidths,
+  actions,
+  onSelect,
+}: {
+  commit: CommitSummary;
+  row: GraphRow;
+  isLast: boolean;
+  knownHashes: Set<string>;
+  selected: boolean;
+  theme: PanelTheme;
+  width: number;
+  showColumns: { time: boolean; hash: boolean; author: boolean };
+  colWidths: ColumnWidths;
+  actions: CommitActions;
+  onSelect: (hash: string) => void;
+}) {
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const isMerge = commit.parents.length >= 2;
+  const { isHead } = buildRefBadges(commit.refs);
+  const menuItems: MenuItem[] = [
+    { key: "copy", label: `复制哈希 ${commit.shortHash}`, icon: "Copy", onPress: () => void copyText(commit.hash).catch(() => undefined) },
+    { key: "-", label: "", onPress: () => undefined },
+    { key: "cherry", label: "Cherry-pick 到当前分支", icon: "GitCommitHorizontal", onPress: () => actions.onCherryPick(commit.hash) },
+    { key: "checkout", label: "检出此提交（分离头指针）", icon: "LogIn", onPress: () => actions.onCheckoutCommit(commit.hash) },
+    { key: "-", label: "", onPress: () => undefined },
+    { key: "reset-soft", label: "重置到此处 · 保留改动（soft）", icon: "Undo2", onPress: () => actions.onReset(commit.hash, "soft") },
+    { key: "reset-mixed", label: "重置到此处 · 保留工作区（mixed）", icon: "Undo2", onPress: () => actions.onReset(commit.hash, "mixed") },
+    { key: "reset-hard", label: "重置到此处 · 丢弃改动（hard）", icon: "Trash2", danger: true, onPress: () => actions.onReset(commit.hash, "hard") },
+    { key: "revert", label: "还原此提交（revert）", icon: "History", onPress: () => actions.onRevert(commit.hash) },
+    { key: "-", label: "", onPress: () => undefined },
+    { key: "branch", label: "在此提交新建分支…", icon: "GitBranch", onPress: () => actions.onCreateBranchHere(commit.hash) },
+    { key: "tag", label: "在此提交新建标签…", icon: "Tag", onPress: () => actions.onCreateTagHere(commit.hash) },
+  ];
+  return (
+    <HoverPressable
+      accessibilityRole="button"
+      accessibilityLabel={`提交 ${commit.subject}`}
+      onPress={() => onSelect(commit.hash)}
+      style={({ hovered, pressed }) => ({
+        flexDirection: "row",
+        alignItems: "center",
+        height: ROW_H,
+        gap: 6,
+        paddingHorizontal: 4,
+        backgroundColor: selected
+          ? mixWithBackground(theme.colors.accent, theme.colors.surface0, 0.86)
+          : pressed || hovered
+            ? theme.colors.surface1
+            : "transparent",
+        borderLeftWidth: 2,
+        borderLeftColor: selected ? theme.colors.accent : "transparent",
+        zIndex: popoverOpen ? 30 : 0,
+      })}
+    >
+      <View style={{ width }}>
+        <GraphCell row={row} theme={theme} isHead={isHead} isMerge={isMerge} />
+        {isLast ? <StubCell row={row} knownHashes={knownHashes} /> : null}
+      </View>
+      {showColumns.time ? (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.time, fontFamily: MONO_FONT }}>
+          {formatShortTime(commit.authorDate)}
+        </Text>
+      ) : null}
+      {showColumns.hash ? (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.hash, fontFamily: MONO_FONT }}>
+          {commit.shortHash}
+        </Text>
+      ) : null}
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 4, flex: 1, minWidth: 0 }}>
+        <RefBadges refs={commit.refs} theme={theme} onPopoverChange={setPopoverOpen} />
+        <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 11, flexShrink: 1 }}>
+          {commit.subject}
+        </Text>
+      </View>
+      {showColumns.author ? (
+        <Text
+          numberOfLines={1}
+          style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.author, textAlign: "right" }}
+        >
+          {commit.authorName}
+        </Text>
+      ) : null}
+      <MenuButton theme={theme} label={`提交 ${commit.shortHash} 的操作`} items={menuItems} size={13} />
+    </HoverPressable>
+  );
 }
 
 export function CommitList({
@@ -563,75 +680,21 @@ export function CommitList({
       {commits.map((commit, index) => {
         const row = graph.rows[index];
         if (!row) return null;
-        const selected = commit.hash === selectedHash;
-        const isMerge = commit.parents.length >= 2;
-        const { isHead } = buildRefBadges(commit.refs);
-        const isLast = index === commits.length - 1;
-        const menuItems: MenuItem[] = [
-          { key: "copy", label: `复制哈希 ${commit.shortHash}`, icon: "Copy", onPress: () => void copyText(commit.hash).catch(() => undefined) },
-          { key: "-", label: "", onPress: () => undefined },
-          { key: "cherry", label: "Cherry-pick 到当前分支", icon: "GitCommitHorizontal", onPress: () => actions.onCherryPick(commit.hash) },
-          { key: "checkout", label: "检出此提交（分离头指针）", icon: "LogIn", onPress: () => actions.onCheckoutCommit(commit.hash) },
-          { key: "-", label: "", onPress: () => undefined },
-          { key: "reset-soft", label: "重置到此处 · 保留改动（soft）", icon: "Undo2", onPress: () => actions.onReset(commit.hash, "soft") },
-          { key: "reset-mixed", label: "重置到此处 · 保留工作区（mixed）", icon: "Undo2", onPress: () => actions.onReset(commit.hash, "mixed") },
-          { key: "reset-hard", label: "重置到此处 · 丢弃改动（hard）", icon: "Trash2", danger: true, onPress: () => actions.onReset(commit.hash, "hard") },
-          { key: "revert", label: "还原此提交（revert）", icon: "History", onPress: () => actions.onRevert(commit.hash) },
-          { key: "-", label: "", onPress: () => undefined },
-          { key: "branch", label: "在此提交新建分支…", icon: "GitBranch", onPress: () => actions.onCreateBranchHere(commit.hash) },
-          { key: "tag", label: "在此提交新建标签…", icon: "Tag", onPress: () => actions.onCreateTagHere(commit.hash) },
-        ];
         return (
-          <HoverPressable
+          <CommitRow
             key={commit.hash}
-            accessibilityRole="button"
-            accessibilityLabel={`提交 ${commit.subject}`}
-            onPress={() => onSelect(commit.hash)}
-            style={({ hovered, pressed }) => ({
-              flexDirection: "row",
-              alignItems: "center",
-              height: ROW_H,
-              gap: 6,
-              paddingHorizontal: 4,
-              backgroundColor: selected
-                ? mixWithBackground(theme.colors.accent, theme.colors.surface0, 0.86)
-                : pressed || hovered
-                  ? theme.colors.surface1
-                  : "transparent",
-              borderLeftWidth: 2,
-              borderLeftColor: selected ? theme.colors.accent : "transparent",
-            })}
-          >
-            <View style={{ width }}>
-              <GraphCell row={row} theme={theme} isHead={isHead} isMerge={isMerge} />
-              {isLast ? <StubCell row={row} knownHashes={knownHashes} /> : null}
-            </View>
-            {showColumns.time ? (
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.time, fontFamily: MONO_FONT }}>
-                {formatShortTime(commit.authorDate)}
-              </Text>
-            ) : null}
-            {showColumns.hash ? (
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.hash, fontFamily: MONO_FONT }}>
-                {commit.shortHash}
-              </Text>
-            ) : null}
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 4, flex: 1, minWidth: 0 }}>
-              <RefBadges refs={commit.refs} theme={theme} />
-              <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 11, flexShrink: 1 }}>
-                {commit.subject}
-              </Text>
-            </View>
-            {showColumns.author ? (
-              <Text
-                numberOfLines={1}
-                style={{ color: theme.colors.foregroundMuted, fontSize: 10, width: colWidths.author, textAlign: "right" }}
-              >
-                {commit.authorName}
-              </Text>
-            ) : null}
-            <MenuButton theme={theme} label={`提交 ${commit.shortHash} 的操作`} items={menuItems} size={13} />
-          </HoverPressable>
+            commit={commit}
+            row={row}
+            isLast={index === commits.length - 1}
+            knownHashes={knownHashes}
+            selected={commit.hash === selectedHash}
+            theme={theme}
+            width={width}
+            showColumns={showColumns}
+            colWidths={colWidths}
+            actions={actions}
+            onSelect={onSelect}
+          />
         );
       })}
 
