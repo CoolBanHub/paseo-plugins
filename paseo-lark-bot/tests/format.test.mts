@@ -7,6 +7,7 @@ import {
   condenseReply,
   formatPermissionNotice,
   formatTurnOutcome,
+  isMissingAgentError,
   isTransientTurnError,
   sanitizeTopicText,
 } from "../server/format.ts";
@@ -18,6 +19,8 @@ describe("isTransientTurnError", () => {
     assert.equal(isTransientTurnError("网关错误（HTTP 502），请稍后重试"), true);
     assert.equal(isTransientTurnError("请求超时 ETIMEDOUT"), true);
     assert.equal(isTransientTurnError("ECONNRESET socket hang up"), true);
+    assert.equal(isTransientTurnError("TypeError: fetch failed"), true);
+    assert.equal(isTransientTurnError("connect ENETUNREACH"), true);
   });
 
   it("treats auth and configuration errors as fatal", () => {
@@ -25,6 +28,19 @@ describe("isTransientTurnError", () => {
     assert.equal(isTransientTurnError("HTTP 403 Forbidden"), false);
     assert.equal(isTransientTurnError("HTTP 404"), false);
     assert.equal(isTransientTurnError("provider 崩溃"), false);
+  });
+});
+
+describe("isMissingAgentError", () => {
+  it("detects deleted or archived stored agents", () => {
+    assert.equal(isMissingAgentError("Agent not found: agent-gone"), true);
+    assert.equal(isMissingAgentError("agent 123 no longer exists"), true);
+    assert.equal(isMissingAgentError("Agent is archived"), true);
+  });
+
+  it("does not confuse model or provider errors with a missing agent", () => {
+    assert.equal(isMissingAgentError("model not found: gpt-x"), false);
+    assert.equal(isMissingAgentError("HTTP 404 Not Found"), false);
   });
 });
 
@@ -134,6 +150,13 @@ describe("formatTurnOutcome", () => {
     assert.ok(formatTurnOutcome("failed", "HTTP 403 Forbidden").includes("拒绝访问"));
     assert.ok(formatTurnOutcome("failed", "HTTP 429 Too Many Requests").includes("限流"));
     assert.ok(formatTurnOutcome("failed", "HTTP 503 Service Unavailable").includes("暂时不可用"));
+  });
+
+  it("includes the retry count even when an HTTP hint replaces the error", () => {
+    const text = formatTurnOutcome("failed", "HTTP 503 Service Unavailable", 2);
+    assert.ok(text.includes("暂时不可用"), text);
+    assert.ok(text.includes("已自动重试 2 次"), text);
+    assert.equal(formatTurnOutcome("failed", "boom", 1), "处理失败：boom（已自动重试 1 次）");
   });
 
   it("strips HTML from non-HTTP errors", () => {

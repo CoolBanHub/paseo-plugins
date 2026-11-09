@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -817,7 +817,8 @@ describe("turn failure retries", () => {
     }
     const failed = h.replies[h.replies.length - 1];
     assert.equal(failed?.outcome.outcome, "failed");
-    assert.match(failed?.outcome.lastError ?? "", /已自动重试 2 次/);
+    assert.equal(failed?.outcome.retries, 2, "the retry count travels with the outcome");
+    assert.doesNotMatch(failed?.outcome.lastError ?? "", /已自动重试/);
     assert.equal(h.registry.ownsAgent(agent.id), false, "exhausted retries rebuild the session");
     assert.equal(h.runCalls.length, 3, "one initial attempt plus two retries");
 
@@ -867,11 +868,58 @@ describe("turn failure retries", () => {
       "the retried item stays ahead of the newer message",
     );
   });
+
+  it("retries a failed turn_ended instead of replying immediately", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    // The daemon reports provider failures through turn_ended, which usually
+    // arrives before run() resolves; it must still take the retry path.
+    h.registry.handleTurnEnded(agent.id, { outcome: "failed", lastText: null, lastError: "HTTP 429" });
+    await flush();
+    assert.equal(h.replies.length, 1, "no failure reply yet");
+    assert.equal(h.registry.ownsAgent(agent.id), true, "transient failure keeps the agent");
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.runCalls.length, 2, "the same turn was retried");
+    h.finishRun({ status: "idle", error: null, lastMessage: "重试后的答复" });
+    h.registry.handleTurnEnded(agent.id, completed("重试后的答复"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_2");
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.retries, undefined);
+  });
+
+  it("retries a transient failure of the create-driven first turn", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, {
+      outcome: "failed",
+      lastText: null,
+      lastError: "HTTP 503 Service Unavailable",
+    });
+    await flush();
+    assert.equal(h.replies.length, 0, "the first failure is retried, not reported");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.created.length, 1, "the existing agent is reused");
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["第一条"], "the prompt is rerun");
+    h.finishRun({ status: "idle", error: null, lastMessage: "重试成功" });
+    h.registry.handleTurnEnded(agent.id, completed("重试成功"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_1");
+  });
 });
 
 describe("stuck-busy watchdog", () => {
-  it("proactively rebuilds a hung turn without waiting for a new message", async () => {
-    const h = makeHarness({ stuckBusyMs: 20 });
+  it("requeues the hung request once and continues the queue on a fresh agent", async () => {
+    const h = makeHarness({ stuckBusyMs: 40 });
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
@@ -881,10 +929,44 @@ describe("stuck-busy watchdog", () => {
     assert.equal(h.registry.status()[0]?.queued, 1);
 
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.ok(h.notices.some((notice) => notice.text.includes("已重建会话")));
+    assert.ok(h.notices.some((notice) => notice.text.includes("重试一次")));
     assert.equal(h.registry.ownsAgent(agent.id), false);
     await flush();
-    assert.equal(h.created.length, 2, "the queued message restarts on a fresh agent");
+    assert.equal(h.created.length, 2, "a fresh agent is created for the requeued request");
+    assert.equal(h.created[1]?.prompt, "第一条", "the timed-out request is rerun, not dropped");
+
+    // Finishing the rerun lets the queued message proceed on the same agent.
+    const fresh = h.currentAgent();
+    h.registry.handleTurnEnded(fresh.id, completed("第一条答复"));
+    await flush();
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["第二条"]);
+    assert.equal(h.created.length, 2);
+  });
+
+  it("does not rebuild a permission wait on a new message", async () => {
+    const h = makeHarness({ stuckBusyMs: 20 });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "需要权限", binding);
+    await flush();
+    h.finishRun({ status: "permission", error: null, lastMessage: null });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // Past the stuck threshold the watchdog only reminds; a new message must
+    // not kill the pending permission request.
+    h.registry.enqueue("om_1", "oc_group", "om_3", "顺手再问一句", binding);
+    await flush();
+    assert.equal(h.registry.ownsAgent(agent.id), true, "permission waits are not rebuilt");
+    assert.equal(h.registry.status()[0]?.busy, true);
+    assert.equal(h.registry.status()[0]?.queued, 1);
+
+    h.registry.handleTurnEnded(agent.id, completed("批准后完成"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_2");
   });
 
   it("only reminds once while a turn waits on a permission decision", async () => {
@@ -1014,6 +1096,162 @@ describe("topic agent store", () => {
       await flush();
       assert.equal(created, 1, "an unresolvable stored agent degrades to a fresh create");
       assert.equal(registry.ownsAgent("agent-new"), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("validates a restored agent via refresh and creates when it is gone", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      writeFileSync(storePath, JSON.stringify({
+        version: 1,
+        topics: [{
+          topicKey: "om_1",
+          chatId: "oc_group",
+          agentId: "agent-gone",
+          lastActivityAt: Date.now(),
+          lastSeenMessageId: "om_prev",
+        }],
+      }));
+      let created = 0;
+      let refreshed = 0;
+      const prompts: (string | undefined)[] = [];
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async (request) => {
+              created += 1;
+              prompts.push(request.prompt);
+              return {
+                id: "agent-new",
+                send: async () => {},
+                run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+              };
+            },
+            ref: () => ({
+              id: "agent-gone",
+              send: async () => {},
+              run: async () => ({ status: "idle", error: null, lastMessage: "stale" }),
+              refresh: async () => {
+                refreshed += 1;
+                return null;
+              },
+            }),
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      assert.equal(registry.status().length, 0, "restored topics are not live status rows");
+      assert.equal(registry.targetForAgent("agent-gone"), "om_prev", "permission notices keep a reply target");
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      assert.equal(refreshed, 1, "the stored handle is validated before use");
+      assert.equal(created, 1, "a missing agent is replaced for the current message");
+      assert.equal(prompts[0], "第一条", "the current request is rerun on the new agent");
+      assert.equal(registry.ownsAgent("agent-new"), true);
+      assert.equal(registry.status().length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reruns the request when a restored agent disappears at run time", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      writeFileSync(storePath, JSON.stringify({
+        version: 1,
+        topics: [{ topicKey: "om_1", chatId: "oc_group", agentId: "agent-gone", lastActivityAt: Date.now() }],
+      }));
+      const prompts: (string | undefined)[] = [];
+      const replies: { messageId: string; outcome: TurnOutcome }[] = [];
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async (request) => {
+              prompts.push(request.prompt);
+              return {
+                id: "agent-new",
+                send: async () => {},
+                run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+              };
+            },
+            ref: () => ({
+              id: "agent-gone",
+              send: async () => {},
+              run: async () => {
+                throw new Error("Agent not found: agent-gone");
+              },
+            }),
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: {
+          onReply: (_chatId, messageId, outcome) => replies.push({ messageId, outcome }),
+          onNotice: () => {},
+        },
+      });
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(prompts.length, 1, "the request is rerun once on a fresh agent");
+      assert.equal(prompts[0], "第一条");
+      assert.equal(registry.ownsAgent("agent-new"), true);
+
+      registry.handleTurnEnded("agent-new", completed("新会话答复"));
+      await flush();
+      assert.equal(replies[replies.length - 1]?.messageId, "om_1");
+      assert.equal(replies[replies.length - 1]?.outcome.lastText, "新会话答复");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("dispose flushes the topic store and stops the watchdog", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      const notices: string[] = [];
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => ({
+              id: "agent-1",
+              send: async () => {},
+              run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+            }),
+            ref: () => {
+              throw new Error("unexpected ref");
+            },
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        stuckBusyMs: 20,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10_000,
+        callbacks: {
+          onReply: () => {},
+          onNotice: (_chatId, _messageId, text) => notices.push(text),
+        },
+      });
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      registry.dispose();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(notices.length, 0, "the watchdog must not fire after dispose");
+      assert.ok(existsSync(storePath), "dispose flushes the debounced store");
+      const saved = JSON.parse(readFileSync(storePath, "utf8")) as { topics?: unknown[] };
+      assert.equal(saved.topics?.length, 1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -333,6 +333,10 @@ export default function contribute(server: PluginServerContext) {
     offPermission();
     offSettings();
     await syncQueue.catch(() => undefined);
+    // Stop retry/watchdog/fallback timers and flush the topic store before the
+    // registry becomes unreachable; otherwise a 30-minute watchdog could fire
+    // into an already unloaded plugin.
+    dispatcher?.dispose();
     dispatcher = null;
     paseo = null;
     await consumer?.stop();

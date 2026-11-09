@@ -125,7 +125,19 @@ function detectHttpStatus(error: string): number | null {
 export function isTransientTurnError(error: string): boolean {
   const status = detectHttpStatus(error);
   if (status !== null) return status === 408 || status === 429 || status >= 500;
-  return /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|temporarily|unavailable|overloaded|rate\s*limit|too many requests|限流|频率/i.test(
+  return /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNABORTED|ENETUNREACH|EHOSTUNREACH|UND_ERR|fetch failed|socket hang up|network|temporarily|unavailable|overloaded|rate\s*limit|too many requests|限流|频率/i.test(
+    error,
+  );
+}
+
+/**
+ * A stored topic agent that was deleted or archived does not fail at ref()
+ * (the handle is constructed lazily); the daemon reports it when run() is
+ * called. Detect that so the registry can rebuild and rerun the request once
+ * instead of losing it behind a failure notice.
+ */
+export function isMissingAgentError(error: string): boolean {
+  return /\bagent\b[^\n]{0,80}\b(?:not found|no longer exists|archived)\b|\b(?:not found|no longer exists|archived)\b[^\n]{0,40}\bagent\b|智能体(?:不存在|已被删除|已归档)|会话不存在/i.test(
     error,
   );
 }
@@ -139,17 +151,22 @@ function plainError(value: string): string {
     .trim();
 }
 
-export function formatTurnOutcome(outcome: "completed" | "failed" | "canceled" | null, lastError: string | null): string {
+export function formatTurnOutcome(
+  outcome: "completed" | "failed" | "canceled" | null,
+  lastError: string | null,
+  retries = 0,
+): string {
   if (outcome === "failed") {
     const raw = lastError?.trim() ?? "";
-    if (!raw) return "处理失败";
+    const suffix = retries > 0 ? `（已自动重试 ${retries} 次）` : "";
+    if (!raw) return "处理失败" + suffix;
     const status = detectHttpStatus(raw);
     if (status !== null) {
       const hint = HTTP_ERROR_HINTS[status] ?? `模型服务返回 HTTP ${status}，请稍后重试或检查 provider 配置`;
-      return `处理失败：${hint}；完整错误见 Paseo 时间线。`;
+      return `处理失败：${hint}${suffix}；完整错误见 Paseo 时间线。`;
     }
     const plain = plainError(raw);
-    return plain ? "处理失败：" + clipText(plain) : "处理失败";
+    return plain ? "处理失败：" + clipText(plain) + suffix : "处理失败" + suffix;
   }
   if (outcome === "canceled") return "本轮处理已取消。";
   return "";

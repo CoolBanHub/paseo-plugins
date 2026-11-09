@@ -198,6 +198,20 @@ export function createDispatcher(options: DispatcherOptions) {
    */
   const senderLabels = new Map<string, string>();
   let memberCounter = 0;
+  /**
+   * Open ids of bots observed in bound chats (plus this bot). The relay guard
+   * only counts mentions of these ids: @-ing a human is normal conversation,
+   * while @-ing another bot is what can start a loop.
+   */
+  const knownBotIds = new Set<string>();
+  function rememberBotId(id: string | null | undefined): void {
+    if (!id) return;
+    knownBotIds.add(id);
+    if (knownBotIds.size > 200) {
+      const oldest = knownBotIds.values().next().value;
+      if (oldest) knownBotIds.delete(oldest);
+    }
+  }
 
   // The idle window is read through a getter so settings edits apply without
   // rebuilding the registry.
@@ -551,6 +565,8 @@ export function createDispatcher(options: DispatcherOptions) {
       if (!cliPath) return;
       const botOpenId = await ensureBotOpenId(cliPath);
       if (event.chat_type === "group" && !botOpenId) return;
+      rememberBotId(botOpenId);
+      if (event.sender_type === "bot") rememberBotId(event.sender_id);
 
       // Only chats with a binding may be recorded or downloaded. Unbound chats
       // get at most the configured "not configured" hint.
@@ -738,7 +754,7 @@ export function createDispatcher(options: DispatcherOptions) {
     }
     // The raw root text carries lark-cli's pre-rendered markdown (images as
     // `![Image](img_v2_…)`); flatten it for both the prompt and the title.
-    const subject = rootText && rootText !== prompt ? sanitizeTopicText(rootText) : null;
+    const subject = rootText && rootText !== prompt ? neutralizeTranscript(sanitizeTopicText(rootText)) : null;
     const lines: string[] = [];
     if (subject) lines.push("【话题主题】" + subject);
     const prior = history.filter((entry) => entry.messageId !== rootId);
@@ -752,8 +768,19 @@ export function createDispatcher(options: DispatcherOptions) {
     return { text, hasContext: true, topicRootText: subject };
   }
 
+  /**
+   * Neutralize the prompt's section markers inside user-supplied text, so a
+   * message cannot spoof a 【本次消息】 boundary or the guard line. The current
+   * instruction is deliberately not passed through this.
+   */
+  function neutralizeTranscript(text: string): string {
+    return text
+      .replace(/【\s*(本次消息|话题主题|话题历史|最近对话|上次消息之后)\s*】/g, "［$1］")
+      .replace(/\[\s*(本次消息|话题主题|话题历史|最近对话|上次消息之后)\s*\]/g, "［$1］");
+  }
+
   function clipContext(text: string, limit = 400): string {
-    const flat = text.trim();
+    const flat = neutralizeTranscript(text).trim();
     return flat.length > limit ? flat.slice(0, limit - 1) + "…" : flat;
   }
 
@@ -815,9 +842,10 @@ export function createDispatcher(options: DispatcherOptions) {
     outcome: "completed" | "failed" | "canceled" | null;
     lastText: string | null;
     lastError: string | null;
+    retries?: number;
   }): string {
     if (outcome.outcome === "failed" || outcome.outcome === "canceled") {
-      return formatTurnOutcome(outcome.outcome, outcome.lastError);
+      return formatTurnOutcome(outcome.outcome, outcome.lastError, outcome.retries ?? 0);
     }
     const text = condenseReply(outcome.lastText ?? "");
     if (!text) return "本轮已完成，但没有可复述的文本结果（可能只有工具操作）。";
@@ -886,7 +914,13 @@ export function createDispatcher(options: DispatcherOptions) {
   function breaksRelayLoop(topicKey: string, text: string): boolean {
     const normalized = text.replace(/\s+/g, "");
     const fingerprint = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-    const mention = /<at\s+user_id=/i.test(text);
+    // Only mentions of a known bot count as a handoff. @-ing the human asker
+    // is normal conversation and must not trip the guard; in a two-bot loop
+    // the other bot has already posted by the time the loop repeats.
+    const mention = [...text.matchAll(/<at\s+user_id="([^"]*)"/gi)].some((match) => {
+      const id = match[1];
+      return typeof id === "string" && knownBotIds.has(id);
+    });
     const history = relayWindow.get(topicKey) ?? [];
     const previous = history.slice(-(RELAY_MENTION_STREAK - 1));
     // A streak needs the full window of prior mention replies — a single
@@ -910,7 +944,38 @@ export function createDispatcher(options: DispatcherOptions) {
     return false;
   }
 
+  const deliveryChains = new Map<string, Promise<void>>();
+
+  /**
+   * Deliver replies one at a time per topic. send() is async and callers do
+   * not await it, so without serialization the relay window could record two
+   * turns out of order and miss (or double-count) a loop.
+   */
   async function deliver(
+    chatId: string,
+    topicKey: string | null,
+    messageId: string,
+    text: string,
+  ): Promise<void> {
+    const chainKey = topicKey ?? `${chatId}:${messageId}`;
+    const previous = deliveryChains.get(chainKey) ?? Promise.resolve();
+    const next = previous
+      .then(
+        () => deliverNow(chatId, topicKey, messageId, text),
+        () => deliverNow(chatId, topicKey, messageId, text),
+      )
+      .catch((error) => {
+        log("发送回复失败", error instanceof Error ? error.message : String(error));
+      });
+    deliveryChains.set(chainKey, next);
+    try {
+      await next;
+    } finally {
+      if (deliveryChains.get(chainKey) === next) deliveryChains.delete(chainKey);
+    }
+  }
+
+  async function deliverNow(
     chatId: string,
     topicKey: string | null,
     messageId: string,
@@ -920,9 +985,12 @@ export function createDispatcher(options: DispatcherOptions) {
     const cliPath = cliPathFor(values);
     if (!cliPath) return;
     const binding = values.chats.find((chat) => chat.chatId === chatId);
-    let format: ReplyFormat = binding?.replyFormat ?? "markdown";
+    const configured: ReplyFormat = binding?.replyFormat ?? "markdown";
+    let format = configured;
     let body = text;
-    if (topicKey && breaksRelayLoop(topicKey, text)) {
+    // Mentions only stay live in post format; markdown/text cannot trigger
+    // another bot, so the guard must not rewrite those replies.
+    if (configured === "post" && topicKey && breaksRelayLoop(topicKey, text)) {
       format = "text";
       body = stripMentionTags(text) + "\n\n" + RELAY_NOTE;
     }
@@ -934,6 +1002,7 @@ export function createDispatcher(options: DispatcherOptions) {
     handleTurnEnded,
     handlePermission,
     resetIdentity,
+    dispose: () => sessions.dispose(),
     status: () => ({
       sessions: sessions.status(),
       unmatched: [...unmatchedRecent.values()],
