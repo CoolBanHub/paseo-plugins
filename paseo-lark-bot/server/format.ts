@@ -39,6 +39,24 @@ export function condenseReply(value: string): string {
 }
 
 /**
+ * Flatten lark-cli's pre-rendered message markdown into one readable line:
+ * images become `[图片]`, links keep their label (or `[链接]`), whitespace is
+ * collapsed, and overlong text is clipped. Used for topic subject lines and
+ * fallback session titles where raw `![Image](img_v2_…)` syntax is noise.
+ */
+export function sanitizeTopicText(value: string, limit = 120): string {
+  const flat = value
+    // Images must be replaced before links: `![alt](url)` also matches the
+    // link pattern.
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "[图片]")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\[\s*\]\([^)]*\)/g, "[链接]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length > limit ? flat.slice(0, limit - 1) + "…" : flat;
+}
+
+/**
  * Feishu rejects overly long messages; clip the reply and point the user to
  * the full timeline in Paseo.
  */

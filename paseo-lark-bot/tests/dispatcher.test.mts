@@ -28,6 +28,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
     maxReplyChars: 4000,
     notifyUnmatched: false,
     ackOnReceive: false,
+    aiTitle: false,
     notifyPermission: false,
     chats: [
       {
@@ -50,7 +51,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
 interface Harness {
   dispatch: ReturnType<typeof createDispatcher>;
   replies: ReplyCall[];
-  created: { prompt?: string }[];
+  created: { prompt?: string; title?: string; images?: unknown[] }[];
   runCalls: { agentId: string; text: string }[];
   agentId: string;
   paseoRef: import("../server/sessions.ts").SessionPaseoApi;
@@ -58,14 +59,14 @@ interface Harness {
 
 function makeHarness(values: BotValues = baseValues()): Harness {
   const replies: ReplyCall[] = [];
-  const created: { prompt?: string; images?: unknown[] }[] = [];
+  const created: { prompt?: string; title?: string; images?: unknown[] }[] = [];
   const runCalls: { agentId: string; text: string }[] = [];
   let current: SessionAgentHandle | null = null;
 
   const paseo: SessionPaseoApi = {
     agents: {
       create: async (request) => {
-        created.push({ prompt: request.prompt, images: request.images });
+        created.push({ prompt: request.prompt, title: request.title, images: request.images });
         current = {
           id: `agent-${created.length}`,
           send: async () => {},
@@ -366,6 +367,32 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.created.length, 1);
     assert.equal(h.created[0].prompt, "【话题主题】现在的构建失败原因是什么\n\n【本次消息】你查一下");
+  });
+
+  it("sanitizes pre-rendered media markdown in the topic subject and fallback title", async () => {
+    const h = makeHarness(baseValues({ aiTitle: false }));
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues({ aiTitle: false }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readThreadRootDetail: async (_cli, id) =>
+        id === "om_root"
+          ? { text: "![Image](img_v2_abc) 这个设计稿帮我看看", senderOpenId: "ou_user", senderName: "张三" }
+          : null,
+      reply: async (options) => {
+        h.replies.push({ messageId: options.messageId, text: options.text, format: options.format, replyInThread: options.replyInThread });
+        return null;
+      },
+    });
+    await dispatch.handleMessageEvent(groupEvent({ message_id: "om_reply", root_id: "om_root", content: "@测试机器人 评估一下" }));
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(
+      h.created[0].prompt,
+      "【话题主题】[图片] 这个设计稿帮我看看\n\n【本次消息】评估一下",
+    );
+    assert.equal(h.created[0].title, "飞书 · 测试群 · [图片] 这个设计稿帮我看看");
   });
 
   it("labels members distinctly and marks media with placeholders", async () => {

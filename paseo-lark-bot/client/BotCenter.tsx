@@ -609,6 +609,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChange={(value) => patchDraft({ ackOnReceive: value })}
             />
             <ToggleRow
+              label="AI 生成会话标题"
+              hint="新话题首次 @ 时用绑定的模型生成一句可读标题；失败或超时回退为清洗后的话题文本"
+              value={draft.aiTitle}
+              onChange={(value) => patchDraft({ aiTitle: value })}
+            />
+            <ToggleRow
               label="权限请求通知到群"
               hint="默认关闭；开启后权限请求会发到话题，仍需在 Paseo 客户端批准"
               value={draft.notifyPermission}

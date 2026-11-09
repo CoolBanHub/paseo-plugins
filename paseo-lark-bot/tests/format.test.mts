@@ -7,7 +7,30 @@ import {
   condenseReply,
   formatPermissionNotice,
   formatTurnOutcome,
+  sanitizeTopicText,
 } from "../server/format.ts";
+
+describe("sanitizeTopicText", () => {
+  it("replaces pre-rendered image markdown with a placeholder", () => {
+    assert.equal(sanitizeTopicText("![Image](img_v2_abc) 这个设计稿"), "[图片] 这个设计稿");
+  });
+
+  it("keeps link labels and collapses bare links", () => {
+    assert.equal(sanitizeTopicText("看 [文档](https://example.com) 和 [](https://x.dev)"), "看 文档 和 [链接]");
+  });
+
+  it("collapses whitespace across lines", () => {
+    assert.equal(sanitizeTopicText("第一行\n  第二行\t\t更多"), "第一行 第二行 更多");
+  });
+
+  it("clips overlong text with an ellipsis", () => {
+    assert.equal(sanitizeTopicText("长".repeat(50), 10), "长".repeat(9) + "…");
+  });
+
+  it("keeps short plain text unchanged", () => {
+    assert.equal(sanitizeTopicText("现在的构建失败原因是什么"), "现在的构建失败原因是什么");
+  });
+});
 
 describe("condenseReply", () => {
   it("keeps CJK sentences when English reasoning is folded in", () => {

@@ -5,6 +5,8 @@ import {
   isDshProvider,
   type ChatBinding,
 } from "../shared/settings.ts";
+import { sanitizeTopicText } from "./format.ts";
+import { generateTopicTitle } from "./title.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
 function resolveCwd(cwd: string): string {
@@ -99,6 +101,10 @@ export interface SessionPaseoApi {
       labels?: Record<string, string>;
       prompt?: string;
       images?: SessionImage[];
+      /** One-shot sessions (topic naming) archive themselves when done. */
+      autoArchive?: boolean;
+      /** Keep helper sessions out of the interactive workspace focus. */
+      background?: boolean;
     }): Promise<SessionAgentHandle>;
     ref(id: string): SessionAgentHandle & { timeline?: SessionTimelineHandle };
   };
@@ -145,6 +151,8 @@ export interface TurnOutcome {
 interface QueueItem {
   messageId: string;
   prompt: string;
+  /** Sanitized thread-root text; seeds the AI/fallback session title. */
+  topicRootText?: string;
   binding: ChatBinding;
   images?: SessionImage[];
 }
@@ -179,7 +187,8 @@ const DEFAULT_TURN_FALLBACK_MS = 5_000;
 const MAX_QUEUE_PER_TOPIC = 20;
 /** Bound topic state for long-running daemons. */
 const MAX_TOPICS = 500;
-const TITLE_SNIPPET = 16;
+/** Clip for the fallback (non-AI) session title snippet. */
+const TITLE_FALLBACK_SNIPPET = 40;
 
 export interface SessionCallbacks {
   /** Send the agent's answer back under the trigger message. */
@@ -216,6 +225,11 @@ export function createSessionRegistry(options: {
   now?: () => number;
   /** Grace period for a missing turn_ended after run() resolves idle. */
   turnFallbackMs?: number;
+  /**
+   * Whether new topic sessions get an AI-generated title (default true). On
+   * failure or timeout the sanitized topic text is used instead.
+   */
+  getAiTitle?: () => boolean;
 }) {
   const resolveProvider =
     options.resolveProvider ??
@@ -226,6 +240,7 @@ export function createSessionRegistry(options: {
   const fetchLastReply = options.fetchLastReply ?? (async () => null);
   const now = options.now ?? Date.now;
   const turnFallbackMs = options.turnFallbackMs ?? DEFAULT_TURN_FALLBACK_MS;
+  const getAiTitle = options.getAiTitle ?? (() => true);
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
   /** turn_ended can arrive before agents.create() resolves and maps the id. */
@@ -277,6 +292,7 @@ export function createSessionRegistry(options: {
     prompt: string,
     binding: ChatBinding,
     images?: SessionImage[],
+    topicRootText?: string | null,
   ): boolean {
     const state = stateFor(topicKey, chatId);
     // lastActivityAt stays at the previous turn's end here so ensureAgent can
@@ -295,7 +311,13 @@ export function createSessionRegistry(options: {
       }
       resetTopic(topicKey);
     }
-    state.queue.push({ messageId, prompt, binding, images });
+    state.queue.push({
+      messageId,
+      prompt,
+      topicRootText: topicRootText ?? undefined,
+      binding,
+      images,
+    });
     drain(topicKey);
     return true;
   }
@@ -425,6 +447,41 @@ export function createSessionRegistry(options: {
     state.turnFallback = timer;
   }
 
+  /**
+   * Fallback snippet when AI titling is off or the naming turn fails: the
+   * sanitized thread-root text, else the current instruction extracted from
+   * the assembled prompt.
+   */
+  function fallbackTitleText(item: QueueItem): string {
+    if (item.topicRootText) return sanitizeTopicText(item.topicRootText, TITLE_FALLBACK_SNIPPET);
+    const marker = item.prompt.indexOf("【本次消息】");
+    const instruction = marker >= 0 ? item.prompt.slice(marker + "【本次消息】".length) : item.prompt;
+    return sanitizeTopicText(instruction, TITLE_FALLBACK_SNIPPET);
+  }
+
+  /** Prefer an AI one-line title; anything less becomes the sanitized text. */
+  async function resolveTitle(
+    topicKey: string,
+    item: QueueItem,
+    provider: string,
+  ): Promise<string> {
+    const state = stateFor(topicKey, "");
+    const prefix = `飞书 · ${item.binding.chatName || state.chatId} · `;
+    if (getAiTitle()) {
+      const generated = await generateTopicTitle({
+        paseo: options.paseo,
+        provider,
+        cwd: resolveCwd(item.binding.cwd),
+        chatId: state.chatId,
+        topicKey,
+        topicRootText: item.topicRootText ?? null,
+        instruction: item.prompt,
+      });
+      if (generated) return prefix + generated;
+    }
+    return prefix + (fallbackTitleText(item) || "新话题");
+  }
+
   async function ensureAgent(
     topicKey: string,
     item: QueueItem,
@@ -439,7 +496,7 @@ export function createSessionRegistry(options: {
     const handle = await options.paseo.agents.create({
       config: providerCreateConfig(provider, item.binding),
       cwd: resolveCwd(item.binding.cwd),
-      title: `飞书 · ${item.binding.chatName || state.chatId} · ${item.prompt.slice(0, TITLE_SNIPPET)}`,
+      title: await resolveTitle(topicKey, item, provider),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
       images: item.images,

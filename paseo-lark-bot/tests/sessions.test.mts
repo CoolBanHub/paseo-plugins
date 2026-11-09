@@ -21,6 +21,10 @@ interface Harness {
   notices: { chatId: string | null; messageId: string; text: string }[];
   created: {
     prompt?: string;
+    title?: string;
+    labels?: Record<string, string>;
+    autoArchive?: boolean;
+    background?: boolean;
     provider: string;
     cwd: string;
     config: {
@@ -48,7 +52,7 @@ const binding: ChatBinding = {
   replyFormat: "markdown",
 };
 
-function makeHarness(options?: { idleMinutes?: number }): Harness {
+function makeHarness(options?: { idleMinutes?: number; aiTitle?: boolean }): Harness {
   const replies: ReplyCall[] = [];
   const notices: Harness["notices"] = [];
   const created: Harness["created"] = [];
@@ -61,7 +65,16 @@ function makeHarness(options?: { idleMinutes?: number }): Harness {
     agents: {
       create: async (request) => {
         agentCounter += 1;
-        created.push({ prompt: request.prompt, provider: request.config.provider, cwd: request.cwd, config: request.config });
+        created.push({
+          prompt: request.prompt,
+          title: request.title,
+          labels: request.labels,
+          autoArchive: request.autoArchive,
+          background: request.background,
+          provider: request.config.provider,
+          cwd: request.cwd,
+          config: request.config,
+        });
         current = {
           id: `agent-${agentCounter}`,
           send: async () => {},
@@ -84,6 +97,7 @@ function makeHarness(options?: { idleMinutes?: number }): Harness {
   const registry = createSessionRegistry({
     paseo,
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
+    getAiTitle: () => options?.aiTitle ?? false,
     callbacks: {
       onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
       onNotice: (chatId, messageId, text) => notices.push({ chatId, messageId, text }),
@@ -240,6 +254,7 @@ describe("createSessionRegistry", () => {
       paseo,
       now: () => clock,
       getIdleMs: () => 30 * 60_000,
+      getAiTitle: () => false,
       callbacks: {
         onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
         onNotice: () => {},
@@ -353,6 +368,7 @@ describe("createSessionRegistry", () => {
     const registry = createSessionRegistry({
       paseo,
       getIdleMs: () => 30 * 60_000,
+      getAiTitle: () => false,
       callbacks: {
         onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
         onNotice: () => {},
@@ -547,5 +563,67 @@ describe("reply fallbacks", () => {
     await flush();
     assert.equal(fetched, true);
     assert.equal(replies[0]?.outcome.lastText, "时间线兜底的答复");
+  });
+});
+
+describe("session titles", () => {
+  it("names new sessions with the AI one-liner when enabled", async () => {
+    const h = makeHarness({ aiTitle: true });
+    h.registry.enqueue(
+      "om_1",
+      "oc_group",
+      "om_1",
+      "【话题主题】看图\n\n【本次消息】帮我分析",
+      binding,
+      undefined,
+      "看图",
+    );
+    await flush();
+    // The one-shot naming session is created first: no prompt, purpose label,
+    // auto-archive, and out of the interactive workspace focus.
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].prompt, undefined);
+    assert.deepEqual(h.created[0].labels, {
+      "lark-bot-purpose": "title",
+      "lark-bot-chat": "oc_group",
+      "lark-bot-topic": "om_1",
+    });
+    assert.equal(h.created[0].autoArchive, true);
+    assert.equal(h.created[0].background, true);
+    assert.equal(h.runCalls.length, 1);
+    assert.match(h.runCalls[0].text, /看图/);
+    // Once the naming turn answers, the topic session carries the AI title.
+    h.finishRun({ status: "idle", error: null, lastMessage: "“分析图片内容”" });
+    await flush();
+    assert.equal(h.created.length, 2);
+    assert.equal(h.created[1].title, "飞书 · 测试群 · 分析图片内容");
+    assert.equal(h.created[1].prompt, "【话题主题】看图\n\n【本次消息】帮我分析");
+  });
+
+  it("falls back to the sanitized topic text when the naming turn fails", async () => {
+    const h = makeHarness({ aiTitle: true });
+    h.registry.enqueue(
+      "om_1",
+      "oc_group",
+      "om_1",
+      "【话题主题】[图片]\n\n【本次消息】看下这张图",
+      binding,
+      undefined,
+      "[图片]",
+    );
+    await flush();
+    h.finishRun({ status: "error", error: "provider down", lastMessage: null });
+    await flush();
+    assert.equal(h.created.length, 2);
+    assert.equal(h.created[1].title, "飞书 · 测试群 · [图片]");
+  });
+
+  it("skips the naming turn and clips the instruction when disabled", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "【话题主题】闲聊\n\n【本次消息】帮我修这个 bug", binding);
+    await flush();
+    assert.equal(h.created.length, 1);
+    assert.equal(h.runCalls.length, 0);
+    assert.equal(h.created[0].title, "飞书 · 测试群 · 帮我修这个 bug");
   });
 });

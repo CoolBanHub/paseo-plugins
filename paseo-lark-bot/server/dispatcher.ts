@@ -18,6 +18,7 @@ import {
   condenseReply,
   formatPermissionNotice,
   formatTurnOutcome,
+  sanitizeTopicText,
 } from "./format.ts";
 import { mentionsBot, routeMessage, extractPrompt, isSenderAllowed } from "./router.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
@@ -175,6 +176,7 @@ export function createDispatcher(options: DispatcherOptions) {
     appSecret: "",
     larkCliPath: "",
     ackOnReceive: true,
+    aiTitle: true,
     notifyPermission: false,
     replyInThread: true,
     sessionIdleMinutes: 30,
@@ -186,6 +188,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const sessions = createSessionRegistry({
     paseo: options.paseo,
     getIdleMs: () => valuesCache.sessionIdleMinutes * 60_000,
+    getAiTitle: () => valuesCache.aiTitle,
     resolveProvider: options.resolveProvider,
     fetchLastReply: options.fetchLastReply,
     callbacks: {
@@ -501,12 +504,22 @@ export function createDispatcher(options: DispatcherOptions) {
       if (values.ackOnReceive) {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
-      const { text: prompt } = await withThreadContext(cliPath, event, instruction);
+      const { text: prompt, topicRootText } = await withThreadContext(cliPath, event, instruction);
       const finalPrompt =
         images.length > 0
           ? prompt + "\n\n【附图】本消息附加 " + images.length + " 张图片（含视频关键帧），请结合图片内容回答。"
           : prompt;
-      if (sessions.enqueue(topicKey, event.chat_id, event.message_id, finalPrompt, decision.binding, images)) {
+      if (
+        sessions.enqueue(
+          topicKey,
+          event.chat_id,
+          event.message_id,
+          finalPrompt,
+          decision.binding,
+          images,
+          topicRootText,
+        )
+      ) {
         lastTriggerMessage.set(topicKey, event.message_id);
         pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, topicKey);
       }
@@ -519,12 +532,13 @@ export function createDispatcher(options: DispatcherOptions) {
    * First @ in a topic gets the root subject plus the recorded history; later
    * @s only get messages after the previous trigger because the agent already
    * holds the earlier turns. A rebuilt/expired agent is treated as a first @.
+   * `topicRootText` is the sanitized root text for the session title.
    */
   async function withThreadContext(
     cliPath: string,
     event: LarkMessageEvent,
     prompt: string,
-  ): Promise<{ text: string; hasContext: boolean }> {
+  ): Promise<{ text: string; hasContext: boolean; topicRootText: string | null }> {
     const historyKey = topicKeyFor(event);
     const history = (topicHistory.get(historyKey) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
@@ -553,16 +567,18 @@ export function createDispatcher(options: DispatcherOptions) {
     if (event.chat_type === "p2p") {
       if (previousTrigger) {
         const transcript = transcriptOf(incremental);
-        if (!transcript) return { text: prompt, hasContext: true };
+        if (!transcript) return { text: prompt, hasContext: true, topicRootText: null };
         return {
           text: "【上次消息之后】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
           hasContext: true,
+          topicRootText: null,
         };
       }
-      if (history.length === 0) return { text: prompt, hasContext: false };
+      if (history.length === 0) return { text: prompt, hasContext: false, topicRootText: null };
       return {
         text: "【最近对话】\n" + transcriptOf(history) + (prompt ? "\n\n【本次消息】" + prompt : ""),
         hasContext: true,
+        topicRootText: null,
       };
     }
 
@@ -571,15 +587,16 @@ export function createDispatcher(options: DispatcherOptions) {
     // turns; only the conversation since the last trigger is new.
     if (previousTrigger) {
       const transcript = transcriptOf(incremental);
-      if (!transcript) return { text: prompt, hasContext: true };
+      if (!transcript) return { text: prompt, hasContext: true, topicRootText: null };
       return {
         text: "【上次消息之后】\n" + transcript + (prompt ? "\n\n【本次消息】" + prompt : ""),
         hasContext: true,
+        topicRootText: null,
       };
     }
 
     const rootId = event.root_id || event.reply_to;
-    if (!rootId) return { text: prompt, hasContext: false };
+    if (!rootId) return { text: prompt, hasContext: false, topicRootText: null };
     let rootText: string | null = null;
     const rootInHistory = history.length > 0 && history[0]?.messageId === rootId;
     if (rootInHistory) {
@@ -607,16 +624,19 @@ export function createDispatcher(options: DispatcherOptions) {
       }
       rootText = detail?.text ?? null;
     }
+    // The raw root text carries lark-cli's pre-rendered markdown (images as
+    // `![Image](img_v2_…)`); flatten it for both the prompt and the title.
+    const subject = rootText && rootText !== prompt ? sanitizeTopicText(rootText) : null;
     const lines: string[] = [];
-    if (rootText && rootText !== prompt) lines.push("【话题主题】" + rootText);
+    if (subject) lines.push("【话题主题】" + subject);
     const prior = history.filter((entry) => entry.messageId !== rootId);
     if (prior.length > 0) {
       const transcript = transcriptOf(prior);
       if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
     }
-    if (lines.length === 0) return { text: prompt, hasContext: false };
+    if (lines.length === 0) return { text: prompt, hasContext: false, topicRootText: subject };
     const text = lines.join("\n\n") + (prompt ? "\n\n【本次消息】" + prompt : "");
-    return { text, hasContext: true };
+    return { text, hasContext: true, topicRootText: subject };
   }
 
   function clipContext(text: string, limit = 400): string {

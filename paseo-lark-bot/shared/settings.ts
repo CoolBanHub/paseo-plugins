@@ -107,6 +107,12 @@ export const botValuesSchema = z.object({
   /** Ack each received message so senders see it was picked up. */
   ackOnReceive: z.boolean().default(true),
   /**
+   * Name new topic sessions with a one-shot AI turn on the chat's bound
+   * provider (adds a short delay to the first reply). On failure, timeout,
+   * or when disabled, the title falls back to the sanitized topic text.
+   */
+  aiTitle: z.boolean().default(true),
+  /**
    * Post permission requests to the chat. Off by default: requests are
    * resolved in the Paseo client, and the finished answer still returns to
    * the thread, so the extra notice is noise for most workflows.
