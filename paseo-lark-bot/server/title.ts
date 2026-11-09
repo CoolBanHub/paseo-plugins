@@ -6,9 +6,8 @@ const TITLE_TIMEOUT_MS = 45_000;
 /** Upper bound asked from the naming model in the prompt below. */
 const TITLE_TARGET_CHARS = 40;
 /**
- * Hard clip for the AI title itself. The session title prepends the "飞书 · "
- * prefix and workspace tabs cut whatever overflows their width, so the
- * description must stay meaningful but compact.
+ * Hard clip for the AI title itself. Workspace tabs cut whatever overflows
+ * their width, so the description must stay meaningful but compact.
  */
 const TITLE_MAX_CHARS = 60;
 

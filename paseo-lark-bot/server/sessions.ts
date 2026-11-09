@@ -280,7 +280,7 @@ const MAX_QUEUE_PER_TOPIC = 20;
 const MAX_TOPICS = 500;
 /**
  * Clip for the fallback (non-AI) session title snippet. Matches the AI title
- * clip so both paths leave the task description readable after the prefix.
+ * clip so both title paths read the same length.
  */
 const TITLE_FALLBACK_SNIPPET = 60;
 
@@ -852,8 +852,8 @@ export function createSessionRegistry(options: {
 
   /**
    * Prefer an AI one-line title; anything less becomes the sanitized text.
-   * The fixed "飞书 · " prefix marks the session's origin; the group name is
-   * deliberately left out so the task description gets the tab's full width.
+   * The title is the bare task description: the shared workspace is already
+   * named "飞书任务", so a per-session "飞书" marker would only eat width.
    */
   async function resolveTitle(
     topicKey: string,
@@ -861,7 +861,6 @@ export function createSessionRegistry(options: {
     provider: string,
   ): Promise<string> {
     const state = stateFor(topicKey, "");
-    const prefix = "飞书 · ";
     if (getAiTitle()) {
       const generated = await generateTopicTitle({
         paseo: options.paseo,
@@ -872,9 +871,9 @@ export function createSessionRegistry(options: {
         topicRootText: item.topicRootText ?? null,
         instruction: item.prompt,
       });
-      if (generated) return prefix + generated;
+      if (generated) return generated;
     }
-    return prefix + (fallbackTitleText(item) || "新话题");
+    return fallbackTitleText(item) || "新话题";
   }
 
   async function ensureAgent(
