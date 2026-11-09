@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createSessionRegistry,
   type SessionAgentHandle,
@@ -28,6 +31,7 @@ interface Harness {
     provider: string;
     cwd: string;
     config: {
+      systemPrompt?: string;
       modeId?: string;
       thinkingOptionId?: string;
       featureValues?: Record<string, unknown>;
@@ -69,7 +73,13 @@ const binding: ChatBinding = {
 };
 
 function makeHarness(
-  options?: { idleMinutes?: number; aiTitle?: boolean; workspaces?: WorkspacesFakeOptions },
+  options?: {
+    idleMinutes?: number;
+    aiTitle?: boolean;
+    workspaces?: WorkspacesFakeOptions;
+    turnRetryDelaysMs?: number[];
+    stuckBusyMs?: number;
+  },
 ): Harness {
   const replies: ReplyCall[] = [];
   const notices: Harness["notices"] = [];
@@ -160,6 +170,8 @@ function makeHarness(
       : paseo,
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
+    turnRetryDelaysMs: options?.turnRetryDelaysMs,
+    stuckBusyMs: options?.stuckBusyMs,
     callbacks: {
       onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
       onNotice: (chatId, messageId, text) => notices.push({ chatId, messageId, text }),
@@ -751,5 +763,276 @@ describe("shared workspace", () => {
     assert.equal(h.created.length, 1);
     assert.equal(h.created[0].cwd, "/tmp/project");
     assert.equal(h.created[0].prompt, "第一条");
+  });
+});
+
+describe("turn failure retries", () => {
+  it("retries a transient failure on the same agent and answers afterwards", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    h.finishRun({ status: "error", error: "HTTP 429", lastMessage: null });
+    await flush();
+    // No failure reply yet: the item sits at the queue head awaiting retry.
+    assert.equal(h.replies.length, 1, "only the first turn has answered");
+    assert.equal(h.registry.ownsAgent(agent.id), true, "transient failure keeps the agent");
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(h.runCalls.map((call) => call.text), ["第二条", "第二条"]);
+    h.finishRun({ status: "idle", error: null, lastMessage: "重试后的答复" });
+    h.registry.handleTurnEnded(agent.id, completed("重试后的答复"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_2");
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.lastText, "重试后的答复");
+
+    // The retried turn must not leave a stale pending target behind: the next
+    // turn replies under its own trigger message.
+    h.registry.enqueue("om_1", "oc_group", "om_3", "第三条", binding);
+    await flush();
+    h.finishRun({ status: "idle", error: null, lastMessage: "第三轮答复" });
+    h.registry.handleTurnEnded(agent.id, completed("第三轮答复"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_3");
+  });
+
+  it("gives up after the retry budget, replies once, and rebuilds", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      h.finishRun({ status: "error", error: "HTTP 503 Service Unavailable", lastMessage: null });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    const failed = h.replies[h.replies.length - 1];
+    assert.equal(failed?.outcome.outcome, "failed");
+    assert.match(failed?.outcome.lastError ?? "", /已自动重试 2 次/);
+    assert.equal(h.registry.ownsAgent(agent.id), false, "exhausted retries rebuild the session");
+    assert.equal(h.runCalls.length, 3, "one initial attempt plus two retries");
+
+    h.registry.enqueue("om_1", "oc_group", "om_3", "第三条", binding);
+    await flush();
+    assert.equal(h.created.length, 2, "a fresh agent is created after the bailout");
+  });
+
+  it("fails fast on fatal errors without retrying", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    h.finishRun({ status: "error", error: "HTTP 401", lastMessage: null });
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.outcome, "failed");
+    assert.equal(h.runCalls.length, 1, "auth errors are not retried");
+    assert.equal(h.registry.ownsAgent(agent.id), false);
+  });
+
+  it("queues new messages behind a pending retry", async () => {
+    const h = makeHarness({ turnRetryDelaysMs: [10, 10] });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    h.finishRun({ status: "error", error: "ETIMEDOUT", lastMessage: null });
+    await flush();
+    // A message arriving during the backoff must not bypass the retry.
+    h.registry.enqueue("om_1", "oc_group", "om_3", "第三条", binding);
+    await flush();
+    assert.equal(h.runCalls.length, 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(
+      h.runCalls.map((call) => call.text),
+      ["第二条", "第二条"],
+      "the retried item stays ahead of the newer message",
+    );
+  });
+});
+
+describe("stuck-busy watchdog", () => {
+  it("proactively rebuilds a hung turn without waiting for a new message", async () => {
+    const h = makeHarness({ stuckBusyMs: 20 });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    // The create-driven turn never ends; the queued message must still be served.
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
+    await flush();
+    assert.equal(h.registry.status()[0]?.queued, 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.ok(h.notices.some((notice) => notice.text.includes("已重建会话")));
+    assert.equal(h.registry.ownsAgent(agent.id), false);
+    await flush();
+    assert.equal(h.created.length, 2, "the queued message restarts on a fresh agent");
+  });
+
+  it("only reminds once while a turn waits on a permission decision", async () => {
+    const h = makeHarness({ stuckBusyMs: 20 });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+    h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
+    await flush();
+
+    h.registry.enqueue("om_1", "oc_group", "om_2", "需要权限", binding);
+    await flush();
+    h.finishRun({ status: "permission", error: null, lastMessage: null });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.ok(h.notices.some((notice) => notice.text.includes("权限确认")));
+    assert.equal(h.registry.ownsAgent(agent.id), true, "permission waits are not stuck");
+    assert.equal(h.registry.status()[0]?.busy, true);
+
+    h.registry.handleTurnEnded(agent.id, completed("批准后完成"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_2");
+  });
+});
+
+describe("topic agent store", () => {
+  it("persists topic→agent mappings and resumes them after a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      const handle: SessionAgentHandle = {
+        id: "agent-1",
+        send: async () => {},
+        run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+      };
+      const first = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => handle,
+            ref: () => {
+              throw new Error("no ref");
+            },
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      first.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      first.handleTurnEnded("agent-1", completed("ok"));
+      await flush();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.ok(existsSync(storePath), "the mapping must be persisted");
+
+      // A new registry (daemon restart) re-attaches via agents.ref, not create.
+      const runCalls: string[] = [];
+      let recreated = 0;
+      const restarted = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => {
+              recreated += 1;
+              return { ...handle, id: "agent-2" };
+            },
+            ref: (id) => {
+              assert.equal(id, "agent-1");
+              return {
+                ...handle,
+                run: async (text: string) => {
+                  runCalls.push(text);
+                  return { status: "idle", error: null, lastMessage: "ok" };
+                },
+              };
+            },
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      assert.equal(restarted.ownsAgent("agent-1"), true, "the reverse mapping is restored too");
+      restarted.enqueue("om_1", "oc_group", "om_2", "重启后的问题", binding);
+      await flush();
+      assert.equal(recreated, 0, "the stored agent is resumed, not recreated");
+      assert.deepEqual(runCalls, ["重启后的问题"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a fresh agent when the stored one is gone", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      writeFileSync(storePath, JSON.stringify({
+        version: 1,
+        topics: [{ topicKey: "om_1", chatId: "oc_group", agentId: "agent-gone", lastActivityAt: 0 }],
+      }));
+      let created = 0;
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => {
+              created += 1;
+              return {
+                id: "agent-new",
+                send: async () => {},
+                run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+              };
+            },
+            ref: () => {
+              throw new Error("agent deleted");
+            },
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      assert.equal(created, 1, "an unresolvable stored agent degrades to a fresh create");
+      assert.equal(registry.ownsAgent("agent-new"), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("default system prompt", () => {
+  it("marks transcript blocks as data when the binding sets none", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, systemPrompt: "" });
+    await flush();
+    assert.match(h.created[0].config.systemPrompt ?? "", /聊天记录/);
+    assert.match(h.created[0].config.systemPrompt ?? "", /【本次消息】/);
+  });
+
+  it("keeps the binding's own system prompt verbatim", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(h.created[0].config.systemPrompt, "用中文回答");
   });
 });

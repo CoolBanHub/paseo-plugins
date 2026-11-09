@@ -7,8 +7,26 @@ import {
   condenseReply,
   formatPermissionNotice,
   formatTurnOutcome,
+  isTransientTurnError,
   sanitizeTopicText,
 } from "../server/format.ts";
+
+describe("isTransientTurnError", () => {
+  it("treats rate limits, 5xx and transport blips as transient", () => {
+    assert.equal(isTransientTurnError("HTTP 429"), true);
+    assert.equal(isTransientTurnError("turn failed: 503 Service Unavailable"), true);
+    assert.equal(isTransientTurnError("网关错误（HTTP 502），请稍后重试"), true);
+    assert.equal(isTransientTurnError("请求超时 ETIMEDOUT"), true);
+    assert.equal(isTransientTurnError("ECONNRESET socket hang up"), true);
+  });
+
+  it("treats auth and configuration errors as fatal", () => {
+    assert.equal(isTransientTurnError("HTTP 401"), false);
+    assert.equal(isTransientTurnError("HTTP 403 Forbidden"), false);
+    assert.equal(isTransientTurnError("HTTP 404"), false);
+    assert.equal(isTransientTurnError("provider 崩溃"), false);
+  });
+});
 
 describe("sanitizeTopicText", () => {
   it("replaces pre-rendered image markdown with a placeholder", () => {

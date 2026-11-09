@@ -117,6 +117,19 @@ function detectHttpStatus(error: string): number | null {
   return null;
 }
 
+/**
+ * Whether a failed turn is worth an automatic in-place retry: rate limits,
+ * 5xx, and transport blips usually heal on their own, while auth/config
+ * errors (401/403/404/…) need a human and must fail fast instead.
+ */
+export function isTransientTurnError(error: string): boolean {
+  const status = detectHttpStatus(error);
+  if (status !== null) return status === 408 || status === 429 || status >= 500;
+  return /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|temporarily|unavailable|overloaded|rate\s*limit|too many requests|限流|频率/i.test(
+    error,
+  );
+}
+
 /** Strip proxy HTML/ANSI noise; the raw page stays in the Paseo timeline. */
 function plainError(value: string): string {
   return value

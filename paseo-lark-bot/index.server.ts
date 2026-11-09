@@ -90,6 +90,7 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
     const pluginDataRoot = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "plugin-data", "lark-bot");
     dispatcher = createDispatcher({
       dedupStorePath: join(pluginDataRoot, "seen-message-ids.json"),
+      topicStorePath: join(pluginDataRoot, "topic-agents.json"),
       mediaStoreDir: join(pluginDataRoot, "media"),
       paseo: api,
       readValues,
