@@ -233,6 +233,13 @@ export default function contribute(server: PluginServerContext) {
   const syncConsumer = async (): Promise<void> => {
     const values = await readValues();
     if (disposed) return;
+    // "Unbind" stops the listeners but keeps the app, lark-cli credentials,
+    // and chat bindings so a later enable can resume without reconfiguring.
+    if (!values.enabled) {
+      await stopConsumers();
+      dispatcher?.resetIdentity();
+      return;
+    }
     const cliPath = resolveLarkCli(values.larkCliPath);
     await applyCredentials(values, cliPath);
     if (disposed) return;
@@ -403,6 +410,7 @@ export default function contribute(server: PluginServerContext) {
       cardLastError: cardConsumer?.status().lastError ?? null,
       cliPath,
       currentAppId: currentAppIdCache,
+      enabled: values.enabled,
       botOpenId: status?.botOpenId ?? null,
       sessions: status?.sessions ?? [],
       unmatched: status?.unmatched ?? [],

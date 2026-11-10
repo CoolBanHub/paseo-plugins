@@ -95,6 +95,8 @@ export const larkBotStatusRpc = defineRpc({
     cardLastError: z.string().nullable(),
     cliPath: z.string().nullable(),
     currentAppId: z.string().nullable(),
+    /** False after "unbind"; consumers stay stopped until re-enabled. */
+    enabled: z.boolean(),
     botOpenId: z.string().nullable(),
     sessions: z.array(
       z.object({

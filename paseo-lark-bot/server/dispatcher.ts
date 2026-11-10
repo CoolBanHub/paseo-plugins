@@ -299,6 +299,7 @@ export function createDispatcher(options: DispatcherOptions) {
   let valuesCache: BotValues = {
     appId: "",
     appSecret: "",
+    enabled: true,
     larkCliPath: "",
     ackOnReceive: true,
     aiTitle: true,

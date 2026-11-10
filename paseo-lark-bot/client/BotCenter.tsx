@@ -52,6 +52,7 @@ interface StatusState {
   cardLastError: string | null;
   cliPath: string | null;
   currentAppId: string | null;
+  enabled: boolean;
   botOpenId: string | null;
   sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
   unmatched: { chatId: string; chatType: string; lastSeenAt: number }[];
@@ -97,6 +98,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [draft, setDraft] = useState<BotValues | null>(null);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
+  const [confirmingUnbind, setConfirmingUnbind] = useState(false);
   const [chatCatalog, setChatCatalog] = useState<{ chatId: string; name: string }[]>([]);
   const [providers, setProviders] = useState<LarkBotProviderInfo[]>([]);
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
@@ -349,10 +351,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const applyScannedApp = useCallback(
     async (appId: string): Promise<boolean> => {
       if (!draft) return false;
+      setConfirmingUnbind(false);
       // Only SAVED credentials override lark-cli. If the draft was merely
       // cleared without saving, the old values still win and must be written.
       const savedOverrides = Boolean(loaded?.appId.trim() || loaded?.appSecret);
-      if (!savedOverrides) {
+      const needsEnable = !draft.enabled;
+      if (!savedOverrides && !needsEnable) {
         // Nothing saved overrides lark-cli; the server already restarted the
         // consumers. Drop any unsaved credential text so a later save cannot
         // accidentally switch back.
@@ -361,12 +365,52 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         return true;
       }
       return persistDraft(
-        { ...draft, appId: "", appSecret: "" },
-        `已创建并切换到新应用 ${appId}；当前设置已保存、旧凭证已清空`,
+        { ...draft, appId: "", appSecret: "", enabled: true },
+        `已创建并切换到新应用 ${appId}；当前设置已保存、旧凭证已清空、监听已启用`,
       );
     },
     [draft, loaded, patchDraft, persistDraft, refreshStatus],
   );
+
+  /** Keep lark-cli's app and its keychain secret, but drop the plaintext copy
+   * the plugin may have saved. */
+  const useCurrentApp = useCallback(() => {
+    const appId = status?.currentAppId;
+    if (!draft || !appId) return;
+    setConfirmingUnbind(false);
+    void persistDraft(
+      { ...draft, appId: "", appSecret: "", enabled: true },
+      `已改用 lark-cli 当前应用 ${appId}`,
+    );
+  }, [draft, persistDraft, status?.currentAppId]);
+
+  /** Use the manually entered App ID/Secret and make sure listening resumes. */
+  const useManualApp = useCallback(() => {
+    if (!draft) return;
+    if (!draft.appId.trim() || !draft.appSecret) {
+      toast.error("请先填写 App ID 和 App Secret");
+      return;
+    }
+    setConfirmingUnbind(false);
+    void persistDraft({ ...draft, enabled: true }, "已保存应用凭证；服务端验证通过后会切换到该应用");
+  }, [draft, persistDraft, toast]);
+
+  /** Stop listening and clear plugin credentials; keep the Feishu app and
+   * lark-cli's own configuration untouched. */
+  const unbindBot = useCallback(() => {
+    if (!draft) return;
+    setConfirmingUnbind(false);
+    void persistDraft(
+      { ...draft, enabled: false, appId: "", appSecret: "" },
+      "已解绑当前机器人；事件监听已停止，lark-cli 配置保持不变",
+    );
+  }, [draft, persistDraft]);
+
+  const reenableBot = useCallback(() => {
+    if (!draft) return;
+    setConfirmingUnbind(false);
+    void persistDraft({ ...draft, enabled: true }, "已重新启用事件监听");
+  }, [draft, persistDraft]);
 
   if (!draft || !loaded) {
     return (
@@ -376,7 +420,11 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     );
   }
 
-  const consumer = status ? (CONSUMER_LABELS[status.consumerState] ?? { text: status.consumerState, tone: "muted" as const }) : null;
+  const consumer = status
+    ? !status.enabled
+      ? { text: "已停止 · 未启用", tone: "muted" as const }
+      : (CONSUMER_LABELS[status.consumerState] ?? { text: status.consumerState, tone: "muted" as const })
+    : null;
   const cardConsumer = status
     ? (CARD_CONSUMER_LABELS[status.cardConsumerState] ?? { text: status.cardConsumerState, tone: "muted" as const })
     : null;
@@ -495,7 +543,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         {navRow(
           "credentials",
           "应用凭证",
-          draft.appId.trim() || status?.currentAppId || "未配置（沿用 lark-cli）",
+          !draft.enabled ? "已停止 · 未启用" : draft.appId.trim() || status?.currentAppId || "未配置（沿用 lark-cli）",
           selection.kind === "credentials",
           () => setSelection({ kind: "credentials" }),
         )}
@@ -576,12 +624,15 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
             <CardTitle text="运行状态" />
-            <InfoRow label="事件监听" value={consumer ? consumer.text + (status?.lastError ? `（${status.lastError}）` : "") : "未知"} />
+            <InfoRow
+              label="事件监听"
+              value={consumer ? consumer.text + (status?.enabled && status.lastError ? `（${status.lastError}）` : "") : "未知"}
+            />
             <InfoRow
               label="问题卡片回调"
               value={
                 cardConsumer
-                  ? cardConsumer.text + (status?.cardLastError ? `（${status.cardLastError}）` : "")
+                  ? cardConsumer.text + (status?.enabled && status.cardLastError ? `（${status.cardLastError}）` : "")
                   : "未知"
               }
             />
@@ -605,20 +656,28 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
             <CardTitle
-              text="扫码创建飞书应用（推荐）"
-              hint="用飞书扫码自动创建一个 PersonalAgent 应用，默认带机器人能力、长连接事件订阅和常用权限"
+              text="使用已有应用"
+              hint="已经在飞书开放平台创建过应用：沿用 lark-cli 当前配置，或手动填写 App ID / App Secret"
             />
-            <AppCreationSection
-              currentAppId={status?.currentAppId ?? null}
-              storedAppId={draft.appId}
-              onCreated={applyScannedApp}
+            <InfoRow
+              label="lark-cli 当前应用"
+              value={status ? (status.currentAppId ?? "未配置") : "读取中…"}
+              muted={!status?.currentAppId}
             />
-          </Card>
-          <Card>
-            <CardTitle
-              text="手动填写应用凭证"
-              hint="已有应用时使用；留空沿用 lark-cli 已有配置，填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
-            />
+            <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+              <PrimaryButton
+                label="使用 lark-cli 当前应用"
+                onPress={useCurrentApp}
+                disabled={!status?.currentAppId || saving}
+              />
+            </View>
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              清空插件内保存的凭证，直接使用 lark-cli 钥匙串里的 App Secret；不会改动飞书应用。
+            </Text>
+            <View style={{ height: 1, backgroundColor: colors().border, marginVertical: 4 }} />
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              如果这个应用还没配置到 lark-cli，填写下面两项。App Secret 在飞书开发者后台「凭证与基础信息」里。
+            </Text>
             <FieldLabel text="App ID（cli_ 开头）" />
             <TextInput
               value={draft.appId}
@@ -640,17 +699,87 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               style={inputStyle()}
             />
             {status?.currentAppId ? (
-              <InfoRow label="当前生效" value={status.currentAppId + (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")} />
+              <InfoRow
+                label="当前生效"
+                value={
+                  status.currentAppId +
+                  (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")
+                }
+              />
+            ) : null}
+            <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+              <PrimaryButton
+                label={draft.enabled ? "保存并使用这个应用" : "保存、启用并使用这个应用"}
+                onPress={useManualApp}
+                disabled={!draft.appId.trim() || !draft.appSecret || saving}
+              />
+            </View>
+            {!draft.enabled ? (
+              <Text style={{ fontSize: 12, color: colors().statusWarning }}>
+                当前事件监听已停止；点上面的按钮会同时启用。
+              </Text>
             ) : null}
             <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
               已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存。按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示；请确保本机账户与备份安全。
             </Text>
+          </Card>
+          <Card>
+            <CardTitle
+              text="创建新应用（扫码）"
+              hint="没有可用的已有应用时，用飞书扫码创建一个新的 PersonalAgent 应用；会替换 lark-cli 默认应用配置"
+            />
+            <AppCreationSection
+              currentAppId={status?.currentAppId ?? null}
+              storedAppId={draft.appId}
+              onCreated={applyScannedApp}
+            />
+          </Card>
+          <Card>
+            <CardTitle
+              text="解绑当前机器人"
+              hint="停止接收新消息并清空插件内保存的凭证；不会删除飞书应用，也不会改动 lark-cli 配置。已开始的轮次可能仍会完成并回复"
+            />
+            {!draft.enabled ? (
+              <>
+                <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                  当前已停止监听。飞书应用和 lark-cli 配置都还在，可随时重新启用。
+                </Text>
+                <View style={{ flexDirection: "row", gap: 8 }}>
+                  <PrimaryButton label="重新启用事件监听" onPress={reenableBot} disabled={saving} />
+                </View>
+              </>
+            ) : confirmingUnbind ? (
+              <>
+                <Text style={{ fontSize: 12, color: colors().statusWarning }}>
+                  确定解绑？将停止事件监听，并清空插件内保存的 App ID / Secret。飞书应用和 lark-cli 配置不受影响。
+                </Text>
+                <View style={{ flexDirection: "row", gap: 8 }}>
+                  <PrimaryButton label="确认解绑" danger onPress={unbindBot} disabled={saving} />
+                  <PrimaryButton label="取消" subtle onPress={() => setConfirmingUnbind(false)} />
+                </View>
+              </>
+            ) : (
+              <View style={{ flexDirection: "row", gap: 8 }}>
+                <PrimaryButton
+                  label="解绑并停止监听"
+                  danger
+                  onPress={() => setConfirmingUnbind(true)}
+                  disabled={saving}
+                />
+              </View>
+            )}
           </Card>
         </ScrollView>
       ) : selection.kind === "global" ? (
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
             <CardTitle text="全局设置" hint="对全部会话生效" />
+            <ToggleRow
+              label="启用事件监听"
+              hint="关闭后停止接收飞书消息，保留应用、凭证与群绑定；重新开启即恢复"
+              value={draft.enabled}
+              onChange={(value) => patchDraft({ enabled: value })}
+            />
             <FieldLabel text="lark-cli 路径（空 = 自动发现：PATH / nvm / Homebrew）" />
             <TextInput
               value={draft.larkCliPath}

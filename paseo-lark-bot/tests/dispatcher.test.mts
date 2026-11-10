@@ -27,6 +27,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
   return {
     appId: "",
     appSecret: "",
+    enabled: true,
     larkCliPath: "",
     replyInThread: true,
     sessionIdleMinutes: 30,

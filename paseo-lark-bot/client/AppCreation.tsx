@@ -176,8 +176,8 @@ export function AppCreationSection({
   return (
     <View style={{ gap: 10 }}>
       <Text style={{ fontSize: 13, color: colors().foreground, lineHeight: 19 }}>
-        没有飞书应用时，用飞书扫码即可自动创建一个带机器人能力、长连接事件订阅和常用权限的
-        PersonalAgent 应用。创建成功后插件会自动改用新应用。
+        没有可用的已有应用时，用飞书扫码即可自动创建一个带机器人能力、长连接事件订阅和常用权限的
+        PersonalAgent 应用。创建成功后插件会自动改用并启用新应用。
       </Text>
 
       {needsConfirm ? (

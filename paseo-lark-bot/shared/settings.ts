@@ -94,6 +94,12 @@ export const botValuesSchema = z.object({
    */
   appId: z.string().default(""),
   appSecret: z.string().default(""),
+  /**
+   * Whether the plugin should listen for Feishu events. Turning this off is
+   * the "unbind" switch: consumers stop, but the app, lark-cli config, and
+   * chat bindings stay in place and can be re-enabled.
+   */
+  enabled: z.boolean().default(true),
   /** Explicit lark-cli binary path; empty means auto-discovery. */
   larkCliPath: z.string().default(""),
   /** Reply inside the source message's thread instead of the main stream. */

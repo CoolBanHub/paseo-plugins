@@ -44,6 +44,8 @@ describe("chat binding schema", () => {
     const parsed = botValuesSchema.parse({});
     assert.equal(parsed.questionCards, true);
     assert.equal(parsed.notifyPermission, false);
+    assert.equal(parsed.enabled, true);
+    assert.equal(botValuesSchema.parse({ enabled: false }).enabled, false);
   });
 });
 
