@@ -16,6 +16,7 @@ const binding: ChatBinding = {
   systemPrompt: "",
   replyStyle: "default",
   replyStylePrompt: "",
+  replyRewrite: "off",
   replyFormat: "markdown",
   mentionOnReply: "off",
 };

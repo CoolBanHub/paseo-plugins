@@ -92,6 +92,38 @@ export function replyStyleInstruction(style: ReplyStyle, custom: string): string
 }
 
 /**
+ * Optional post-processing pass: run one extra model turn over the final
+ * answer and send the shorter rewrite. Off by default; `long` only rewrites
+ * answers over REPLY_REWRITE_LONG_CHARS, `always` rewrites every answer.
+ */
+export const replyRewriteSchema = z.enum(["off", "long", "always"]);
+export type ReplyRewrite = z.output<typeof replyRewriteSchema>;
+
+export const REPLY_REWRITE_LONG_CHARS = 800;
+
+export const REPLY_REWRITE_OPTIONS: ReadonlyArray<{
+  value: ReplyRewrite;
+  label: string;
+  hint: string;
+}> = [
+  { value: "off", label: "关闭", hint: "直接发送原始回答，不额外调用模型。" },
+  {
+    value: "long",
+    label: "仅长回复",
+    hint: `超过 ${REPLY_REWRITE_LONG_CHARS} 字才改写；短回答原样发送。`,
+  },
+  {
+    value: "always",
+    label: "总是",
+    hint: "每条最终回答都改写；多一次模型调用和等待。",
+  },
+];
+
+/** Fallback rewrite instruction when the binding has no reply-style prompt. */
+export const DEFAULT_REWRITE_INSTRUCTION =
+  "把回答改写成 3-5 句：先给结论，再给关键下一步或注意事项；面向非技术同事，少用术语；代码块、命令、文件路径、链接和数字原样保留。";
+
+/**
  * A Feishu user allowed to drive the bot in one chat. Only `openId` is used
  * for matching; `name` is a display convenience kept from the member picker.
  */
@@ -160,6 +192,8 @@ export const chatBindingSchema = z.object({
   replyStyle: replyStyleSchema.default("default"),
   /** Custom reply instruction; only used when replyStyle is `custom`. */
   replyStylePrompt: z.string().default(""),
+  /** Optional AI rewrite of the final answer before sending it to Feishu. */
+  replyRewrite: replyRewriteSchema.default("off"),
   replyFormat: replyFormatSchema.default("markdown"),
   /** Who to @ in the group after the turn finishes. */
   mentionOnReply: mentionOnReplySchema.default("off"),

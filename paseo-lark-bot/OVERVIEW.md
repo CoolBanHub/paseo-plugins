@@ -84,11 +84,12 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 | `aiTitle` | `true` | 新话题首次 @ 时，用该会话绑定的模型跑一次一次性命名轮次，为智能体会话生成一句不超过 40 字、直接描述任务内容的标题（首轮回复会稍慢）。失败、超时（45 秒）或关闭时回退为清洗后的话题文本（截 60 字） |
 | `notifyPermission` | `false` | 普通权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题；dsh 的 ask_user_question 走 `questionCards` |
 | `questionCards` | `true` | 把 dsh 的 ask_user_question 以 Card 2.0 发到话题，点选项/多选后提交即可回答；需要飞书后台开启 `card.action.trigger` 回调。关闭后问题只能在 Paseo 处理 |
-| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyFormat` |
+| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyRewrite`、`replyFormat`、`mentionOnReply` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。设置保存会串行执行，避免并发 stop/start。
 - 每条绑定可选择**模型**、**思考深度**和**权限**：模型列表来自 Paseo provider 快照，留空使用 provider 默认模型；思考深度来自所选模型的 thinking options，留空使用模型默认（dsh 留空仍为最深 `max`）；权限在 Claude/Codex/ZCode 等 provider 上对应 provider mode（如 plan / acceptEdits / bypass、Codex default / full-access），在 dsh 上对应权限预设（仅可查看 / 工作区内修改 / 完全权限），留空时 dsh 沿用旧的 `danger-full-access`。
 - 每条绑定可选**回复风格**（`replyStyle`）：`default` / `concise`（3-5 句结论 + 下一步，保留代码命令）/ `plain`（面向非技术同事）/ `custom`（使用 `replyStylePrompt`）。风格指令追加在系统提示末尾，**不额外调用模型、不增加费用**；它只是提示词，模型仍可能不完全遵守。硬性长度仍由全局 `maxReplyChars` 和 `replySplit` 控制。保存后对新建的智能体会话生效；已有话题可发 `/new` 或等空闲重建后使用新风格。
+- 每条绑定可选 **AI 改写**（`replyRewrite`）：`off`（默认）/ `long`（超过 800 字才改写）/ `always`。开启后最终回答会再跑一次一次性模型轮次，用当前话题覆盖后的 provider/model 和上面的回复风格，把原文压成短版再发飞书；**会增加一次模型调用、延迟和费用**。原文保留在 Paseo 时间线；改写失败、超时或为空时自动发送原文。带 `<at>` 的机器人接力回复、失败/取消提示不改写。
 - `systemPrompt` 是替换而不是追加：填写后不再使用插件默认提示（包括提示注入边界和附件 helper 用法）；`replyStyle` / `replyStylePrompt` 会在这份自定义提示末尾再追加风格指令。
 - 每条绑定可配置「允许 @ 的成员」（`allowedUsers`，按飞书 open_id 匹配）：留空表示**所有人**都可以 @ 并触发（默认）；填写后只有名单内成员能驱动智能体。非名单成员 @ 机器人时只回复一条「当前会话仅允许指定成员 @ 我处理」提示，不创建智能体；但这条 @ 的文字、图片、视频、文件仍会作为话题上下文记录，方便名单内成员追问前文。机器人发送者不在名单内时，其 @ 静默忽略（不回复提示），但消息同样进入话题历史，避免机器人互相触发。
 - 设置界面提供「读取群成员」按钮（依赖 `im:chat.members:read`），也可手动填写 `ou_` 开头的 open_id；名单只作用于单个会话绑定。
@@ -123,6 +124,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - 收到一条会触发轮次的消息后，若开启 `ackReaction`，插件在触发消息上加 `OnIt` 表情；轮次结束（成功、失败或取消）移除它，成功时再加 `DONE`。表情是尽力而为：没有 reaction 权限或 API 失败只写日志，不影响回复。
 - 轮次开始时发一张进度卡片（`progressCard`），内容为已用时、排队数、最近的工具调用与一行输出/思考；更新按 2.5 秒节流，结束时原地变成「已完成/失败/已取消」。飞书卡片更新不会推送，所以完成提醒依赖 `DONE` 表情或最终回复。
 - 最终答案仍作为独立话题回复发送（保留 markdown/text/post 格式与接力 @）；卡片只承担过程可见性，不承载最终答案。
+- **AI 改写**（`replyRewrite`）：`turn_ended` 之后、发送之前跑一次一次性 agent（标签 `lark-bot-purpose: rewrite`，`autoArchive`/后台运行，30 秒超时），使用当前话题覆盖后的 provider/model。成功则用改写文本替换最终回复；失败、超时或空结果回退原文。`long` 仅对超过 800 字的回复触发；带 `<at>` 的机器人接力回复、失败/取消提示不改写。原文仍完整保留在 Paseo 时间线；`replyFooter` 的 token/费用仍是主轮次数据，不含改写调用。进度卡片会在主轮次结束时先显示已完成，改写后的最终回复可能晚几秒到达。
 - 长回复在 `replySplit` 开启时按行拆分，自动闭合/重开代码围栏，每段带 `（1/3）` 标记；超过 `maxReplyChunks` 的尾部截断并提示去 Paseo 查看。关闭后恢复旧的单条截断行为。
 - `replyFooter` 开启时，在最后一段追加 `— 模型 · 耗时 · 入/出 token · 费用`；费用与 token 来自 Paseo 的上报，缺失时只显示模型与耗时。
 - **完成后 @**（每个绑定单独配置，默认关闭）：可选 `@ 触发者`、`@ 话题发起人`、`@ 两者`。正文发送成功后再发一条独立的纯文本提醒（例如 `@张三 已完成，结果见上方回复。`），因为飞书只在文本消息里触发 @ 通知；正文仍按绑定选择的 markdown/text/post 格式发送。失败/取消也会提醒，文案不同。
@@ -189,6 +191,7 @@ npm run typecheck
 
 ## 已知限制
 
+- **AI 改写多一次模型调用**：会增加延迟和费用（30 秒超时）；原文只在 Paseo 时间线，飞书里只发短版。提示词要求保留代码/命令/链接，但模型仍可能丢细节；对准确性要求高的回答建议关闭。带 `<at>` 的接力回复、失败/取消提示不改写；`replyFooter` 的 usage 不含改写调用。
 - **扫码创建会替换 lark-cli 的默认应用配置**：`config init --new` 不带 `--name` 时会把新应用保存为唯一应用，其他 profile 会被清除；插件目前只读默认配置、不认 profile。已有应用请优先用「使用 lark-cli 当前应用」或手动填写凭证；只有确实没有现成应用时再用扫码创建，且先确认同机其他 lark-cli 使用方。
 - 扫码创建依赖 `lark-cli ≥ 1.0.98`；旧版本会提示升级。租户不允许成员创建自建应用时，扫码页会拒绝，插件无法绕过。
 - 扫码创建的应用默认不含 `im:message.group_msg`（敏感）和 `im:chat.members:read`：前者影响话题根消息/群历史/群媒体，后者影响「读取群成员」；需要时到开发者后台手动补。
@@ -200,7 +203,7 @@ npm run typecheck
 - 机器人自己发起的回复不会触发其他会话轮次，但若 post 回复中 @ 了其他机器人，对方 agent 的响应由对方的接入方处理。**接力循环熔断**（仅对 `post` 生效）：同一话题内连续 3 条回复都提及**本话题出现过的机器人**、或连续 3 条回复内容完全相同时，第 3 条会自动降级为纯文本（提及以 @名称 文字呈现，不会再触发其他机器人）并附一行说明；@ 人类成员不计入提及连击，单次正常交接不受影响，熔断后窗口重置。
 - **轮次重试是 at-least-once**：失败发生前如果智能体已经执行过工具操作，重跑同一段 prompt 可能重复执行。涉及写文件、发请求等副作用的场景，请在 prompt/工具侧做幂等，或把这类任务放到 Paseo 客户端手动执行。
 - 进程关闭/插件 reload 时会停止重试与看门狗定时器，并立即写入话题映射（不等 5 秒去抖），避免卸载后仍有延迟通知或在旧进程里覆盖新映射。
-- 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）；一次性命名会话带 `lark-bot-purpose: title` 标签，lark-notify 会自动跳过它们的通知。
+- 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）；一次性命名（`title`）与 AI 改写（`rewrite`）会话都带 `lark-bot-purpose` 标签，lark-notify 会自动跳过它们的通知。
 - 共享 workspace 的目录取**首次创建时**绑定的 `cwd`：之后再修改绑定 `cwd`、或存在多个不同 `cwd` 的绑定，都不会产生新的「飞书任务」workspace——所有话题 agent 仍落在第一个 workspace（工作目录以它为准）。开启 `workspacePerBinding` 可让每个绑定独立，但同一绑定之后的 `cwd` 修改仍需归档旧 workspace 才会重建。
 - **进度卡片不是可靠通道**：卡片 PATCH 受飞书限流与 30KB 上限影响，失败时只写日志并保留旧卡；最终答案始终单独发送，不依赖卡片。卡片更新不会推送，完成提示依赖 `DONE` 表情或最终回复。
 - `/stop` 只能清空本地排队；Paseo 插件 API 目前没有 `cancelAgent`，已在执行的轮次不会被中断，完成后仍会回复。

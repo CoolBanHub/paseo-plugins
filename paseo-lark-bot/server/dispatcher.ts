@@ -67,7 +67,15 @@ import {
   type PendingQuestion,
 } from "./question-store.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
-import { DEFAULT_BOT_VALUES, type BotValues, type ReplyFormat } from "../shared/settings.ts";
+import {
+  DEFAULT_BOT_VALUES,
+  REPLY_REWRITE_LONG_CHARS,
+  replyStyleInstruction,
+  type BotValues,
+  type ChatBinding,
+  type ReplyFormat,
+} from "../shared/settings.ts";
+import { rewriteReplyWithModel, type RewriteReplyOptions } from "./rewrite.ts";
 import { splitReply } from "./split.ts";
 import { SlidingWindowLimiter, formatRetryAfter } from "./rate-limit.ts";
 import { parseCommand, runCommand } from "./commands.ts";
@@ -121,6 +129,8 @@ export interface DispatcherOptions {
     /** Stable per logical reply; retries reuse it so sends cannot duplicate. */
     idempotencyKey?: string;
   }) => Promise<string | null>;
+  /** Injectable one-shot rewriter for tests; defaults to rewriteReplyWithModel. */
+  rewriteReply?: (options: RewriteReplyOptions) => Promise<string | null>;
   /** Injectable interactive-card sender for tests. */
   replyCard?: (options: {
     cliPath: string;
@@ -228,6 +238,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const resolveCli = options.resolveCli || ((explicit: string) => resolveLarkCli(explicit));
   const readOpenId = options.readOpenId || readBotOpenId;
   const reply = options.reply || replyMessage;
+  const rewrite = options.rewriteReply || rewriteReplyWithModel;
   const sendCard = options.replyCard || replyCard;
   const readThreadRootDetail = options.readThreadRootDetail || readMessageDetail;
   const readRaw = options.readRaw || readRawContent;
@@ -1819,6 +1830,19 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!ok) log("发送完成提醒失败");
   }
 
+  /**
+   * Optional AI rewrite of the final answer. Skip failed/cancelled notices,
+   * bot-to-bot relay replies (their <at> tags must survive), and short answers
+   * when the binding selected "long".
+   */
+  function shouldRewriteReply(binding: ChatBinding, text: string, outcome: TurnOutcome): boolean {
+    if (binding.replyRewrite === "off") return false;
+    if (outcome.outcome !== "completed") return false;
+    if (/<at\s+user_id=/i.test(text)) return false;
+    if (binding.replyRewrite === "long" && text.length < REPLY_REWRITE_LONG_CHARS) return false;
+    return true;
+  }
+
   async function deliverNow(
     chatId: string,
     topicKey: string | null,
@@ -1833,11 +1857,34 @@ export function createDispatcher(options: DispatcherOptions) {
     const configured: ReplyFormat = binding?.replyFormat ?? "markdown";
     let format = configured;
     let body = text;
+    if (binding && meta && shouldRewriteReply(binding, body, meta.outcome)) {
+      const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
+      const provider = overrides.provider ?? binding.provider;
+      const model = overrides.model ?? binding.model;
+      try {
+        const resolvedProvider = options.resolveProvider
+          ? await options.resolveProvider(provider, model)
+          : provider;
+        const rewritten = await rewrite({
+          paseo: options.paseo,
+          provider: resolvedProvider,
+          cwd: resolveCwd(overrides.cwd ?? binding.cwd),
+          chatId,
+          topicKey: meta.topicKey ?? topicKey ?? "",
+          text: body,
+          instruction: replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt),
+          log,
+        });
+        if (rewritten) body = rewritten;
+      } catch (error) {
+        log("改写回复失败，发送原文", error instanceof Error ? error.message : String(error));
+      }
+    }
     // Mentions only stay live in post format; markdown/text cannot trigger
     // another bot, so the guard must not rewrite those replies.
-    if (configured === "post" && topicKey && breaksRelayLoop(topicKey, text)) {
+    if (configured === "post" && topicKey && breaksRelayLoop(topicKey, body)) {
       format = "text";
-      body = stripMentionTags(text) + "\n\n" + RELAY_NOTE;
+      body = stripMentionTags(body) + "\n\n" + RELAY_NOTE;
     }
     let footer: string | undefined;
     if (values.replyFooter && binding && meta) {

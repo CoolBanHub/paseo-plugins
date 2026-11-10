@@ -18,7 +18,17 @@ describe("chat binding schema", () => {
     assert.equal(binding.systemPrompt, "");
     assert.equal(binding.replyStyle, "default");
     assert.equal(binding.replyStylePrompt, "");
+    assert.equal(binding.replyRewrite, "off");
     assert.equal(binding.replyFormat, "markdown");
+  });
+
+  it("accepts explicit AI rewrite modes", () => {
+    const parse = (value: string) =>
+      botValuesSchema.parse({ chats: [{ chatId: "oc_group", provider: "dsh", replyRewrite: value }] }).chats[0]
+        .replyRewrite;
+    assert.equal(parse("off"), "off");
+    assert.equal(parse("long"), "long");
+    assert.equal(parse("always"), "always");
   });
 
   it("maps reply-style presets to prompt text and trims custom text", () => {

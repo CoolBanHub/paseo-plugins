@@ -8,6 +8,7 @@ import type {
   SessionPermissionResponse,
 } from "../server/sessions.ts";
 import { questionCardToken } from "../server/question-card.ts";
+import type { RewriteReplyOptions } from "../server/rewrite.ts";
 import { DEFAULT_BOT_VALUES, type BotValues } from "../shared/settings.ts";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,6 +45,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         systemPrompt: "",
         replyStyle: "default",
         replyStylePrompt: "",
+        replyRewrite: "off",
         replyFormat: "markdown",
         mentionOnReply: "off",
       },
@@ -308,6 +310,85 @@ describe("createDispatcher", () => {
     assert.equal(h.replies[0].format, "markdown");
     assert.equal(h.replies[0].replyInThread, true);
     assert.ok(h.replies[0].text.includes("已经修复"));
+  });
+
+  it("sends the AI-rewritten answer when replyRewrite is always", async () => {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0],
+      replyRewrite: "always",
+      replyStyle: "custom",
+      replyStylePrompt: "用三句话回答",
+    };
+    const seen: RewriteReplyOptions[] = [];
+    const h = makeHarness(values, {
+      rewriteReply: async (options) => {
+        seen.push(options);
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始长回答"));
+    await flush();
+    assert.equal(h.replies.length, 1);
+    assert.equal(h.replies[0].text, "精简版回答");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, "原始长回答");
+    assert.match(seen[0].instruction, /用三句话回答/);
+  });
+
+  it("does not rewrite short answers in long mode", async () => {
+    const values = baseValues();
+    values.chats[0] = { ...values.chats[0], replyRewrite: "long" };
+    const seen: RewriteReplyOptions[] = [];
+    const h = makeHarness(values, {
+      rewriteReply: async (options) => {
+        seen.push(options);
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "短回答"));
+    await flush();
+    assert.equal(h.replies[0].text, "短回答");
+    assert.equal(seen.length, 0);
+  });
+
+  it("rewrites long answers in long mode", async () => {
+    const values = baseValues();
+    values.chats[0] = { ...values.chats[0], replyRewrite: "long" };
+    const seen: RewriteReplyOptions[] = [];
+    const h = makeHarness(values, {
+      rewriteReply: async (options) => {
+        seen.push(options);
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    const long = "长".repeat(801);
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, long));
+    await flush();
+    assert.equal(h.replies[0].text, "精简版回答");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, long);
+  });
+
+  it("falls back to the original answer when the rewrite fails", async () => {
+    const values = baseValues();
+    values.chats[0] = { ...values.chats[0], replyRewrite: "always" };
+    const h = makeHarness(values, {
+      rewriteReply: async () => {
+        throw new Error("rewrite down");
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始回答"));
+    await flush();
+    assert.equal(h.replies[0].text, "原始回答");
   });
 
   it("records unmatched chats and stays silent unless configured", async () => {
@@ -1237,6 +1318,7 @@ describe("p2p and delivery hygiene", () => {
         systemPrompt: "",
         replyStyle: "default",
         replyStylePrompt: "",
+        replyRewrite: "off",
         replyFormat: "markdown",
         mentionOnReply: "off",
       },

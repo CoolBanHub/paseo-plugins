@@ -2,6 +2,7 @@ import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { LarkBotChatMember, LarkBotProviderInfo } from "../shared/contracts.ts";
 import {
   MENTION_ON_REPLY_OPTIONS,
+  REPLY_REWRITE_OPTIONS,
   REPLY_STYLE_OPTIONS,
   type ChatBinding,
   type ReplyFormat,
@@ -339,6 +340,25 @@ export function BindingEditor({
         <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
           风格是提示词，模型可能不完全遵守；保存后对新建会话生效，已有话题可发 /new 重建。硬性长度限制可在全局设置里调小「单条回复长度」。
         </Text>
+        <FieldLabel text="AI 改写（可选；最终回答再跑一次模型压缩）" />
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+          {REPLY_REWRITE_OPTIONS.map((option) => (
+            <ChoicePill
+              key={option.value}
+              label={option.label}
+              active={binding.replyRewrite === option.value}
+              onPress={() => onPatch({ replyRewrite: option.value })}
+            />
+          ))}
+        </View>
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          {REPLY_REWRITE_OPTIONS.find((option) => option.value === binding.replyRewrite)?.hint ?? ""}
+        </Text>
+        {binding.replyRewrite !== "off" ? (
+          <Text style={{ fontSize: 11, color: colors().statusWarning, lineHeight: 17 }}>
+            会额外调用一次当前绑定的模型，增加延迟和费用；原文保留在 Paseo，失败/超时自动发原文。带 @ 接力的回复不改写。
+          </Text>
+        ) : null}
         <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {REPLY_FORMATS.map((format) => (
