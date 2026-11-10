@@ -1,6 +1,6 @@
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { LarkBotChatMember, LarkBotProviderInfo } from "../shared/contracts.ts";
-import type { ChatBinding, ReplyFormat } from "../shared/settings.ts";
+import { REPLY_STYLE_OPTIONS, type ChatBinding, type ReplyFormat } from "../shared/settings.ts";
 import {
   Card,
   CardTitle,
@@ -295,7 +295,7 @@ export function BindingEditor({
           onChangeText={(text) => onPatch({ cwd: text })}
           style={inputStyle()}
         />
-        <FieldLabel text="系统提示（可选，追加在该会话的指令前）" />
+        <FieldLabel text="系统提示（可选，替换插件默认提示；留空用默认）" />
         <TextInput
           value={binding.systemPrompt}
           placeholder="例：你是项目维护助手，用中文回答"
@@ -304,6 +304,36 @@ export function BindingEditor({
           onChangeText={(text) => onPatch({ systemPrompt: text })}
           style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
         />
+        <FieldLabel text="回复风格（追加到系统提示末尾；只影响智能体的文本回答）" />
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+          {REPLY_STYLE_OPTIONS.map((style) => (
+            <ChoicePill
+              key={style.value}
+              label={style.label}
+              active={binding.replyStyle === style.value}
+              onPress={() => onPatch({ replyStyle: style.value })}
+            />
+          ))}
+        </View>
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          {REPLY_STYLE_OPTIONS.find((style) => style.value === binding.replyStyle)?.hint ?? ""}
+        </Text>
+        {binding.replyStyle === "custom" ? (
+          <>
+            <FieldLabel text="自定义回复要求" />
+            <TextInput
+              value={binding.replyStylePrompt}
+              placeholder="例：用 3-5 句中文回答，先说结论，面向非技术同事，保留代码和命令"
+              placeholderTextColor={colors().foregroundMuted}
+              multiline
+              onChangeText={(text) => onPatch({ replyStylePrompt: text })}
+              style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
+            />
+          </>
+        ) : null}
+        <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
+          风格是提示词，模型可能不完全遵守；保存后对新建会话生效，已有话题可发 /new 重建。硬性长度限制可在全局设置里调小「单条回复长度」。
+        </Text>
         <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {REPLY_FORMATS.map((format) => (

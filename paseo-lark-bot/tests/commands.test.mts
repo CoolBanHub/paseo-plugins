@@ -14,6 +14,8 @@ const binding: ChatBinding = {
   allowedUsers: [],
   cwd: "/tmp/project",
   systemPrompt: "",
+  replyStyle: "default",
+  replyStylePrompt: "",
   replyFormat: "markdown",
 };
 

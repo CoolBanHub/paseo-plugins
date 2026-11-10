@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { botValuesSchema, isDshProvider } from "../shared/settings.ts";
+import { botValuesSchema, isDshProvider, replyStyleInstruction } from "../shared/settings.ts";
 
 describe("chat binding schema", () => {
   it("fills the new model/thinking/permission/allowlist fields for old settings", () => {
@@ -16,7 +16,17 @@ describe("chat binding schema", () => {
     // Existing cwd/system-prompt/reply-format defaults are unchanged.
     assert.equal(binding.cwd, "");
     assert.equal(binding.systemPrompt, "");
+    assert.equal(binding.replyStyle, "default");
+    assert.equal(binding.replyStylePrompt, "");
     assert.equal(binding.replyFormat, "markdown");
+  });
+
+  it("maps reply-style presets to prompt text and trims custom text", () => {
+    assert.equal(replyStyleInstruction("default", "ignored"), "");
+    assert.match(replyStyleInstruction("concise", ""), /3-5 句/);
+    assert.match(replyStyleInstruction("plain", ""), /非技术同事/);
+    assert.equal(replyStyleInstruction("custom", "  用三句话回答  "), "用三句话回答");
+    assert.equal(replyStyleInstruction("custom", "   "), "");
   });
 
   it("keeps an explicit allowlist and trims nothing implicitly", () => {

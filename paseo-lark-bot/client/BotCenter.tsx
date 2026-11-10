@@ -196,6 +196,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               allowedUsers: [],
               cwd: "",
               systemPrompt: "",
+              replyStyle: "default",
+              replyStylePrompt: "",
               replyFormat: "markdown",
             },
           ],
@@ -1001,6 +1003,7 @@ function normalize(values: BotValues): BotValues {
         ),
       cwd: chat.cwd.trim(),
       systemPrompt: chat.systemPrompt.trim(),
+      replyStylePrompt: chat.replyStylePrompt.trim(),
     })),
   };
 }

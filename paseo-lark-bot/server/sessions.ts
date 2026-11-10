@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
   DSH_DEFAULT_PERMISSION,
   isDshProvider,
+  replyStyleInstruction,
   type ChatBinding,
 } from "../shared/settings.ts";
 import { isMissingAgentError, isTransientTurnError, sanitizeTopicText } from "./format.ts";
@@ -115,6 +116,8 @@ function providerCreateConfig(
 } {
   const thinking = overrides.thinkingOptionId ?? binding.thinkingOptionId;
   const permission = overrides.permission ?? binding.permission;
+  const basePrompt = binding.systemPrompt?.trim() || defaultSystemPrompt(helperPath, attachmentContext);
+  const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
   const config: {
     provider: string;
     systemPrompt?: string;
@@ -123,7 +126,7 @@ function providerCreateConfig(
     featureValues?: Record<string, unknown>;
   } = {
     provider,
-    systemPrompt: binding.systemPrompt?.trim() || defaultSystemPrompt(helperPath, attachmentContext),
+    systemPrompt: styleInstruction ? `${basePrompt}\n\n### 回复风格\n${styleInstruction}` : basePrompt,
   };
 
   if (isDshProvider(provider)) {

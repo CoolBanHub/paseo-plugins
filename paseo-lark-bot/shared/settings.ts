@@ -17,6 +17,50 @@ export const replyFormatSchema = z.enum(["markdown", "text", "post"]);
 export type ReplyFormat = z.output<typeof replyFormatSchema>;
 
 /**
+ * Reply-style presets are appended to the agent's system prompt. They are
+ * instructions to the main turn only — no second model call, no extra cost.
+ */
+export const replyStyleSchema = z.enum(["default", "concise", "plain", "custom"]);
+export type ReplyStyle = z.output<typeof replyStyleSchema>;
+
+export const REPLY_STYLE_OPTIONS: ReadonlyArray<{
+  value: ReplyStyle;
+  label: string;
+  hint: string;
+}> = [
+  { value: "default", label: "默认", hint: "不追加额外要求，沿用智能体自己的回答风格。" },
+  {
+    value: "concise",
+    label: "简洁结论",
+    hint: "3-5 句，先给结论和下一步；代码、命令、路径保留。",
+  },
+  {
+    value: "plain",
+    label: "通俗解释",
+    hint: "面向非技术同事，少用术语；代码、命令、路径保留。",
+  },
+  {
+    value: "custom",
+    label: "自定义",
+    hint: "在下方填写自己的回复要求，会追加到系统提示末尾；留空则不追加。",
+  },
+];
+
+/** Prompt text appended for a reply style; empty for default or blank custom. */
+export function replyStyleInstruction(style: ReplyStyle, custom: string): string {
+  switch (style) {
+    case "concise":
+      return "回答控制在 3-5 句：先给结论，再给关键下一步或注意事项。只保留必要的细节，不要复述分析过程；代码块、命令、文件路径和链接原样保留，不要省略。";
+    case "plain":
+      return "面向非技术同事解释：先说结论，以及这对用户意味着什么、需要做什么。少用术语；必须使用术语时用一句话解释。代码块、命令、文件路径和链接原样保留。";
+    case "custom":
+      return custom.trim();
+    default:
+      return "";
+  }
+}
+
+/**
  * A Feishu user allowed to drive the bot in one chat. Only `openId` is used
  * for matching; `name` is a display convenience kept from the member picker.
  */
@@ -76,8 +120,15 @@ export const chatBindingSchema = z.object({
    * node:os because the client loads it too).
    */
   cwd: z.string().default(""),
-  /** Optional extra system prompt prepended for this chat. */
+  /** Optional system prompt for this chat; replaces the plugin default when set. */
   systemPrompt: z.string().default(""),
+  /**
+   * Appended to the effective system prompt as an extra reply-style
+   * instruction. `custom` uses replyStylePrompt below.
+   */
+  replyStyle: replyStyleSchema.default("default"),
+  /** Custom reply instruction; only used when replyStyle is `custom`. */
+  replyStylePrompt: z.string().default(""),
   replyFormat: replyFormatSchema.default("markdown"),
 });
 

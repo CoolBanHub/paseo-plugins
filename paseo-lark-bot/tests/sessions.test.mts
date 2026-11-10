@@ -71,6 +71,8 @@ const binding: ChatBinding = {
   allowedUsers: [],
   cwd: "/tmp/project",
   systemPrompt: "用中文回答",
+  replyStyle: "default",
+  replyStylePrompt: "",
   replyFormat: "markdown",
 };
 
@@ -1320,6 +1322,30 @@ describe("default system prompt", () => {
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     assert.equal(h.created[0].config.systemPrompt, "用中文回答");
+  });
+
+  it("appends a preset reply-style instruction after the system prompt", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      replyStyle: "concise",
+    });
+    await flush();
+    const prompt = h.created[0].config.systemPrompt ?? "";
+    assert.match(prompt, /^用中文回答/);
+    assert.match(prompt, /### 回复风格/);
+    assert.match(prompt, /3-5 句/);
+  });
+
+  it("appends a custom reply-style prompt", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      replyStyle: "custom",
+      replyStylePrompt: "  用三句话回答  ",
+    });
+    await flush();
+    assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);
   });
 });
 

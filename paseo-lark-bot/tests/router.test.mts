@@ -35,6 +35,8 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
+        replyStyle: "default" as const,
+        replyStylePrompt: "",
         replyFormat: "markdown" as const,
       },
       {
@@ -47,6 +49,8 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         allowedUsers: [],
         cwd: "/tmp",
         systemPrompt: "",
+        replyStyle: "default" as const,
+        replyStylePrompt: "",
         replyFormat: "text" as const,
       },
     ],
