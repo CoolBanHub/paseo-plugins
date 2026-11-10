@@ -243,7 +243,7 @@ test("honours the turn-completion notification toggle", async () => {
   assert.equal(sent.length, 0);
 });
 
-test("skips one-shot lark-bot title sessions and fails open on lookup errors", async () => {
+test("skips all one-shot lark-bot helper sessions and fails open on lookup errors", async () => {
   const paseoWith = (labels: Record<string, string> | null, fail = false): NotifyPaseoApi => ({
     agents: {
       ref: () => ({
@@ -255,13 +255,15 @@ test("skips one-shot lark-bot title sessions and fails open on lookup errors", a
     },
   });
 
-  // A titled helper session notifies for neither turn ends nor permissions.
-  const helper = fixture();
-  const helperPaseo = paseoWith({ "lark-bot-purpose": "title" });
-  helper.notifier.handleCreated({ agent } as never);
-  await helper.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, helperPaseo);
-  await helper.notifier.handlePermission({ agent, request } as never, helperPaseo);
-  assert.equal(helper.sent.length, 0);
+  // Helper sessions notify for neither turn ends nor permissions.
+  for (const purpose of ["title", "rewrite"]) {
+    const helper = fixture();
+    const helperPaseo = paseoWith({ "lark-bot-purpose": purpose });
+    helper.notifier.handleCreated({ agent } as never);
+    await helper.notifier.handleTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, helperPaseo);
+    await helper.notifier.handlePermission({ agent, request } as never, helperPaseo);
+    assert.equal(helper.sent.length, 0, purpose);
+  }
 
   // A refresh failure must not swallow real notifications.
   const failing = fixture();
