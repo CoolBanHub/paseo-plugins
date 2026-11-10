@@ -12,8 +12,8 @@ export interface RoutingDecision {
 
 /**
  * True when this sender may drive the bot in the chat. Empty = everyone.
- * Dispatchers still record unmentioned messages from disallowed senders as
- * context; only their @-mentions are rejected.
+ * Dispatchers still record every message from disallowed senders as context;
+ * the allowlist only rejects starting a turn from their @-mention.
  */
 export function isSenderAllowed(binding: ChatBinding, senderId: string): boolean {
   return (

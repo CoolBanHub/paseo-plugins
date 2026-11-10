@@ -606,27 +606,26 @@ export function createDispatcher(options: DispatcherOptions) {
         return;
       }
 
-      // Record/ingest before routing so unmentioned messages in a bound chat
-      // still contribute thread context; awaiting the download keeps a fast
+      // Record/ingest before routing so every message in a bound chat stays
+      // as context, whatever its sender; awaiting the download keeps a fast
       // follow-up @ from reading an empty image cache.
       //
       // allowedUsers only gates who may *trigger* a turn. A disallowed
-      // member's mention is rejected before it can enter the transcript, but
-      // their unmentioned messages stay as context for an allowed member's
+      // member's @ is still recorded (text and media) for an allowed member's
       // later @ — otherwise the bot loses the discussion around the request.
       const allowed = isSenderAllowed(binding, event.sender_id);
       const triggered =
         event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
-      if (!allowed && triggered) {
-        if (event.sender_type !== "bot") {
-          log(`会话 ${event.chat_id} 收到未授权成员 ${event.sender_id} 的 @，已拒绝处理`);
-          await send(cliPath, event.message_id, BLOCKED_HINT, values, "text");
-        }
-        return;
-      }
+      const blocked = !allowed && triggered;
       recordHistory(event);
+      if (blocked && event.sender_type !== "bot") {
+        // Reply first so a slow media download never delays the rejection.
+        log(`会话 ${event.chat_id} 收到未授权成员 ${event.sender_id} 的 @，已拒绝处理`);
+        await send(cliPath, event.message_id, BLOCKED_HINT, values, "text");
+      }
       await ingestMedia(cliPath, event);
       await ensureRootMedia(cliPath, event);
+      if (blocked) return;
       if (!allowed) return;
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;

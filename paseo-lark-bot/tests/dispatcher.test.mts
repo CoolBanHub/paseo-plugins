@@ -187,7 +187,7 @@ describe("createDispatcher", () => {
     assert.ok(last.text.includes("处理结果答复"));
   });
 
-  it("rejects non-allowlisted senders without recording their text", async () => {
+  it("rejects non-allowlisted senders but keeps their text as context", async () => {
     const base = baseValues();
     const first = base.chats[0];
     assert.ok(first);
@@ -222,7 +222,7 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.created.length, 1);
     assert.ok(h.created[0].prompt?.includes("正常请求"));
-    assert.ok(!h.created[0].prompt?.includes("机密讨论"), "blocked text must stay out of thread history");
+    assert.ok(h.created[0].prompt?.includes("机密讨论"), "blocked text must be kept as thread context");
   });
 
   it("keeps unmentioned messages from non-allowlisted members as context", async () => {
@@ -323,6 +323,62 @@ describe("createDispatcher", () => {
     assert.equal(createdImages?.length, 1, "image from a non-allowlisted member should be attached");
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("成员B: [图片]"), prompt);
+    assert.ok(prompt.includes("【附图】"), prompt);
+  });
+
+  it("keeps media from a non-allowlisted member's @ as context", async () => {
+    const base = baseValues();
+    const first = base.chats[0];
+    assert.ok(first);
+    const h = makeHarness();
+    const replies: string[] = [];
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () =>
+        baseValues({
+          chats: [{ ...first, allowedUsers: [{ openId: "ou_boss", name: "指定人" }] }],
+        }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readRaw: async (_cli, id) =>
+        id === "om_blocked_post" ? { image_key: "img_v3_blocked" } : null,
+      download: async ({ fileKey }) => ({ bytes: Buffer.from("fake-jpeg-" + fileKey), extension: ".jpg" }),
+      extractFrames: async () => [],
+      reply: async (options) => {
+        replies.push(options.text);
+        return null;
+      },
+    });
+
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_blocked_post",
+        root_id: "om_root",
+        sender_id: "ou_other",
+        message_type: "post",
+        content: "@_user_1 看这张图",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 0, "blocked sender must not start a session");
+    assert.equal(replies.length, 1);
+    assert.ok(replies[0].includes("指定成员"));
+
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_trigger",
+        root_id: "om_root",
+        sender_id: "ou_boss",
+        content: "@_user_1 处理一下",
+      }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const createdImages = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(createdImages?.length, 1, "image from a blocked @ should be attached");
+    const prompt = h.created[0].prompt ?? "";
+    assert.ok(prompt.includes("看这张图"), prompt);
+    assert.ok(prompt.includes("成员A: 看这张图"), prompt);
     assert.ok(prompt.includes("【附图】"), prompt);
   });
 
