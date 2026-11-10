@@ -931,6 +931,48 @@ describe("thread-root media backfill", () => {
     const images = (h.created[0] as { images?: unknown[] }).images;
     assert.equal(images?.length, 1);
   });
+
+  it("attaches root images even when events disagree on the topic key", async () => {
+    const h = makeHarness();
+    const downloads: string[] = [];
+    const dispatch = createDispatcher({
+      paseo: h.paseoRef,
+      readValues: async () => baseValues({ aiTitle: false }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      readThreadRootDetail: async (_cli, id) =>
+        id === "om_root" ? { text: "[图片] 这是什么页面", senderOpenId: "ou_user", senderName: "张三" } : null,
+      readRaw: async (_cli, id) => (id === "om_root" ? { image_key: "img_v3_root" } : null),
+      download: async ({ fileKey }) => {
+        downloads.push(fileKey);
+        return { bytes: Buffer.from("root-png"), extension: ".png" };
+      },
+      extractFrames: async () => [],
+      reply: async () => null,
+    });
+    // A member replies without @: the event carries only thread_id + reply_to,
+    // so its topic key is the thread id — not the root id the @ below uses.
+    await dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_note",
+        thread_id: "omt_1",
+        reply_to: "om_root",
+        content: "帮看看",
+        mentions: [],
+      }),
+    );
+    await flush();
+    assert.deepEqual(downloads, ["img_v3_root"], "the note's reference backfills the root image");
+    // The owner @s the bot by replying directly to the root message.
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_at", root_id: "om_root", content: "@测试机器人 这是什么页面" }),
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const images = (h.created[0] as { images?: unknown[] }).images;
+    assert.equal(images?.length, 1, "root images must attach despite the key drift");
+    assert.ok((h.created[0].prompt ?? "").includes("【附图】"));
+  });
 });
 
 describe("bot relay loop guard", () => {

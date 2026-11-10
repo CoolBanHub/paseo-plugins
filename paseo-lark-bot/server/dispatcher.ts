@@ -74,12 +74,11 @@ export interface DispatcherOptions {
 }
 
 const UNMATCHED_KEEP = 20;
-/** Images attached per turn, and cached per topic, respectively. */
+/** Images attached per turn, and cached per message, respectively. */
 const MAX_IMAGES_PER_TURN = 4;
-const MAX_TOPIC_IMAGES = 8;
+const MAX_CACHED_MEDIA_MESSAGES = 200;
 /** Bound in-memory topic state for long-running daemons and busy tenants. */
 const MAX_TOPIC_HISTORY = 500;
-const MAX_TOPIC_IMAGE_TOPICS = 50;
 /** Chinese labels for non-text message types in thread context. */
 const MEDIA_LABELS: Record<string, string> = {
   image: "图片",
@@ -184,8 +183,8 @@ export function createDispatcher(options: DispatcherOptions) {
   const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
   /** Last message that actually triggered a bot turn, per topic. */
   const lastTriggerMessage = new Map<string, string>();
-  /** Images collected per topic (downloads of image posts + video frames). */
-  const topicImages = new Map<string, TopicImage[]>();
+  /** Images collected per MESSAGE (downloads of image posts + video frames). */
+  const imagesByMessage = new Map<string, TopicImage[]>();
   /**
    * Messages whose media was already ingested (live event or root backfill);
    * guards the backfill from re-downloading on every in-thread message.
@@ -369,15 +368,19 @@ export function createDispatcher(options: DispatcherOptions) {
     }
   }
 
-  function cacheImages(key: string, messageId: string, buffers: { bytes: Buffer; mime: string }[]): void {
-    const images = topicImages.get(key) ?? [];
+  function cacheImages(messageId: string, buffers: { bytes: Buffer; mime: string }[]): void {
+    // Images are keyed by MESSAGE id, not by topic key: Feishu thread events
+    // carry either root_id or thread_id, so a topic's key drifts between the
+    // two and a per-topic cache would split. Turn assembly aggregates by the
+    // message ids the topic references.
+    const images = imagesByMessage.get(messageId) ?? [];
     for (const [index, buffer] of buffers.entries()) {
       const attachment = toImageAttachment(buffer.bytes, buffer.mime);
       if (!attachment) continue;
       const file = options.mediaStoreDir
         ? persistMediaFile(
             options.mediaStoreDir,
-            key,
+            messageId,
             messageId,
             images.length + index + 1,
             buffer.bytes,
@@ -386,23 +389,44 @@ export function createDispatcher(options: DispatcherOptions) {
         : null;
       images.push(file ? { ...attachment, file } : attachment);
     }
-    if (images.length > MAX_TOPIC_IMAGES) images.splice(0, images.length - MAX_TOPIC_IMAGES);
-    topicImages.set(key, images);
-    pruneMap(topicImages, MAX_TOPIC_IMAGE_TOPICS, key);
+    if (images.length > MAX_IMAGES_PER_TURN) images.splice(0, images.length - MAX_IMAGES_PER_TURN);
+    if (images.length > 0) {
+      imagesByMessage.set(messageId, images);
+      pruneMap(imagesByMessage, MAX_CACHED_MEDIA_MESSAGES, messageId);
+    }
+  }
+
+  /**
+   * Images to attach to the current turn: the ones downloaded for the thread
+   * root, the recorded topic history, and the triggering message itself —
+   * newest last, clipped to the per-turn cap. Aggregating by message id keeps
+   * this working no matter which key (root_id vs thread_id) the events used.
+   */
+  function imagesForTurn(event: LarkMessageEvent): TopicImage[] {
+    const rootId = event.root_id || event.reply_to || null;
+    const historyIds = (topicHistory.get(topicKeyFor(event)) ?? []).map((entry) => entry.messageId);
+    const candidates = [...(rootId ? [rootId] : []), ...historyIds, event.message_id];
+    const seen = new Set<string>();
+    const collected: TopicImage[] = [];
+    for (const id of candidates) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      collected.push(...(imagesByMessage.get(id) ?? []));
+    }
+    return collected.slice(-MAX_IMAGES_PER_TURN);
   }
 
   /**
    * Download media posted in a topic: images (including images embedded in a
-   * post) as-is, videos as extracted frames. Everything is cached per topic so
-   * the next @-mention in the thread carries it to the provider. Failures
-   * degrade to placeholders.
+   * post) as-is, videos as extracted frames. Everything is cached per message
+   * (see cacheImages) so the next @-mention in the thread carries it to the
+   * provider. Failures degrade to placeholders.
    */
   async function ingestMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
     markIngested(event.message_id);
     const kind =
       event.message_type === "image" ? "image" : event.message_type === "media" ? "video" : null;
     if (!kind && event.message_type !== "post") return;
-    const key = topicKeyFor(event);
     try {
       const raw = await readRaw(cliPath, event.message_id);
       if (!raw) return;
@@ -427,7 +451,7 @@ export function createDispatcher(options: DispatcherOptions) {
             type: "image",
             maxBytes: 5 * 1024 * 1024,
           });
-          cacheImages(key, event.message_id, [
+          cacheImages(event.message_id, [
             { bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" },
           ]);
           return;
@@ -449,7 +473,7 @@ export function createDispatcher(options: DispatcherOptions) {
           for (const frame of await extractFrames(videoPath, ffmpeg, 3)) {
             buffers.push({ bytes: frame, mime: "image/jpeg" });
           }
-          cacheImages(key, event.message_id, buffers);
+          cacheImages(event.message_id, buffers);
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -467,7 +491,7 @@ export function createDispatcher(options: DispatcherOptions) {
         });
         buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
       }
-      cacheImages(key, event.message_id, buffers);
+      cacheImages(event.message_id, buffers);
     } catch (error) {
       log("处理话题媒体失败", error instanceof Error ? error.message : String(error));
     }
@@ -506,7 +530,7 @@ export function createDispatcher(options: DispatcherOptions) {
         });
         buffers.push({ bytes: resource.bytes, mime: resource.extension === ".png" ? "image/png" : "image/jpeg" });
       }
-      cacheImages(topicKeyFor(event), rootId, buffers);
+      cacheImages(rootId, buffers);
     } catch (error) {
       log("补拉话题根消息图片失败", error instanceof Error ? error.message : String(error));
     }
@@ -614,7 +638,7 @@ export function createDispatcher(options: DispatcherOptions) {
       // context, while each fresh @-mention starts an independent topic. P2P
       // has no thread root, so the chat itself is the continuous topic.
       const topicKey = topicKeyFor(event);
-      const images = (topicImages.get(topicKey) ?? []).slice(-MAX_IMAGES_PER_TURN);
+      const images = imagesForTurn(event);
 
       // A bare @-mention means "go handle the thread": proceed whenever the
       // thread carries any context (topic subject, history, or images) and
