@@ -39,6 +39,12 @@ describe("chat binding schema", () => {
     assert.equal(binding.permission, "plan");
     assert.deepEqual(binding.allowedUsers, [{ openId: "ou_boss", name: "老板" }]);
   });
+
+  it("enables question cards while keeping permission notices opt-in", () => {
+    const parsed = botValuesSchema.parse({});
+    assert.equal(parsed.questionCards, true);
+    assert.equal(parsed.notifyPermission, false);
+  });
 });
 
 describe("isDshProvider", () => {

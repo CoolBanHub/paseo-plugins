@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listChatMembers, parseLarkJson, replyMessage, resolveLarkCli } from "../server/lark.ts";
+import { listChatMembers, parseLarkJson, replyCard, replyMessage, resolveLarkCli } from "../server/lark.ts";
 
 describe("parseLarkJson", () => {
   it("parses JSON after leading warnings", () => {
@@ -98,6 +98,49 @@ describe("applyAppCredentials", () => {
     });
     assert.deepEqual(calls, [{ appId: "cli_good", secret: "secret" }]);
     assert.equal(busStopped, true);
+  });
+});
+
+describe("replyCard", () => {
+  it("feeds the Card 2.0 JSON through stdin", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-card-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+let stdin = "";
+process.stdin.on("data", (chunk) => { stdin += chunk; });
+process.stdin.on("end", () => {
+  let card = null;
+  try { card = JSON.parse(stdin); } catch {}
+  const ok =
+    args.includes("--msg-type") &&
+    args.includes("interactive") &&
+    args.includes("--content") &&
+    args.includes("-") &&
+    args.includes("--reply-in-thread") &&
+    card?.schema === "2.0";
+  if (!ok) {
+    console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv/stdin" } }));
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ ok: true, data: { message_id: "om_card" } }));
+});
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const messageId = await replyCard({
+        cliPath: cli,
+        messageId: "om_trigger",
+        card: { schema: "2.0", body: { elements: [] } },
+        replyInThread: true,
+      });
+      assert.equal(messageId, "om_card");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

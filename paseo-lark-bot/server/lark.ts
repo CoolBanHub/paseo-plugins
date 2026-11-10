@@ -302,6 +302,41 @@ export async function listChats(cliPath: string): Promise<LarkChat[]> {
   return chats;
 }
 
+/**
+ * Reply with an interactive card (Card 2.0) under the source message. The
+ * card JSON goes through stdin so large forms do not show up in `ps`.
+ */
+export async function replyCard(options: {
+  cliPath: string;
+  messageId: string;
+  card: Record<string, unknown>;
+  replyInThread: boolean;
+  idempotencyKey?: string;
+}): Promise<string | null> {
+  const args = [
+    "im",
+    "+messages-reply",
+    "--message-id",
+    options.messageId,
+    "--as",
+    "bot",
+    "--msg-type",
+    "interactive",
+    "--content",
+    "-",
+  ];
+  if (options.replyInThread) args.push("--reply-in-thread");
+  if (options.idempotencyKey) args.push("--idempotency-key", options.idempotencyKey.slice(0, 50));
+  const stdout = await runWithStdin(options.cliPath, args, JSON.stringify(options.card));
+  const payload = parseLarkJson(stdout);
+  if (payload?.ok !== true) {
+    const error = payload?.error;
+    throw new Error("发送问题卡片失败：" + (error?.message || stdout.trim() || "lark-cli 无输出").slice(0, 400));
+  }
+  const messageId = (payload.data as { message_id?: unknown } | undefined)?.message_id;
+  return typeof messageId === "string" ? messageId : null;
+}
+
 export interface LarkChatMember {
   openId: string;
   name: string;

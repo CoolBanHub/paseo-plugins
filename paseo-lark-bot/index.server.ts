@@ -8,7 +8,12 @@ import {
   larkBotProvidersRpc,
   larkBotStatusRpc,
 } from "./shared/contracts.ts";
-import { createEventConsumer, type EventConsumer, type LarkMessageEvent } from "./server/lark-events.ts";
+import {
+  createEventConsumer,
+  type EventConsumer,
+  type LarkCardActionEvent,
+  type LarkMessageEvent,
+} from "./server/lark-events.ts";
 import {
   applyAppCredentials,
   listChatMembers,
@@ -39,6 +44,8 @@ let paseo: SessionPaseoApi | null = null;
 let dispatcher: Dispatcher | null = null;
 let consumer: EventConsumer | null = null;
 let consumerCli: string | null = null;
+let cardConsumer: EventConsumer | null = null;
+let cardConsumerCli: string | null = null;
 /** appId + secret fingerprint confirmed in this plugin lifetime. */
 let appliedCredentialKey: string | null = null;
 let currentAppIdCache: string | null = null;
@@ -170,8 +177,34 @@ export default function contribute(server: PluginServerContext) {
   let disposed = false;
   let syncQueue: Promise<void> = Promise.resolve();
 
-  // Start or stop the event consumer to match the current bindings; a changed
-  // lark-cli path rebuilds it so the child process picks up the new binary.
+  const startCardConsumer = async (cliPath: string): Promise<void> => {
+    if (cardConsumer && cardConsumerCli === cliPath) {
+      cardConsumer.start();
+      return;
+    }
+    await cardConsumer?.stop();
+    if (disposed) return;
+    cardConsumerCli = cliPath;
+    cardConsumer = createEventConsumer<LarkCardActionEvent>({
+      cliPath,
+      eventKey: "card.action.trigger",
+      fatalErrorPattern: /requires callbacks not subscribed|failed_precondition/i,
+      onEvent: deliverCardAction,
+    });
+    cardConsumer.start();
+  };
+
+  const stopConsumers = async (): Promise<void> => {
+    await consumer?.stop();
+    consumer = null;
+    consumerCli = null;
+    await cardConsumer?.stop();
+    cardConsumer = null;
+    cardConsumerCli = null;
+  };
+
+  // Start or stop the event consumers to match the current bindings; a changed
+  // lark-cli path rebuilds them so the child processes pick up the new binary.
   const syncConsumer = async (): Promise<void> => {
     const values = await readValues();
     if (disposed) return;
@@ -179,21 +212,21 @@ export default function contribute(server: PluginServerContext) {
     await applyCredentials(values, cliPath);
     if (disposed) return;
     if (values.chats.length === 0) {
-      await consumer?.stop();
-      consumer = null;
-      consumerCli = null;
+      await stopConsumers();
       return;
     }
     if (!cliPath) return;
     if (consumer && consumerCli === cliPath) {
       consumer.start();
+      await startCardConsumer(cliPath);
       return;
     }
-    await consumer?.stop();
+    await stopConsumers();
     if (disposed) return;
     consumerCli = cliPath;
     consumer = createEventConsumer({ cliPath, onEvent: deliverEvent });
     consumer.start();
+    await startCardConsumer(cliPath);
   };
 
   /** Serialize settings saves so concurrent syncs cannot leak a consumer. */
@@ -216,6 +249,15 @@ export default function contribute(server: PluginServerContext) {
     // PaseoApi. Buffer a bounded window instead of silently dropping messages.
     if (pendingEvents.length >= MAX_PENDING_EVENTS) pendingEvents.shift();
     pendingEvents.push(event);
+  };
+
+  const deliverCardAction = (event: LarkCardActionEvent): void => {
+    if (dispatcher) {
+      void dispatcher.handleCardAction(event);
+      return;
+    }
+    // A question card cannot be sent before the dispatcher exists, so an
+    // action arriving this early has nothing to resolve.
   };
 
   requestSync();
@@ -304,6 +346,8 @@ export default function contribute(server: PluginServerContext) {
     return {
       consumerState: consumer?.status().state ?? "stopped",
       lastError: consumer?.status().lastError ?? null,
+      cardConsumerState: cardConsumer?.status().state ?? "stopped",
+      cardLastError: cardConsumer?.status().lastError ?? null,
       cliPath,
       currentAppId: currentAppIdCache,
       botOpenId: status?.botOpenId ?? null,
@@ -320,6 +364,10 @@ export default function contribute(server: PluginServerContext) {
     capture(context.paseo);
     void dispatcher?.handlePermission(event);
   });
+  const offPermissionResolved = server.on("agent.permission_resolved", (event, context) => {
+    capture(context.paseo);
+    dispatcher?.handlePermissionResolved(event);
+  });
   // agent.turn_started fires for every provider's turns; it is the earliest
   // reliable hook to capture the PaseoApi after a daemon restart.
   const offTurnStarted = server.on("agent.turn_started", (_event, context) => {
@@ -331,6 +379,7 @@ export default function contribute(server: PluginServerContext) {
     offTurnStarted();
     offTurnEnded();
     offPermission();
+    offPermissionResolved();
     offSettings();
     await syncQueue.catch(() => undefined);
     // Stop retry/watchdog/fallback timers and flush the topic store before the
@@ -342,6 +391,9 @@ export default function contribute(server: PluginServerContext) {
     await consumer?.stop();
     consumer = null;
     consumerCli = null;
+    await cardConsumer?.stop();
+    cardConsumer = null;
+    cardConsumerCli = null;
     pendingEvents.length = 0;
     appliedCredentialKey = null;
     currentAppIdCache = null;

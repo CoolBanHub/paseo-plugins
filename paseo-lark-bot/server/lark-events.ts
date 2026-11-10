@@ -18,6 +18,26 @@ export interface LarkMessageEvent {
   create_time?: string;
 }
 
+/** Flattened card.action.trigger payload as emitted by lark-cli. */
+export interface LarkCardActionEvent {
+  type?: string;
+  chat_id: string;
+  message_id: string;
+  operator_id: string;
+  action_tag?: string;
+  action_name?: string;
+  action_value?: string;
+  form_value?: string;
+  input_value?: string;
+  option?: string;
+  options?: string;
+  checked?: boolean;
+  token?: string;
+  card_content?: string;
+  event_id?: string;
+  timestamp?: string;
+}
+
 export type ConsumerState = "stopped" | "starting" | "ready" | "retrying";
 
 export interface EventConsumerStatus {
@@ -47,17 +67,26 @@ const RETRY_MAX_MS = 60_000;
 const STOP_TIMEOUT_MS = 10_000;
 
 /**
- * Long-lived `lark-cli event consume im.message.receive_v1 --as bot` child
- * process. lark-cli bridges Feishu's WebSocket event subscription and streams
- * NDJSON events to stdout, so no public webhook endpoint is needed. The child
- * treats stdin EOF as an exit signal, so the pipe stays open for the whole
- * lifetime and stop() closes it / sends SIGTERM.
+ * Long-lived `lark-cli event consume <eventKey> --as bot` child process.
+ * lark-cli bridges Feishu's WebSocket event subscription and streams NDJSON
+ * events to stdout, so no public webhook endpoint is needed. The child treats
+ * stdin EOF as an exit signal, so the pipe stays open for the whole lifetime
+ * and stop() closes it / sends SIGTERM.
  */
-export function createEventConsumer(options: {
+export function createEventConsumer<T extends { chat_id?: string; message_id?: string } = LarkMessageEvent>(options: {
   cliPath: string;
-  onEvent: (event: LarkMessageEvent) => void;
+  /** Defaults to im.message.receive_v1; card actions use card.action.trigger. */
+  eventKey?: string;
+  /**
+   * Treat matching stdout/stderr output as a configuration error and stop
+   * instead of retrying forever. Used for card.action.trigger, whose missing
+   * console subscription is a stable "failed_precondition" response.
+   */
+  fatalErrorPattern?: RegExp;
+  onEvent: (event: T) => void;
   deps?: SpawnDeps;
 }): EventConsumer {
+  const eventKey = options.eventKey ?? "im.message.receive_v1";
   const spawnFn = options.deps?.spawn ?? spawn;
   const schedule = options.deps?.schedule ?? ((callback, delayMs) => {
     const timer = setTimeout(callback, delayMs);
@@ -71,6 +100,8 @@ export function createEventConsumer(options: {
   let child: ChildProcess | null = null;
   let retryTimer: { clear: () => void } | null = null;
   let stopped = true;
+  /** Last few KB of child output, used to surface a fatal configuration error. */
+  let outputTail = "";
 
   return {
     start() {
@@ -95,14 +126,17 @@ export function createEventConsumer(options: {
   function spawnChild(): void {
     if (stopped) return;
     // stdio pipe keeps stdin open; the consumer exits when stdin closes.
-    const proc = spawnFn(options.cliPath, ["event", "consume", "im.message.receive_v1", "--as", "bot"], {
+    const proc = spawnFn(options.cliPath, ["event", "consume", eventKey, "--as", "bot"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     child = proc;
+    outputTail = "";
 
     let stdoutRest = "";
     proc.stdout?.on("data", (chunk: Buffer) => {
-      stdoutRest += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      outputTail = (outputTail + text).slice(-4_096);
+      stdoutRest += text;
       let newline = stdoutRest.indexOf("\n");
       while (newline >= 0) {
         const line = stdoutRest.slice(0, newline).trim();
@@ -114,7 +148,9 @@ export function createEventConsumer(options: {
 
     let stderrRest = "";
     proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrRest += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      outputTail = (outputTail + text).slice(-4_096);
+      stderrRest += text;
       let newline = stderrRest.indexOf("\n");
       while (newline >= 0) {
         const line = stderrRest.slice(0, newline).trim();
@@ -136,6 +172,13 @@ export function createEventConsumer(options: {
       if (proc !== child) return;
       child = null;
       if (stopped) return;
+      if (options.fatalErrorPattern?.test(outputTail)) {
+        stopped = true;
+        state = "stopped";
+        lastError = fatalOutputMessage(outputTail) ?? detail;
+        log("event consumer stopped after a configuration error: " + lastError);
+        return;
+      }
       state = "retrying";
       if (!lastError) lastError = detail;
       scheduleRestart();
@@ -155,7 +198,7 @@ export function createEventConsumer(options: {
   function emitEventLine(line: string): void {
     if (!line.startsWith("{")) return;
     try {
-      const parsed = JSON.parse(line) as LarkMessageEvent;
+      const parsed = JSON.parse(line) as T;
       if (parsed && typeof parsed.chat_id === "string" && typeof parsed.message_id === "string") {
         options.onEvent(parsed);
       }
@@ -176,6 +219,19 @@ export function createEventConsumer(options: {
       spawnChild();
     }, delay);
   }
+}
+
+/** Pull a readable message out of a lark-cli validation/error JSON blob. */
+function fatalOutputMessage(output: string): string | null {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const match = [...lines]
+    .reverse()
+    .find((line) => /"message"|requires callbacks|failed_precondition/i.test(line));
+  const text = (match ?? output).trim();
+  return text ? text.slice(0, 400) : null;
 }
 
 async function terminate(child: ChildProcess | null): Promise<void> {

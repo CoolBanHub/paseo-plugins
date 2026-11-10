@@ -1,6 +1,14 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
-import type { LarkMessageEvent } from "./lark-events.ts";
-import { readBotOpenId, readMessageDetail, readRawContent, replyMessage, resolveLarkCli, type MessageDetail } from "./lark.ts";
+import type { LarkCardActionEvent, LarkMessageEvent } from "./lark-events.ts";
+import {
+  readBotOpenId,
+  readMessageDetail,
+  readRawContent,
+  replyCard,
+  replyMessage,
+  resolveLarkCli,
+  type MessageDetail,
+} from "./lark.ts";
 import {
   downloadMessageResource,
   extractVideoFrames,
@@ -22,11 +30,21 @@ import {
   sanitizeTopicText,
 } from "./format.ts";
 import { mentionsBot, routeMessage, extractPrompt, isSenderAllowed } from "./router.ts";
+import {
+  buildQuestionCard,
+  parseFormActionName,
+  parseFormAnswer,
+  parseQuestionAction,
+  parseQuestionForms,
+  questionCardToken,
+  type QuestionForm,
+} from "./question-card.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
 import type { BotValues, ReplyFormat } from "../shared/settings.ts";
 
 export type TurnEndedEvent = PluginLifecycleEvents["agent.turn_ended"];
 export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"];
+export type PermissionResolvedEvent = PluginLifecycleEvents["agent.permission_resolved"];
 
 export interface DispatcherOptions {
   /**
@@ -62,6 +80,14 @@ export interface DispatcherOptions {
     format: ReplyFormat;
     replyInThread: boolean;
     /** Stable per logical reply; retries reuse it so sends cannot duplicate. */
+    idempotencyKey?: string;
+  }) => Promise<string | null>;
+  /** Injectable interactive-card sender for tests. */
+  replyCard?: (options: {
+    cliPath: string;
+    messageId: string;
+    card: Record<string, unknown>;
+    replyInThread: boolean;
     idempotencyKey?: string;
   }) => Promise<string | null>;
   /** Injectable thread-root lookup for tests; may also learn sender names. */
@@ -106,6 +132,23 @@ interface TopicImage extends SessionImage {
 const BLOCKED_HINT = "当前会话仅允许指定成员 @ 我处理，请让指定成员发起请求，或联系会话管理员。";
 const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
+const QUESTION_DONE_NOTE = "✅ 已提交选择：";
+const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
+
+/** One pending dsh ask_user_question, keyed by its permission request id. */
+interface PendingQuestion {
+  requestId: string;
+  agentId: string;
+  chatId: string;
+  topicKey: string | null;
+  questions: QuestionForm[];
+  answers: Map<number, string>;
+  cardMessageId?: string;
+  createdAt: number;
+}
+
+const MAX_PENDING_QUESTIONS = 50;
+const PENDING_QUESTION_TTL_MS = 30 * 60_000;
 
 /**
  * Wires inbound Feishu message events to per-chat agent sessions and sends
@@ -117,6 +160,7 @@ export function createDispatcher(options: DispatcherOptions) {
   const resolveCli = options.resolveCli || ((explicit: string) => resolveLarkCli(explicit));
   const readOpenId = options.readOpenId || readBotOpenId;
   const reply = options.reply || replyMessage;
+  const sendCard = options.replyCard || replyCard;
   const readThreadRootDetail = options.readThreadRootDetail || readMessageDetail;
   const readRaw = options.readRaw || readRawContent;
   const download = options.download || downloadMessageResource;
@@ -135,6 +179,15 @@ export function createDispatcher(options: DispatcherOptions) {
   // Event delivery is at-least-once; message_id is the documented dedup key.
   const seenMessageIds = new Set<string>();
   const seenMessageOrder: string[] = [];
+  // Pending ask_user_question cards, keyed by permission request id.
+  const pendingQuestions = new Map<string, PendingQuestion>();
+  // Form submits carry no callback value; resolve them by card message id or
+  // by the short token embedded in the submit button name.
+  const pendingByCardMessageId = new Map<string, string>();
+  const pendingByFormToken = new Map<string, string>();
+  // card.action.trigger delivery can repeat too; dedup on its event id.
+  const seenCardEventIds = new Set<string>();
+  const seenCardEventOrder: string[] = [];
   // Optional persistence of the dedup window across daemon restarts.
   const dedupStorePath = options.dedupStorePath;
   let dedupFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -221,6 +274,7 @@ export function createDispatcher(options: DispatcherOptions) {
     ackOnReceive: true,
     aiTitle: true,
     notifyPermission: false,
+    questionCards: true,
     replyInThread: true,
     sessionIdleMinutes: 30,
     maxReplyChars: 4000,
@@ -627,6 +681,21 @@ export function createDispatcher(options: DispatcherOptions) {
       await ensureRootMedia(cliPath, event);
       if (blocked) return;
       if (!allowed) return;
+      if (triggered) {
+        const pending = [...pendingQuestions.values()].find(
+          (entry) => entry.chatId === event.chat_id && entry.topicKey === topicKeyFor(event),
+        );
+        if (pending) {
+          await send(
+            cliPath,
+            event.message_id,
+            "请点击上方问题卡片选择；文字回复不会作为答案。",
+            values,
+            "text",
+          );
+          return;
+        }
+      }
       const decision = routeMessage(event, values, botOpenId);
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {
@@ -848,9 +917,15 @@ export function createDispatcher(options: DispatcherOptions) {
     ).trim();
     void (async () => {
       const values = await currentValues();
-      if (!values.notifyPermission) return;
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
+      const questions =
+        event.request.kind === "question" ? parseQuestionForms(event.request.input) : [];
+      if (questions.length > 0 && values.questionCards) {
+        await sendQuestionCard(cliPath, values, event, chatId, target, questions);
+        return;
+      }
+      if (!values.notifyPermission) return;
       await send(
         cliPath,
         target,
@@ -859,6 +934,215 @@ export function createDispatcher(options: DispatcherOptions) {
         "markdown",
       );
     })();
+  }
+
+  async function sendQuestionCard(
+    cliPath: string,
+    values: BotValues,
+    event: PermissionEvent,
+    chatId: string,
+    target: string,
+    questions: QuestionForm[],
+  ): Promise<void> {
+    const requestId = event.request.id;
+    const token = questionCardToken(requestId);
+    const title = (event.request.title || "需要你选择").trim();
+    const pending: PendingQuestion = {
+      requestId,
+      agentId: event.agent.id,
+      chatId,
+      topicKey: sessions.topicKeyForAgent(event.agent.id),
+      questions,
+      answers: new Map(),
+      createdAt: Date.now(),
+    };
+    pendingQuestions.set(requestId, pending);
+    pendingByFormToken.set(token, requestId);
+    prunePendingQuestions();
+    try {
+      const cardMessageId = await sendCard({
+        cliPath,
+        messageId: target,
+        card: buildQuestionCard({ requestId, token, title, questions }),
+        replyInThread: values.replyInThread,
+        idempotencyKey: `lq-${createHash("sha256").update(requestId).digest("hex").slice(0, 40)}`,
+      });
+      if (cardMessageId && pendingQuestions.has(requestId)) {
+        pending.cardMessageId = cardMessageId;
+        pendingByCardMessageId.set(cardMessageId, requestId);
+      }
+      log(`已发送问题卡片 ${requestId}（${questions.length} 题）`);
+    } catch (error) {
+      removePendingQuestion(requestId);
+      const detail = error instanceof Error ? error.message : String(error);
+      log("发送问题卡片失败", detail);
+      if (values.notifyPermission) {
+        await send(
+          cliPath,
+          target,
+          formatPermissionNotice({ heading: title, extra: detail.slice(0, 200) }),
+          values,
+          "markdown",
+        );
+      }
+    }
+  }
+
+  function removePendingQuestion(requestId: string): void {
+    const pending = pendingQuestions.get(requestId);
+    if (!pending) return;
+    pendingQuestions.delete(requestId);
+    if (pending.cardMessageId) pendingByCardMessageId.delete(pending.cardMessageId);
+    pendingByFormToken.delete(questionCardToken(requestId));
+  }
+
+  function prunePendingQuestions(): void {
+    const cutoff = Date.now() - PENDING_QUESTION_TTL_MS;
+    for (const [requestId, pending] of [...pendingQuestions]) {
+      if (pending.createdAt < cutoff) removePendingQuestion(requestId);
+    }
+    while (pendingQuestions.size > MAX_PENDING_QUESTIONS) {
+      const oldest = pendingQuestions.keys().next().value;
+      if (!oldest) break;
+      removePendingQuestion(oldest);
+    }
+  }
+
+  function handlePermissionResolved(event: PermissionResolvedEvent): void {
+    if (!sessions.ownsAgent(event.agent.id)) return;
+    removePendingQuestion(event.requestId);
+  }
+
+  function handleCardAction(event: LarkCardActionEvent): void {
+    if (event.event_id) {
+      if (seenCardEventIds.has(event.event_id)) return;
+      seenCardEventIds.add(event.event_id);
+      seenCardEventOrder.push(event.event_id);
+      if (seenCardEventOrder.length > 1_000) {
+        const oldest = seenCardEventOrder.shift();
+        if (oldest) seenCardEventIds.delete(oldest);
+      }
+    }
+    void processCardAction(event);
+  }
+
+  async function processCardAction(event: LarkCardActionEvent): Promise<void> {
+    try {
+      const action = parseQuestionAction(event.action_value);
+      const formAction = parseFormActionName(event.action_name);
+      const requestId =
+        action?.requestId ??
+        pendingByCardMessageId.get(event.message_id) ??
+        (formAction?.token ? pendingByFormToken.get(formAction.token) : undefined);
+      if (!requestId) return;
+      const pending = pendingQuestions.get(requestId);
+      if (!pending) return;
+      if (Date.now() - pending.createdAt > PENDING_QUESTION_TTL_MS) {
+        removePendingQuestion(requestId);
+        return;
+      }
+      if (pending.chatId !== event.chat_id) return;
+
+      const values = await currentValues();
+      const cliPath = cliPathFor(values);
+      if (!cliPath) return;
+      const binding = values.chats.find((chat) => chat.chatId === pending.chatId);
+      if (!binding || !isSenderAllowed(binding, event.operator_id)) {
+        await send(cliPath, event.message_id, QUESTION_UNAUTHORIZED_NOTE, values, "text");
+        return;
+      }
+
+      const questionIndex = action?.questionIndex ?? formAction?.questionIndex;
+      if (
+        questionIndex === undefined ||
+        questionIndex < 0 ||
+        questionIndex >= pending.questions.length
+      ) {
+        return;
+      }
+      const question = pending.questions[questionIndex]!;
+      let answer: string | null = null;
+      if (action?.skip) {
+        answer = "";
+      } else if (action?.optionIndex !== undefined) {
+        answer = question.options[action.optionIndex]?.label ?? null;
+      } else if (event.form_value) {
+        answer = parseFormAnswer(question, questionIndex, event.form_value);
+        if (answer === null) {
+          await send(
+            cliPath,
+            event.message_id,
+            "这次提交没有读到答案，请重新选择或填写。",
+            values,
+            "text",
+          );
+          return;
+        }
+      }
+      if (answer === null) return;
+
+      pending.answers.set(questionIndex, answer);
+      if (pending.answers.size < pending.questions.length) {
+        await send(
+          cliPath,
+          event.message_id,
+          `已记录第 ${questionIndex + 1} 题，请继续在卡片上完成其余问题。`,
+          values,
+          "text",
+        );
+        return;
+      }
+
+      const answers: Record<string, string> = {};
+      pending.questions.forEach((entry, index) => {
+        answers[entry.header] = pending.answers.get(index) ?? "";
+      });
+      const agent = options.paseo.agents.ref(pending.agentId);
+      if (!agent.respondToPermission) {
+        removePendingQuestion(requestId);
+        await send(
+          cliPath,
+          event.message_id,
+          "当前 Paseo 版本不支持从飞书回答问题，请在 Paseo 客户端处理。",
+          values,
+          "text",
+        );
+        return;
+      }
+      try {
+        await agent.respondToPermission({
+          requestId: pending.requestId,
+          response: {
+            behavior: "allow",
+            updatedInput: { answers },
+          },
+        });
+      } catch (error) {
+        log("提交问题答案失败", error instanceof Error ? error.message : String(error));
+        await send(
+          cliPath,
+          event.message_id,
+          "提交选择失败：" + (error instanceof Error ? error.message : String(error)),
+          values,
+          "text",
+        );
+        return;
+      }
+      removePendingQuestion(requestId);
+      const lines = pending.questions.map((entry, index) => {
+        const value = pending.answers.get(index) ?? "";
+        return `${index + 1}. ${entry.header}：${value || "跳过"}`;
+      });
+      await send(
+        cliPath,
+        event.message_id,
+        QUESTION_DONE_NOTE + "\n" + lines.join("\n"),
+        values,
+        "text",
+      );
+    } catch (error) {
+      log("处理问题卡片回调失败", error instanceof Error ? error.message : String(error));
+    }
   }
 
   function buildReplyText(outcome: {
@@ -1024,6 +1308,8 @@ export function createDispatcher(options: DispatcherOptions) {
     handleMessageEvent,
     handleTurnEnded,
     handlePermission,
+    handlePermissionResolved,
+    handleCardAction,
     resetIdentity,
     dispose: () => sessions.dispose(),
     status: () => ({

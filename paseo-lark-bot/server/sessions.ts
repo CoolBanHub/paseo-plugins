@@ -84,6 +84,14 @@ export interface SessionImage {
   mimeType: string;
 }
 
+/** Minimal permission answer accepted by the Paseo agent handle. */
+export interface SessionPermissionResponse {
+  behavior: "allow" | "deny";
+  selectedActionId?: string;
+  updatedInput?: Record<string, unknown>;
+  message?: string;
+}
+
 export interface SessionAgentHandle {
   readonly id: string;
   send(text: string): Promise<void>;
@@ -94,6 +102,15 @@ export interface SessionAgentHandle {
    * (and test fakes) omit it; the runtime not-found path still recovers.
    */
   refresh?(): Promise<unknown | null>;
+  /**
+   * Optional permission answer. dsh's ask_user_question arrives as a synthetic
+   * permission request; the answer map is passed through `updatedInput`.
+   * Older hosts omit it, in which case the question stays in Paseo.
+   */
+  respondToPermission?(options: {
+    requestId: string;
+    response: SessionPermissionResponse;
+  }): Promise<void>;
 }
 
 export interface SessionRunResult {
@@ -1035,6 +1052,11 @@ export function createSessionRegistry(options: {
     return topicKey ? (topics.get(topicKey)?.chatId ?? null) : null;
   }
 
+  /** The Feishu thread this agent serves, for topic-scoped notices. */
+  function topicKeyForAgent(agentId: string): string | null {
+    return agentToTopic.get(agentId) ?? null;
+  }
+
   /** Reply target for notices about this agent (its own topic, not the chat). */
   function targetForAgent(agentId: string): string | null {
     const topicKey = agentToTopic.get(agentId);
@@ -1092,6 +1114,7 @@ export function createSessionRegistry(options: {
     handleTurnEnded,
     ownsAgent,
     chatIdForAgent,
+    topicKeyForAgent,
     targetForAgent,
     needsRebuild,
     status,

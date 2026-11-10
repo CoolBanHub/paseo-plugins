@@ -6,12 +6,14 @@
 
 ```
 飞书（WebSocket 事件订阅，经 lark-cli）
-  └→ lark-cli event consume im.message.receive_v1（插件管理的长驻子进程，NDJSON 流）
-       └→ 按 message_id 去重，并按会话串行预处理
-            └→ 路由：chat_id → 绑定的 provider / cwd / systemPrompt / 回复格式
-                 └→ 群聊：每个话题一个智能体会话；单聊：整个 chat 一个持续会话
-                      └→ agent.turn_ended 统一回复：lark-cli im +messages-reply 挂回原消息话题
-权限请求 → 默认只在 Paseo 处理；开启通知后发到话题
+  ├→ lark-cli event consume im.message.receive_v1（插件管理的长驻子进程，NDJSON 流）
+  │    └→ 按 message_id 去重，并按会话串行预处理
+  │         └→ 路由：chat_id → 绑定的 provider / cwd / systemPrompt / 回复格式
+  │              └→ 群聊：每个话题一个智能体会话；单聊：整个 chat 一个持续会话
+  │                   └→ agent.turn_ended 统一回复：lark-cli im +messages-reply 挂回原消息话题
+  └→ lark-cli event consume card.action.trigger（问题卡片的按钮/表单回调）
+普通权限请求 → 默认只在 Paseo 处理；开启通知后发到话题
+dsh ask_user_question → 开启 questionCards 后以交互卡片发到话题，点选后经 respondToPermission 回写
 ```
 
 - 事件订阅走 lark-cli 的长连接模式，插件只需本机能跑 lark-cli 并访问 `open.feishu.cn`，无需公网地址。
@@ -26,6 +28,7 @@
 - 已安装 lark-cli；应用凭证二选一：在插件界面直接填写 App ID / App Secret（保存时自动验证并写入 lark-cli），或沿用 `lark-cli config init` 已配置的凭证；
 - 飞书开发者后台（该 appId）：
   - 事件订阅切换为**长连接**方式，并添加事件 `im.message.receive_v1`（接收消息）；
+  - **回调配置**：添加 `card.action.trigger`（卡片回传交互）并发布版本。没有它时问题卡片仍能发出，但点按钮/提交表单没有回调，插件收不到答案；
   - 基础权限：
     - `im:message:send_as_bot`：以机器人身份回复；
     - `im:message.p2p_msg:readonly`：接收单聊消息（需要单聊时）；
@@ -33,7 +36,7 @@
     - `im:message.group_at_msg.include_bot:readonly`：接收群里其他机器人 @ 本机器人的消息；
     - `application:bot.basic_info:read`：读取机器人信息。
   - 上下文/媒体/群列表所需权限：
-    - `im:message:readonly`：读取消息详情（话题根消息、mget）；
+    - `im:message:readonly`：读取消息详情（话题根消息、mget），`card.action.trigger` 自动拉取卡片内容也依赖它；
     - `im:message.group_msg`（敏感权限）：读取群消息详情、下载群内图片/视频；没有它时，话题根消息和媒体会失败并降级为无上下文；
     - 如果要接收**未 @ 的群消息**（完整群历史），还需要 `im:message.group_msg` 或 `im:message.group_msg:readonly`；这是敏感权限，请按实际隐私边界决定是否开启；
     - `im:chat:read`：设置界面的群列表选择器；
@@ -54,7 +57,8 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 | `notifyUnmatched` | `false` | 未绑定的会话 @ 机器人时是否回复配置提示 |
 | `ackOnReceive` | `true` | 收到 @ 消息立即回复一条「收到，正在处理」确认 |
 | `aiTitle` | `true` | 新话题首次 @ 时，用该会话绑定的模型跑一次一次性命名轮次，为智能体会话生成一句不超过 40 字、直接描述任务内容的标题（首轮回复会稍慢）。失败、超时（45 秒）或关闭时回退为清洗后的话题文本（截 60 字） |
-| `notifyPermission` | `false` | 权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题 |
+| `notifyPermission` | `false` | 普通权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题；dsh 的 ask_user_question 走 `questionCards` |
+| `questionCards` | `true` | 把 dsh 的 ask_user_question 以 Card 2.0 发到话题，点选项/多选后提交即可回答；需要飞书后台开启 `card.action.trigger` 回调。关闭后问题只能在 Paseo 处理 |
 | `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyFormat` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。设置保存会串行执行，避免并发 stop/start。
@@ -72,6 +76,8 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - **轮次失败区分瞬时/致命**：限流（429）、5xx、网络瞬断等瞬时错误会**保留原智能体**自动重试（5 秒、20 秒各一次，期间新消息排在重试之后），重试仍失败才回复失败并重建会话（提示中注明已重试次数）；401/403 等认证配置类错误不重试，立即失败，避免无意义等待。`run()` 报错与 `turn_ended` 的 failed 结果走**同一条失败处理路径**，不受事件先后顺序影响；创建新会话后的第一轮失败也会重试。
 - 一轮卡死超过 30 分钟时由**看门狗定时器**主动重建：先把当前这条请求重新排到队首、在新会话里重跑一次（只重排一次，避免反复卡死循环），再继续处理排队消息；第二次仍超时会提示「本轮请求未能完成，请重新发送」。轮次等待权限确认时不视为卡死：超过 30 分钟只提醒一次，之后的新消息继续排队、**不会**重建会话，请在 Paseo 中批准/拒绝（或取消该轮次）后继续。
 - 处理中发起权限请求且开启 `notifyPermission` 时，通知会发到**该智能体所属话题**（不是群里最新消息），请在 Paseo 客户端里批准 / 拒绝，处理完成后结果自动回到原话题。
+- **dsh 的 ask_user_question 以卡片回到话题**：开启 `questionCards`（默认）时，问题以 Card 2.0 发到该智能体所属话题、挂在触发消息下。单选用按钮，多选用勾选 + 「提交选择」，带 `allowOther` 的问题提供输入框 + 「提交其他答案」；多题按题逐个收集，全部答完才调用 `respondToPermission`（`updatedInput.answers`）写回 dsh。只有该会话白名单内的成员能点击，其他人的点击会被拒绝；文字回复不会作为答案，插件会提示点击卡片。问题在 Paseo 中被批准/拒绝/关闭后，对应卡片回调失效，以 Paseo 状态为准。
+- 问题卡片的待答状态只保存在插件进程内存（最多 50 个、30 分钟过期）；`paseo plugin reload` 或守护进程重启后，已发出的卡片按钮不会再把答案写回，需在 Paseo 中处理。卡片发出后不会自动更新为「已答」，但重复点击会被忽略。
 - 对 `dsh` provider，绑定未选择思考与权限时仍默认使用**最深思考**（`thinkingOptionId: max`）和 `paseo_dsh_permission_preset: danger-full-access`，避免群聊轮次停在权限确认上；绑定显式选择后以绑定为准。其他 provider 不强制这些设置。
 - 非白名单成员的 @ 只拦截“触发”这一步：不创建/不驱动智能体，但这条 @ 的文字、图片、视频仍会记录为后续话题上下文（先回拦截提示，再摄取媒体）。拦截提示只在该成员确实 @ 机器人（单聊则直接发消息）时发送；其未 @ 的群聊发言同样记录。
 - 回复内容为该轮最后一条助手消息；中英文混排时只剔除**开头**的英文推理段，保留换行、列表和 fenced code，不再把中文答案截成最后两句。当轮次结束事件未携带文本时（部分 provider 的时间线投影、权限批准后继续的轮次会出现），先取 `run()` 返回的最后消息，再主动拉取智能体时间线兜底。

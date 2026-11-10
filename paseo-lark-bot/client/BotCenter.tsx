@@ -47,6 +47,8 @@ import {
 interface StatusState {
   consumerState: string;
   lastError: string | null;
+  cardConsumerState: string;
+  cardLastError: string | null;
   cliPath: string | null;
   currentAppId: string | null;
   botOpenId: string | null;
@@ -56,6 +58,13 @@ interface StatusState {
 
 const CONSUMER_LABELS: Record<string, { text: string; tone: "success" | "warning" | "danger" | "muted" }> = {
   stopped: { text: "未运行 · 没有绑定", tone: "muted" },
+  starting: { text: "连接中…", tone: "warning" },
+  ready: { text: "监听中", tone: "success" },
+  retrying: { text: "重试中", tone: "danger" },
+};
+
+const CARD_CONSUMER_LABELS: Record<string, { text: string; tone: "success" | "warning" | "danger" | "muted" }> = {
+  stopped: { text: "未运行", tone: "muted" },
   starting: { text: "连接中…", tone: "warning" },
   ready: { text: "监听中", tone: "success" },
   retrying: { text: "重试中", tone: "danger" },
@@ -328,6 +337,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   }
 
   const consumer = status ? (CONSUMER_LABELS[status.consumerState] ?? { text: status.consumerState, tone: "muted" as const }) : null;
+  const cardConsumer = status
+    ? (CARD_CONSUMER_LABELS[status.cardConsumerState] ?? { text: status.cardConsumerState, tone: "muted" as const })
+    : null;
   const addableChats = [
     ...chatCatalog
       .filter((chat) => !boundIds.has(chat.chatId))
@@ -525,6 +537,14 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           <Card>
             <CardTitle text="运行状态" />
             <InfoRow label="事件监听" value={consumer ? consumer.text + (status?.lastError ? `（${status.lastError}）` : "") : "未知"} />
+            <InfoRow
+              label="问题卡片回调"
+              value={
+                cardConsumer
+                  ? cardConsumer.text + (status?.cardLastError ? `（${status.cardLastError}）` : "")
+                  : "未知"
+              }
+            />
             <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在全局设置填写路径）"} muted={!status?.cliPath} />
             <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
             <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
@@ -616,9 +636,15 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             />
             <ToggleRow
               label="权限请求通知到群"
-              hint="默认关闭；开启后权限请求会发到话题，仍需在 Paseo 客户端批准"
+              hint="默认关闭；开启后普通权限请求会发到话题，仍需在 Paseo 客户端批准"
               value={draft.notifyPermission}
               onChange={(value) => patchDraft({ notifyPermission: value })}
+            />
+            <ToggleRow
+              label="问题卡片发到话题"
+              hint="dsh 的 ask_user_question 以交互卡片发到话题，点选项即可回答；需在飞书后台开启 card.action.trigger"
+              value={draft.questionCards}
+              onChange={(value) => patchDraft({ questionCards: value })}
             />
             <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
             <TextInput

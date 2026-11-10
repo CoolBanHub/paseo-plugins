@@ -118,6 +118,13 @@ export const botValuesSchema = z.object({
    * the thread, so the extra notice is noise for most workflows.
    */
   notifyPermission: z.boolean().default(false),
+  /**
+   * Post dsh's ask_user_question as an interactive card in the topic and
+   * accept the answer there. Requires the Feishu app's card.action.trigger
+   * callback event. On by default because a pending question blocks the turn;
+   * without the card the user has to answer in the Paseo client.
+   */
+  questionCards: z.boolean().default(true),
   chats: z.array(chatBindingSchema).default([]),
 });
 

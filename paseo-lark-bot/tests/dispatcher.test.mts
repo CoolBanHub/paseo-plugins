@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createDispatcher } from "../server/dispatcher.ts";
-import type { LarkMessageEvent } from "../server/lark-events.ts";
-import type { SessionAgentHandle, SessionPaseoApi } from "../server/sessions.ts";
+import type { LarkCardActionEvent, LarkMessageEvent } from "../server/lark-events.ts";
+import type {
+  SessionAgentHandle,
+  SessionPaseoApi,
+  SessionPermissionResponse,
+} from "../server/sessions.ts";
+import { questionCardToken } from "../server/question-card.ts";
 import type { BotValues } from "../shared/settings.ts";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +35,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
     ackOnReceive: false,
     aiTitle: false,
     notifyPermission: false,
+    questionCards: false,
     chats: [
       {
         chatId: "oc_group",
@@ -48,11 +54,27 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
   };
 }
 
+interface CardCall {
+  messageId: string;
+  cardMessageId: string;
+  card: Record<string, unknown>;
+  replyInThread: boolean;
+  idempotencyKey?: string;
+}
+
+interface PermissionCall {
+  agentId: string;
+  requestId: string;
+  response: SessionPermissionResponse;
+}
+
 interface Harness {
   dispatch: ReturnType<typeof createDispatcher>;
   replies: ReplyCall[];
   created: { prompt?: string; title?: string; images?: unknown[] }[];
   runCalls: { agentId: string; text: string }[];
+  cards: CardCall[];
+  permissionResponses: PermissionCall[];
   agentId: string;
   paseoRef: import("../server/sessions.ts").SessionPaseoApi;
 }
@@ -61,6 +83,8 @@ function makeHarness(values: BotValues = baseValues()): Harness {
   const replies: ReplyCall[] = [];
   const created: { prompt?: string; title?: string; images?: unknown[] }[] = [];
   const runCalls: { agentId: string; text: string }[] = [];
+  const cards: CardCall[] = [];
+  const permissionResponses: PermissionCall[] = [];
   let current: SessionAgentHandle | null = null;
 
   const paseo: SessionPaseoApi = {
@@ -73,6 +97,13 @@ function makeHarness(values: BotValues = baseValues()): Harness {
           run: async (text) => {
             runCalls.push({ agentId: current!.id, text });
             return { status: "idle", error: null, lastMessage: "ok" };
+          },
+          respondToPermission: async (options) => {
+            permissionResponses.push({
+              agentId: current!.id,
+              requestId: options.requestId,
+              response: options.response,
+            });
           },
         };
         return current;
@@ -98,9 +129,29 @@ function makeHarness(values: BotValues = baseValues()): Harness {
       });
       return null;
     },
+    replyCard: async (options) => {
+      const cardMessageId = `om_card_${cards.length + 1}`;
+      cards.push({
+        messageId: options.messageId,
+        cardMessageId,
+        card: options.card,
+        replyInThread: options.replyInThread,
+        idempotencyKey: options.idempotencyKey,
+      });
+      return cardMessageId;
+    },
   });
 
-  return { dispatch, replies, created, runCalls, agentId: "agent-1", paseoRef: paseo };
+  return {
+    dispatch,
+    replies,
+    created,
+    runCalls,
+    cards,
+    permissionResponses,
+    agentId: "agent-1",
+    paseoRef: paseo,
+  };
 }
 
 function groupEvent(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent {
@@ -113,6 +164,51 @@ function groupEvent(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent
     sender_id: "ou_user",
     sender_type: "user",
     mentions: [{ id: BOT, key: "@_user_1", name: "测试机器人" }],
+    ...overrides,
+  };
+}
+
+function questionPermission(
+  agentId: string,
+  requestId = "permission:paseo-question-q-1",
+  questions: unknown[] = [
+    {
+      header: "选择方案",
+      question: "选哪个方案？",
+      options: [{ label: "方案A" }, { label: "方案B" }],
+      multiSelect: false,
+      allowOther: true,
+      allowEmpty: false,
+    },
+  ],
+): Parameters<ReturnType<typeof createDispatcher>["handlePermission"]>[0] {
+  return {
+    agent: {
+      id: agentId,
+      workspaceId: null,
+      parentAgentId: null,
+      provider: "dsh",
+      cwd: "/tmp",
+      title: null,
+    },
+    request: {
+      id: requestId,
+      provider: "dsh",
+      name: "ask_user_question",
+      kind: "question",
+      title: "选择方案",
+      input: { questions },
+    },
+  };
+}
+
+function cardAction(overrides: Partial<LarkCardActionEvent> = {}): LarkCardActionEvent {
+  return {
+    type: "card.action.trigger",
+    chat_id: "oc_group",
+    message_id: "om_card_1",
+    operator_id: "ou_boss",
+    action_tag: "button",
     ...overrides,
   };
 }
@@ -609,6 +705,202 @@ describe("createDispatcher", () => {
     await flush();
     assert.equal(h.replies.length, 1);
     assert.ok(h.replies[0].text.includes("provider 超时"));
+  });
+});
+
+describe("question cards", () => {
+  it("sends a card for a question permission and submits a clicked option", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handlePermission(questionPermission(h.agentId));
+    await flush();
+    assert.equal(h.cards.length, 1);
+    const card = h.cards[0]!;
+    assert.equal((card.card as { schema?: string }).schema, "2.0");
+    assert.equal(card.replyInThread, true);
+
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        action_value: JSON.stringify({
+          requestId: "permission:paseo-question-q-1",
+          questionIndex: 0,
+          optionIndex: 1,
+        }),
+        event_id: "evt-1",
+      }),
+    );
+    await flush();
+    assert.equal(h.permissionResponses.length, 1);
+    assert.deepEqual(h.permissionResponses[0]?.response, {
+      behavior: "allow",
+      updatedInput: { answers: { 选择方案: "方案B" } },
+    });
+    assert.ok(h.replies.some((reply) => reply.text.includes("已提交选择")));
+  });
+
+  it("submits a multi-select form", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    const requestId = "permission:paseo-question-q-multi";
+    h.dispatch.handlePermission(
+      questionPermission(h.agentId, requestId, [
+        {
+          header: "多选题",
+          question: "选哪些？",
+          options: [{ label: "X" }, { label: "Y" }],
+          multiSelect: true,
+          allowOther: false,
+          allowEmpty: false,
+        },
+      ]),
+    );
+    await flush();
+    const card = h.cards[0]!;
+    const token = questionCardToken(requestId);
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        action_name: `submit_multi_0_${token}`,
+        form_value: JSON.stringify({ q0_opt0: true, q0_opt1: true }),
+        event_id: "evt-multi",
+      }),
+    );
+    await flush();
+    assert.deepEqual(h.permissionResponses[0]?.response.updatedInput, {
+      answers: { 多选题: "X, Y" },
+    });
+  });
+
+  it("collects multiple questions before answering", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    const requestId = "permission:paseo-question-q-two";
+    h.dispatch.handlePermission(
+      questionPermission(h.agentId, requestId, [
+        { header: "第一题", question: "A?", options: [{ label: "A1" }, { label: "A2" }] },
+        { header: "第二题", question: "B?", options: [{ label: "B1" }, { label: "B2" }] },
+      ]),
+    );
+    await flush();
+    const card = h.cards[0]!;
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        action_value: JSON.stringify({ requestId, questionIndex: 0, optionIndex: 1 }),
+        event_id: "evt-two-1",
+      }),
+    );
+    await flush();
+    assert.equal(h.permissionResponses.length, 0);
+    assert.ok(h.replies.some((reply) => reply.text.includes("已记录第 1 题")));
+
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        action_value: JSON.stringify({ requestId, questionIndex: 1, optionIndex: 0 }),
+        event_id: "evt-two-2",
+      }),
+    );
+    await flush();
+    assert.deepEqual(h.permissionResponses[0]?.response.updatedInput, {
+      answers: { 第一题: "A2", 第二题: "B1" },
+    });
+  });
+
+  it("ignores unauthorized operators and duplicate callbacks", async () => {
+    const first = baseValues().chats[0]!;
+    const h = makeHarness(
+      baseValues({
+        questionCards: true,
+        chats: [{ ...first, allowedUsers: [{ openId: "ou_boss", name: "管理员" }] }],
+      }),
+    );
+    await h.dispatch.handleMessageEvent(groupEvent({ sender_id: "ou_boss" }));
+    await flush();
+    h.dispatch.handlePermission(questionPermission(h.agentId));
+    await flush();
+    const card = h.cards[0]!;
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        operator_id: "ou_other",
+        action_value: JSON.stringify({
+          requestId: "permission:paseo-question-q-1",
+          questionIndex: 0,
+          optionIndex: 0,
+        }),
+        event_id: "evt-unauth",
+      }),
+    );
+    await flush();
+    assert.equal(h.permissionResponses.length, 0);
+    assert.ok(h.replies.some((reply) => reply.text.includes("白名单")));
+
+    const allowed = cardAction({
+      message_id: card.cardMessageId,
+      operator_id: "ou_boss",
+      action_value: JSON.stringify({
+        requestId: "permission:paseo-question-q-1",
+        questionIndex: 0,
+        optionIndex: 1,
+      }),
+      event_id: "evt-ok",
+    });
+    h.dispatch.handleCardAction(allowed);
+    h.dispatch.handleCardAction(allowed);
+    await flush();
+    assert.equal(h.permissionResponses.length, 1, "duplicate event ids must be ignored");
+  });
+
+  it("points a text reply at the card instead of queueing it", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handlePermission(questionPermission(h.agentId));
+    await flush();
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_text_reply", root_id: "om_1", content: "@_user_1 2" }),
+    );
+    await flush();
+    assert.equal(h.runCalls.length, 0, "text must not be sent to the blocked agent");
+    assert.ok(h.replies.some((reply) => reply.text.includes("问题卡片")));
+  });
+
+  it("clears the pending card when the question resolves in Paseo", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }));
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handlePermission(questionPermission(h.agentId));
+    await flush();
+    h.dispatch.handlePermissionResolved({
+      agent: {
+        id: h.agentId,
+        workspaceId: null,
+        parentAgentId: null,
+        provider: "dsh",
+        cwd: "/tmp",
+        title: null,
+      },
+      requestId: "permission:paseo-question-q-1",
+      resolution: { behavior: "deny" },
+    });
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: "om_card_1",
+        action_value: JSON.stringify({
+          requestId: "permission:paseo-question-q-1",
+          questionIndex: 0,
+          optionIndex: 0,
+        }),
+        event_id: "evt-resolved",
+      }),
+    );
+    await flush();
+    assert.equal(h.permissionResponses.length, 0);
   });
 });
 

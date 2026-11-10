@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
-import { createEventConsumer, type LarkMessageEvent } from "../server/lark-events.ts";
+import {
+  createEventConsumer,
+  type LarkCardActionEvent,
+  type LarkMessageEvent,
+} from "../server/lark-events.ts";
 import type { ChildProcess } from "node:child_process";
 
 class FakeChildProcess extends EventEmitter {
@@ -125,6 +129,83 @@ describe("createEventConsumer", () => {
     feedStdout(h.processes[0], JSON.stringify(sampleEvent) + "\n");
     assert.equal(h.events.length, 1);
     assert.equal(h.events[0].message_id, "om_1");
+  });
+
+  it("consumes a custom event key and forwards card action payloads", () => {
+    const events: LarkCardActionEvent[] = [];
+    const processes: FakeChildProcess[] = [];
+    const consumer = createEventConsumer<LarkCardActionEvent>({
+      cliPath: "/fake/lark-cli",
+      eventKey: "card.action.trigger",
+      onEvent: (event) => events.push(event),
+      deps: {
+        spawn: (command, args) => {
+          const fake = new FakeChildProcess(command, args);
+          processes.push(fake);
+          return asProcess(fake);
+        },
+        schedule: () => ({ clear: () => {} }),
+      },
+    });
+    consumer.start();
+    assert.deepEqual(processes[0]?.spawned.args, [
+      "event",
+      "consume",
+      "card.action.trigger",
+      "--as",
+      "bot",
+    ]);
+    markReady(processes[0]!);
+    feedStdout(
+      processes[0]!,
+      JSON.stringify({
+        type: "card.action.trigger",
+        chat_id: "oc_group",
+        message_id: "om_card",
+        operator_id: "ou_user",
+        action_tag: "button",
+        action_value: '{"requestId":"r"}',
+      }) + "\n",
+    );
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.action_value, '{"requestId":"r"}');
+  });
+
+  it("stops on a fatal subscription error instead of retrying", () => {
+    const processes: FakeChildProcess[] = [];
+    const timers: FakeTimer[] = [];
+    const consumer = createEventConsumer({
+      cliPath: "/fake/lark-cli",
+      eventKey: "card.action.trigger",
+      fatalErrorPattern: /requires callbacks not subscribed|failed_precondition/i,
+      onEvent: () => {},
+      deps: {
+        spawn: (command, args) => {
+          const fake = new FakeChildProcess(command, args);
+          processes.push(fake);
+          return asProcess(fake);
+        },
+        schedule: (callback, delayMs) => {
+          const timer: FakeTimer = { callback, delayMs, cleared: false };
+          timers.push(timer);
+          return {
+            clear: () => {
+              timer.cleared = true;
+            },
+          };
+        },
+      },
+    });
+    consumer.start();
+    feedStdout(
+      processes[0]!,
+      '{\n  "ok": false,\n  "error": {\n    "message": "EventKey card.action.trigger requires callbacks not subscribed in console: card.action.trigger"\n  }\n}\n',
+    );
+    processes[0]!.emitExit(2, null);
+    assert.equal(consumer.status().state, "stopped");
+    assert.match(consumer.status().lastError ?? "", /requires callbacks/);
+    assert.equal(timers.length, 0, "fatal errors must not schedule a retry");
+    assert.equal(processes.length, 1, "fatal errors must not respawn the child");
   });
 
   it("parses events split across chunk boundaries and skips bad lines", () => {
