@@ -252,6 +252,17 @@ export function createDispatcher(options: DispatcherOptions) {
   let warnedMissingCli = false;
   // Latest inbound message per chat: fallback reply target for notices.
   const latestSeen = new Map<string, string>();
+  /** Chat type per chat, so completion mentions stay out of p2p threads. */
+  const chatTypes = new Map<string, "p2p" | "group">();
+  /** Trigger message → sender, for "mention the person who asked" completion notes. */
+  const triggerSenders = new Map<string, { openId: string; isBot: boolean }>();
+  /** Topic root sender, for "mention the topic starter" completion notes. */
+  const topicOwners = new Map<string, { openId: string; name: string | null }>();
+  /** Resolved display names by open_id (needed inside <at> tags). */
+  const senderNames = new Map<string, string>();
+  /** In-flight name lookups, so a mention can wait briefly for a real name. */
+  const senderNameLookups = new Map<string, Promise<void>>();
+  let mentionWarningLogged = false;
   // Event delivery is at-least-once; message_id is the documented dedup key.
   const seenMessageIds = new Set<string>();
   const seenMessageOrder: string[] = [];
@@ -340,7 +351,10 @@ export function createDispatcher(options: DispatcherOptions) {
    * the messages since the previous trigger. Bounded per topic; lost on
    * daemon restart (the root fallback covers the topic subject).
    */
-  const topicHistory = new Map<string, { senderType: string; text: string; messageId: string }[]>();
+  const topicHistory = new Map<
+    string,
+    { senderType: string; senderId: string; text: string; messageId: string }[]
+  >();
   /** Last message that actually triggered a bot turn, per topic. */
   const lastTriggerMessage = new Map<string, string>();
   /** Images collected per MESSAGE (downloads of image posts + video frames). */
@@ -797,6 +811,7 @@ export function createDispatcher(options: DispatcherOptions) {
     if (event.sender_type === "bot" && text.startsWith(ACK_TEXT.slice(0, 2))) return;
     entries.push({
       senderType: labelFor(event.sender_id, event.sender_type),
+      senderId: event.sender_id,
       text,
       messageId: event.message_id,
     });
@@ -899,6 +914,11 @@ export function createDispatcher(options: DispatcherOptions) {
         const oldest = latestSeen.keys().next().value;
         if (oldest) latestSeen.delete(oldest);
       }
+      chatTypes.set(event.chat_id, event.chat_type);
+      if (chatTypes.size > 500) {
+        const oldest = chatTypes.keys().next().value;
+        if (oldest) chatTypes.delete(oldest);
+      }
       const values = await currentValues();
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
@@ -986,6 +1006,15 @@ export function createDispatcher(options: DispatcherOptions) {
       // context, while each fresh @-mention starts an independent topic. P2P
       // has no thread root, so the chat itself is the continuous topic.
       const topicKey = topicKeyFor(event);
+      const rootless = !event.root_id && !event.thread_id && !event.reply_to;
+      if (event.chat_type === "group" && rootless && !topicOwners.has(topicKey)) {
+        // A fresh group @ starts the topic, so its sender is the owner.
+        topicOwners.set(topicKey, { openId: event.sender_id, name: null });
+        if (topicOwners.size > 500) {
+          const oldest = topicOwners.keys().next().value;
+          if (oldest) topicOwners.delete(oldest);
+        }
+      }
       const images = imagesForTurn(event);
       const files = filesForTurn(event);
 
@@ -1033,6 +1062,21 @@ export function createDispatcher(options: DispatcherOptions) {
       ) {
         lastTriggerMessage.set(topicKey, event.message_id);
         pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, topicKey);
+        triggerSenders.set(event.message_id, {
+          openId: event.sender_id,
+          isBot: event.sender_type === "bot",
+        });
+        if (triggerSenders.size > 500) {
+          const oldest = triggerSenders.keys().next().value;
+          if (oldest) triggerSenders.delete(oldest);
+        }
+        if (
+          decision.binding.mentionOnReply !== "off" &&
+          event.chat_type === "group" &&
+          event.sender_type !== "bot"
+        ) {
+          void lookupSenderName(cliPath, event.message_id, event.sender_id);
+        }
         progressByTopic.get(topicKey)?.setQueue(sessions.sessionInfo(topicKey, event.chat_id).queued);
         void addReceipt(cliPath, event.message_id);
       }
@@ -1056,6 +1100,21 @@ export function createDispatcher(options: DispatcherOptions) {
     const history = (topicHistory.get(historyKey) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
     );
+    // The root message may already be in history (delivered live before the
+    // first @). Record its sender so "mention the topic starter" works
+    // without another mget.
+    if (event.chat_type === "group" && !topicOwners.has(historyKey)) {
+      const rootId = event.root_id || event.reply_to;
+      const rootEntry = rootId
+        ? history.find((entry) => entry.messageId === rootId)
+        : history[0];
+      if (rootEntry?.senderId) {
+        topicOwners.set(historyKey, {
+          openId: rootEntry.senderId,
+          name: senderNames.get(rootEntry.senderId) ?? null,
+        });
+      }
+    }
     // A fresh/expired agent has no prior turns in its own context, so treat
     // this as the first message and include the topic root/history again.
     if (sessions.needsRebuild(historyKey)) lastTriggerMessage.delete(historyKey);
@@ -1131,9 +1190,16 @@ export function createDispatcher(options: DispatcherOptions) {
           if (oldest) threadRootCache.delete(oldest);
         }
       }
-      if (detail?.senderOpenId && detail.senderName) {
-        // A real name beats the provisional 成员A/B label.
-        senderLabels.set(detail.senderOpenId, detail.senderName);
+      if (detail?.senderOpenId) {
+        topicOwners.set(historyKey, {
+          openId: detail.senderOpenId,
+          name: detail.senderName ?? null,
+        });
+        if (detail.senderName) {
+          // A real name beats the provisional 成员A/B label.
+          senderLabels.set(detail.senderOpenId, detail.senderName);
+          senderNames.set(detail.senderOpenId, detail.senderName);
+        }
       }
       rootText = detail?.text ?? null;
     }
@@ -1624,6 +1690,135 @@ export function createDispatcher(options: DispatcherOptions) {
     }
   }
 
+  /** Escape a display name for the text-message `<at>` tag. */
+  function escapeAtName(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  /**
+   * Resolve the trigger sender's display name from the message detail. The
+   * mention tag needs a name; if the app cannot read messages, completion
+   * mentions are skipped rather than @-ing a placeholder.
+   */
+  function lookupSenderName(cliPath: string, messageId: string, openId: string): Promise<void> {
+    if (senderNames.has(openId)) return Promise.resolve();
+    const existing = senderNameLookups.get(openId);
+    if (existing) return existing;
+    const task = (async () => {
+      try {
+        const detail = await readThreadRootDetail(cliPath, messageId);
+        if (detail?.senderOpenId === openId && detail.senderName) {
+          senderNames.set(openId, detail.senderName);
+          senderLabels.set(openId, detail.senderName);
+        }
+      } catch (error) {
+        if (!mentionWarningLogged) {
+          mentionWarningLogged = true;
+          log("读取发送者姓名失败，完成提醒可能跳过 @", error instanceof Error ? error.message : String(error));
+        }
+      }
+    })();
+    senderNameLookups.set(openId, task);
+    void task.finally(() => senderNameLookups.delete(openId));
+    return task;
+  }
+
+  /**
+   * Send a short text mention after the answer. Feishu only delivers mention
+   * notifications for text messages, not post/card, so this is a separate
+   * message; the answer keeps its configured markdown/post format.
+   */
+  async function sendCompletionMention(options: {
+    cliPath: string;
+    values: BotValues;
+    binding: BotValues["chats"][number];
+    chatId: string;
+    topicKey: string | null;
+    messageId: string;
+    outcome: TurnOutcome;
+  }): Promise<void> {
+    const mode = options.binding.mentionOnReply;
+    if (mode === "off") return;
+    if ((chatTypes.get(options.chatId) ?? "p2p") !== "group") return;
+
+    const candidates: { openId: string; name: string | null; isBot: boolean }[] = [];
+    const add = (candidate: { openId: string; name: string | null; isBot: boolean } | undefined): void => {
+      if (!candidate || candidate.isBot) return;
+      if (!candidate.openId.startsWith("ou_")) return;
+      if (candidate.openId === cachedBotOpenId || knownBotIds.has(candidate.openId)) return;
+      if (candidates.some((entry) => entry.openId === candidate.openId)) return;
+      candidates.push(candidate);
+    };
+    if (mode === "sender" || mode === "both") {
+      const sender = triggerSenders.get(options.messageId);
+      if (sender) add({ openId: sender.openId, name: null, isBot: sender.isBot });
+    }
+    if (mode === "topic" || mode === "both") {
+      const owner = options.topicKey ? topicOwners.get(options.topicKey) : undefined;
+      if (owner) {
+        add({ openId: owner.openId, name: owner.name, isBot: false });
+        if (
+          !owner.name &&
+          !senderNames.has(owner.openId) &&
+          options.topicKey?.startsWith("om_")
+        ) {
+          // The topic root was delivered live (or restored from history) and
+          // has no name yet; mget it once, at completion time.
+          void lookupSenderName(options.cliPath, options.topicKey, owner.openId);
+        }
+      }
+    }
+    if (candidates.length === 0) return;
+
+    // The trigger's name lookup starts after enqueue; give it a short window
+    // so a fast turn can still mention the real display name.
+    const pending = candidates
+      .map((candidate) => senderNameLookups.get(candidate.openId))
+      .filter((promise): promise is Promise<void> => Boolean(promise));
+    if (pending.length > 0) {
+      await Promise.race([
+        Promise.all(pending).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 1_500);
+          timer.unref?.();
+        }),
+      ]);
+    }
+
+    const targets = candidates
+      .map((candidate) => ({ openId: candidate.openId, name: candidate.name ?? senderNames.get(candidate.openId) ?? null }))
+      .filter((target): target is { openId: string; name: string } => Boolean(target.name));
+    if (targets.length === 0) {
+      if (!mentionWarningLogged) {
+        mentionWarningLogged = true;
+        log("没有解析到发送者姓名，跳过完成 @（检查消息读取权限）");
+      }
+      return;
+    }
+
+    const tags = targets
+      .map((target) => `<at user_id="${target.openId}">${escapeAtName(target.name)}</at>`)
+      .join(" ");
+    const status =
+      options.outcome.outcome === "failed"
+        ? "本轮处理失败，原因见上方回复。"
+        : options.outcome.outcome === "canceled"
+          ? "本轮处理已取消。"
+          : "已完成，结果见上方回复。";
+    const ok = await send(
+      options.cliPath,
+      options.messageId,
+      tags + " " + status,
+      options.values,
+      "text",
+    );
+    if (!ok) log("发送完成提醒失败");
+  }
+
   async function deliverNow(
     chatId: string,
     topicKey: string | null,
@@ -1657,6 +1852,17 @@ export function createDispatcher(options: DispatcherOptions) {
       });
     }
     const sent = await send(cliPath, messageId, body, values, format, footer);
+    if (sent && meta && binding) {
+      await sendCompletionMention({
+        cliPath,
+        values,
+        binding,
+        chatId,
+        topicKey: meta.topicKey ?? topicKey,
+        messageId,
+        outcome: meta.outcome,
+      });
+    }
     if (meta) {
       await finishReceipt(cliPath, messageId, sent && meta.outcome.outcome !== "failed" && meta.outcome.outcome !== "canceled");
     }

@@ -38,6 +38,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyStyle: "default" as const,
         replyStylePrompt: "",
         replyFormat: "markdown" as const,
+        mentionOnReply: "off" as const,
       },
       {
         chatId: "oc_p2p",
@@ -52,6 +53,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyStyle: "default" as const,
         replyStylePrompt: "",
         replyFormat: "text" as const,
+        mentionOnReply: "off" as const,
       },
     ],
     ...overrides,

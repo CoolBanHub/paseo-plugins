@@ -17,6 +17,7 @@ const binding: ChatBinding = {
   replyStyle: "default",
   replyStylePrompt: "",
   replyFormat: "markdown",
+  mentionOnReply: "off",
 };
 
 function context(overrides: Partial<CommandContext> = {}) {

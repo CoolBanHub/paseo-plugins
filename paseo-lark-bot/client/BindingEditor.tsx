@@ -1,6 +1,11 @@
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { LarkBotChatMember, LarkBotProviderInfo } from "../shared/contracts.ts";
-import { REPLY_STYLE_OPTIONS, type ChatBinding, type ReplyFormat } from "../shared/settings.ts";
+import {
+  MENTION_ON_REPLY_OPTIONS,
+  REPLY_STYLE_OPTIONS,
+  type ChatBinding,
+  type ReplyFormat,
+} from "../shared/settings.ts";
 import {
   Card,
   CardTitle,
@@ -345,6 +350,21 @@ export function BindingEditor({
             />
           ))}
         </View>
+        <FieldLabel text="完成后 @ 谁（仅群聊）" />
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+          {MENTION_ON_REPLY_OPTIONS.map((option) => (
+            <ChoicePill
+              key={option.value}
+              label={option.label}
+              active={binding.mentionOnReply === option.value}
+              onPress={() => onPatch({ mentionOnReply: option.value })}
+            />
+          ))}
+        </View>
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          {MENTION_ON_REPLY_OPTIONS.find((option) => option.value === binding.mentionOnReply)?.hint ?? ""}
+          完成提醒以独立的纯文本消息发送（飞书只在文本消息里触发 @ 通知），不会影响正文格式；读取不到发送者姓名时会跳过 @。
+        </Text>
       </Card>
     </ScrollView>
   );

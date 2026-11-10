@@ -17,6 +17,37 @@ export const replyFormatSchema = z.enum(["markdown", "text", "post"]);
 export type ReplyFormat = z.output<typeof replyFormatSchema>;
 
 /**
+ * Who to @ after a turn finishes. Mentions are sent as a separate plain-text
+ * message because Feishu only fires mention notifications for `text` messages
+ * (not post/card), and doing so keeps the answer's markdown intact.
+ */
+export const mentionOnReplySchema = z.enum(["off", "sender", "topic", "both"]);
+export type MentionOnReply = z.output<typeof mentionOnReplySchema>;
+
+export const MENTION_ON_REPLY_OPTIONS: ReadonlyArray<{
+  value: MentionOnReply;
+  label: string;
+  hint: string;
+}> = [
+  { value: "off", label: "不 @", hint: "完成后不发额外提醒。" },
+  {
+    value: "sender",
+    label: "@ 触发者",
+    hint: "在群里 @ 本次发消息的人；单聊不适用。",
+  },
+  {
+    value: "topic",
+    label: "@ 话题发起人",
+    hint: "在群里 @ 这个话题根消息的发送者；话题发起人≠触发者时也只提醒发起人。",
+  },
+  {
+    value: "both",
+    label: "@ 两者",
+    hint: "同时 @ 触发者和话题发起人；同一人只 @ 一次。",
+  },
+];
+
+/**
  * Reply-style presets are appended to the agent's system prompt. They are
  * instructions to the main turn only — no second model call, no extra cost.
  */
@@ -130,6 +161,8 @@ export const chatBindingSchema = z.object({
   /** Custom reply instruction; only used when replyStyle is `custom`. */
   replyStylePrompt: z.string().default(""),
   replyFormat: replyFormatSchema.default("markdown"),
+  /** Who to @ in the group after the turn finishes. */
+  mentionOnReply: mentionOnReplySchema.default("off"),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;

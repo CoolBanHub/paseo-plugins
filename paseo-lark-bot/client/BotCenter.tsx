@@ -199,6 +199,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               replyStyle: "default",
               replyStylePrompt: "",
               replyFormat: "markdown",
+              mentionOnReply: "off",
             },
           ],
         };

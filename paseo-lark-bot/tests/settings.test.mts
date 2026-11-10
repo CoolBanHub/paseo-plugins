@@ -71,6 +71,14 @@ describe("chat binding schema", () => {
     assert.equal(parsed.rateLimitPerHour, 20);
     assert.equal(parsed.workspacePerBinding, false);
   });
+
+  it("defaults completion mentions off and preserves a per-chat choice", () => {
+    const parsed = botValuesSchema.parse({
+      chats: [{ chatId: "oc_group", provider: "dsh", mentionOnReply: "both" }],
+    });
+    assert.equal(parsed.chats[0]?.mentionOnReply, "both");
+    assert.equal(botValuesSchema.parse({ chats: [{ chatId: "oc_group", provider: "dsh" }] }).chats[0]?.mentionOnReply, "off");
+  });
 });
 
 describe("isDshProvider", () => {

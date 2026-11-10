@@ -45,6 +45,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         replyStyle: "default",
         replyStylePrompt: "",
         replyFormat: "markdown",
+        mentionOnReply: "off",
       },
     ],
     ...overrides,
@@ -1237,6 +1238,7 @@ describe("p2p and delivery hygiene", () => {
         replyStyle: "default",
         replyStylePrompt: "",
         replyFormat: "markdown",
+        mentionOnReply: "off",
       },
     ],
   });
@@ -1986,5 +1988,140 @@ describe("main-stream commands", () => {
     await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_cmd", content: "@_user_1 /status" }));
     await flush();
     assert.match(h.replies[0]?.text ?? "", /尚未创建/);
+  });
+});
+
+describe("completion mentions", () => {
+  function mentionValues(mode: "off" | "sender" | "topic" | "both"): BotValues {
+    const values = baseValues();
+    values.chats[0]!.mentionOnReply = mode;
+    return values;
+  }
+
+  it("mentions the trigger sender as a separate text message", async () => {
+    const h = makeHarness(mentionValues("sender"), {
+      readThreadRootDetail: async (_cli, messageId) =>
+        messageId === "om_mention"
+          ? { text: null, senderOpenId: "ou_user", senderName: "张三" }
+          : null,
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_mention", content: "@_user_1 帮我看看" }),
+    );
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "看完了"));
+    await flush();
+
+    assert.equal(h.replies.length, 2, "answer + completion mention");
+    assert.equal(h.replies[0]?.format, "markdown");
+    assert.equal(h.replies[1]?.format, "text");
+    assert.match(h.replies[1]?.text ?? "", /<at user_id="ou_user">张三<\/at>/);
+    assert.match(h.replies[1]?.text ?? "", /已完成/);
+  });
+
+  it("mentions the topic starter rather than a later replier", async () => {
+    const h = makeHarness(mentionValues("topic"), {
+      readThreadRootDetail: async (_cli, messageId) => {
+        if (messageId === "om_root") {
+          return { text: "原话题", senderOpenId: "ou_alice", senderName: "Alice" };
+        }
+        if (messageId === "om_bob") {
+          return { text: null, senderOpenId: "ou_bob", senderName: "Bob" };
+        }
+        return null;
+      },
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_root", sender_id: "ou_alice", content: "@_user_1 开始" }),
+    );
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "第一轮"));
+    await flush();
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_bob",
+        root_id: "om_root",
+        sender_id: "ou_bob",
+        content: "@_user_1 继续",
+      }),
+    );
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "第二轮"));
+    await flush();
+
+    const last = h.replies[h.replies.length - 1]?.text ?? "";
+    assert.match(last, /<at user_id="ou_alice">Alice<\/at>/);
+    assert.ok(!last.includes("ou_bob"), "the replier must not be mentioned in topic mode");
+  });
+
+  it("resolves the topic starter from a root delivered before the first @", async () => {
+    const h = makeHarness(mentionValues("topic"), {
+      readThreadRootDetail: async (_cli, messageId) => {
+        if (messageId === "om_root_live") {
+          return { text: "先发的话题根", senderOpenId: "ou_alice", senderName: "Alice" };
+        }
+        return null;
+      },
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_root_live",
+        sender_id: "ou_alice",
+        content: "先发一条普通消息",
+        mentions: [],
+      }),
+    );
+    await flush();
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_bob2",
+        root_id: "om_root_live",
+        sender_id: "ou_bob",
+        content: "@_user_1 看看这个",
+      }),
+    );
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "看完了"));
+    await flush();
+    const last = h.replies[h.replies.length - 1]?.text ?? "";
+    assert.match(last, /<at user_id="ou_alice">Alice<\/at>/);
+  });
+
+  it("does not mention in p2p", async () => {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0]!,
+      chatId: "oc_p2p",
+      chatName: "私聊",
+      mentionOnReply: "sender",
+    };
+    const h = makeHarness(values, {
+      readThreadRootDetail: async () => ({ text: null, senderOpenId: "ou_user", senderName: "张三" }),
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        chat_id: "oc_p2p",
+        chat_type: "p2p",
+        message_id: "om_p2p",
+        content: "帮我看看",
+        mentions: [],
+      }),
+    );
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "完成"));
+    await flush();
+    assert.equal(h.replies.length, 1);
+  });
+
+  it("does not mention when disabled", async () => {
+    const off = makeHarness(mentionValues("off"), {
+      readThreadRootDetail: async () => ({ text: null, senderOpenId: "ou_user", senderName: "张三" }),
+    });
+    await off.dispatch.handleMessageEvent(groupEvent({ message_id: "om_off", content: "@_user_1 看看" }));
+    await flush();
+    off.dispatch.handleTurnEnded(turnEnded("agent-1", "完成"));
+    await flush();
+    assert.equal(off.replies.length, 1);
   });
 });
