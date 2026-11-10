@@ -71,6 +71,40 @@ export function appendFooter(text: string, clipped: boolean): string {
   return text + "\n\n（回复过长已截断，打开 Paseo 查看完整内容。）";
 }
 
+function compactNumber(value: number): string {
+  if (value < 1_000) return String(value);
+  if (value < 1_000_000) return (value / 1_000).toFixed(value < 10_000 ? 1 : 0) + "k";
+  return (value / 1_000_000).toFixed(1) + "m";
+}
+
+function compactDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return seconds % 60 > 0 ? `${minutes}m${seconds % 60}s` : `${minutes}m`;
+}
+
+/**
+ * Optional per-turn footer: which model answered, how long it took and the
+ * token/cost numbers the provider reported. Kept on one line so it does not
+ * compete with the answer.
+ */
+export function formatReplyFooter(info: {
+  model: string;
+  durationMs?: number;
+  usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number } | null;
+}): string {
+  const parts: string[] = ["`" + (info.model || "默认模型") + "`"];
+  if (info.durationMs !== undefined) parts.push(compactDuration(info.durationMs));
+  const usage = info.usage;
+  if (usage?.inputTokens !== undefined) parts.push("入 " + compactNumber(usage.inputTokens));
+  if (usage?.outputTokens !== undefined) parts.push("出 " + compactNumber(usage.outputTokens));
+  if (usage?.totalCostUsd !== undefined && usage.totalCostUsd > 0) {
+    parts.push("$" + usage.totalCostUsd.toFixed(usage.totalCostUsd < 0.01 ? 4 : 2));
+  }
+  return "— " + parts.join(" · ");
+}
+
 /**
  * Exact post payload for the `post` reply format: a single md element so
  * inline `<at user_id=...>` mentions stay intact for agent-to-agent handoffs

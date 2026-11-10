@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   appendFooter,
+  formatReplyFooter,
   buildPostContent,
   clipReply,
   condenseReply,
@@ -178,5 +179,21 @@ describe("formatPermissionNotice", () => {
     assert.ok(text.includes("执行命令"));
     assert.ok(text.includes("Paseo"));
     assert.ok(text.includes("清理构建产物"));
+  });
+});
+
+
+describe("formatReplyFooter", () => {
+  it("includes model, duration and compact token counts", () => {
+    const footer = formatReplyFooter({
+      model: "dsh/model-a",
+      durationMs: 65_000,
+      usage: { inputTokens: 12_345, outputTokens: 678, totalCostUsd: 0.0123 },
+    });
+    assert.match(footer, /dsh\/model-a/);
+    assert.match(footer, /1m5s/);
+    assert.match(footer, /入 12k/);
+    assert.match(footer, /出 678/);
+    assert.match(footer, /\$0\.01/);
   });
 });

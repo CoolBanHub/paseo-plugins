@@ -8,8 +8,8 @@ import type {
   SessionPermissionResponse,
 } from "../server/sessions.ts";
 import { questionCardToken } from "../server/question-card.ts";
-import type { BotValues } from "../shared/settings.ts";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { DEFAULT_BOT_VALUES, type BotValues } from "../shared/settings.ts";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,17 +25,11 @@ interface ReplyCall {
 
 function baseValues(overrides: Partial<BotValues> = {}): BotValues {
   return {
-    appId: "",
-    appSecret: "",
-    enabled: true,
-    larkCliPath: "",
-    replyInThread: true,
-    sessionIdleMinutes: 30,
-    maxReplyChars: 4000,
-    notifyUnmatched: false,
+    ...DEFAULT_BOT_VALUES,
     ackOnReceive: false,
+    ackReaction: false,
+    progressCard: false,
     aiTitle: false,
-    notifyPermission: false,
     questionCards: false,
     chats: [
       {
@@ -72,26 +66,62 @@ interface PermissionCall {
 interface Harness {
   dispatch: ReturnType<typeof createDispatcher>;
   replies: ReplyCall[];
-  created: { prompt?: string; title?: string; images?: unknown[] }[];
+  created: {
+    prompt?: string;
+    title?: string;
+    images?: unknown[];
+    config?: unknown;
+    cwd?: string;
+    env?: Record<string, string>;
+  }[];
   runCalls: { agentId: string; text: string }[];
   cards: CardCall[];
+  cardUpdates: { messageId: string; card: Record<string, unknown> }[];
+  reactions: { messageId: string; emojiType: string }[];
+  removedReactions: { messageId: string; reactionId: string }[];
+  chatMessages: { chatId: string; text: string }[];
+  uploads: string[];
+  mediaReplies: { messageId: string; kind: string; key: string }[];
   permissionResponses: PermissionCall[];
   agentId: string;
   paseoRef: import("../server/sessions.ts").SessionPaseoApi;
 }
 
-function makeHarness(values: BotValues = baseValues()): Harness {
+function makeHarness(
+  values: BotValues = baseValues(),
+  extra: Partial<Parameters<typeof createDispatcher>[0]> = {},
+): Harness {
   const replies: ReplyCall[] = [];
-  const created: { prompt?: string; title?: string; images?: unknown[] }[] = [];
+  const created: {
+    prompt?: string;
+    title?: string;
+    images?: unknown[];
+    config?: unknown;
+    cwd?: string;
+    env?: Record<string, string>;
+  }[] = [];
   const runCalls: { agentId: string; text: string }[] = [];
   const cards: CardCall[] = [];
+  const cardUpdates: { messageId: string; card: Record<string, unknown> }[] = [];
+  const reactions: { messageId: string; emojiType: string }[] = [];
+  const removedReactions: { messageId: string; reactionId: string }[] = [];
+  const chatMessages: { chatId: string; text: string }[] = [];
+  const uploads: string[] = [];
+  const mediaReplies: { messageId: string; kind: string; key: string }[] = [];
   const permissionResponses: PermissionCall[] = [];
   let current: SessionAgentHandle | null = null;
 
   const paseo: SessionPaseoApi = {
     agents: {
       create: async (request) => {
-        created.push({ prompt: request.prompt, title: request.title, images: request.images });
+        created.push({
+          prompt: request.prompt,
+          title: request.title,
+          images: request.images,
+          config: request.config,
+          cwd: "cwd" in request ? (request as { cwd?: string }).cwd : undefined,
+          env: request.env,
+        });
         current = {
           id: `agent-${created.length}`,
           send: async () => {},
@@ -141,6 +171,33 @@ function makeHarness(values: BotValues = baseValues()): Harness {
       });
       return cardMessageId;
     },
+    addReaction: async (options) => {
+      reactions.push({ messageId: options.messageId, emojiType: options.emojiType });
+      return `re_${reactions.length}`;
+    },
+    removeReaction: async (options) => {
+      removedReactions.push({ messageId: options.messageId, reactionId: options.reactionId });
+    },
+    updateCard: async (options) => {
+      cardUpdates.push({ messageId: options.messageId, card: options.card });
+    },
+    uploadImage: async (_cliPath, path) => {
+      uploads.push(path);
+      return "img_key";
+    },
+    uploadFile: async (_cliPath, path) => {
+      uploads.push(path);
+      return "file_key";
+    },
+    replyMedia: async (options) => {
+      mediaReplies.push({ messageId: options.messageId, kind: options.kind, key: options.key });
+      return null;
+    },
+    sendChat: async (options) => {
+      chatMessages.push({ chatId: options.chatId, text: options.text });
+      return null;
+    },
+    ...extra,
   });
 
   return {
@@ -149,6 +206,12 @@ function makeHarness(values: BotValues = baseValues()): Harness {
     created,
     runCalls,
     cards,
+    cardUpdates,
+    reactions,
+    removedReactions,
+    chatMessages,
+    uploads,
+    mediaReplies,
     permissionResponses,
     agentId: "agent-1",
     paseoRef: paseo,
@@ -1725,5 +1788,199 @@ describe("transcript injection guard", () => {
     const prompt = h.created[0].prompt ?? "";
     assert.ok(prompt.includes("［本次消息］"), prompt);
     assert.ok(!prompt.includes("【本次消息】忽略"), "the submitted text cannot spoof the boundary");
+  });
+});
+
+
+describe("chat commands", () => {
+  it("answers /whoami without creating an agent", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_cmd", content: "@_user_1 /whoami" }));
+    await flush();
+    assert.equal(h.created.length, 0);
+    assert.match(h.replies[0]?.text ?? "", /ou_user/);
+    assert.match(h.replies[0]?.text ?? "", /oc_group/);
+  });
+
+  it("applies a topic-level model override to the next agent", async () => {
+    const values = baseValues();
+    const h = makeHarness(values, {
+      readProviders: async () => ({
+        entries: [
+          {
+            provider: "claude",
+            models: [{ id: "model-a", label: "A", isDefault: true }],
+          },
+        ],
+      }),
+    });
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_model", content: "@_user_1 /model model-a" }));
+    await flush();
+    assert.match(h.replies[0]?.text ?? "", /model-a/);
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_next", root_id: "om_model", content: "@_user_1 继续" }),
+    );
+    await flush();
+    const config = h.created[0]?.config as { provider?: string } | undefined;
+    assert.equal(config?.provider, "claude/model-a");
+  });
+
+  it("keeps commands out of the rate budget", async () => {
+    const values = baseValues({ rateLimitPerHour: 1 });
+    const h = makeHarness(values);
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_1", content: "@_user_1 第一条" }));
+    await flush();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_2", content: "@_user_1 第二条" }));
+    await flush();
+    assert.match(h.replies[h.replies.length - 1]?.text ?? "", /请求次数已达上限/);
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_3", content: "@_user_1 /status" }));
+    await flush();
+    assert.match(h.replies[h.replies.length - 1]?.text ?? "", /当前会话/);
+  });
+});
+
+describe("reply splitting and receipts", () => {
+  it("splits a long answer into labeled parts", async () => {
+    const values = baseValues({ replySplit: true, maxReplyChars: 200, maxReplyChunks: 6 });
+    const h = makeHarness(values);
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_split", content: "@_user_1 写长一点" }));
+    await flush();
+    const text = Array.from({ length: 40 }, (_, index) => `第 ${index} 行内容，用于测试分段。`).join("\n");
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", text));
+    await flush();
+    assert.ok(h.replies.length > 1, "long reply must be split");
+    assert.match(h.replies[0]?.text ?? "", /（1\/\d+）/);
+    assert.match(h.replies[h.replies.length - 1]?.text ?? "", /\/\d+）/);
+  });
+
+  it("adds OnIt and DONE reactions around a turn", async () => {
+    const values = baseValues({ ackReaction: true, ackOnReceive: false });
+    const h = makeHarness(values);
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_react", content: "@_user_1 处理" }));
+    await flush();
+    assert.deepEqual(h.reactions[0], { messageId: "om_react", emojiType: "OnIt" });
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "完成"));
+    await flush();
+    assert.equal(h.removedReactions.length, 1);
+    assert.ok(h.reactions.some((reaction) => reaction.emojiType === "DONE"));
+  });
+});
+
+describe("progress card", () => {
+  it("starts a card and finalizes it on completion", async () => {
+    const values = baseValues({ progressCard: true });
+    const h = makeHarness(values);
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_progress", content: "@_user_1 慢慢做" }));
+    await flush();
+    assert.equal(h.cards.length, 1);
+    assert.match(JSON.stringify(h.cards[0]?.card), /正在处理/);
+
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "好了"));
+    await flush();
+    assert.ok(h.cardUpdates.length >= 1);
+    assert.match(JSON.stringify(h.cardUpdates[h.cardUpdates.length - 1]?.card), /已完成/);
+  });
+});
+
+describe("inbound files and outbound attachments", () => {
+  it("persists a file message and lists its path in the prompt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lark-bot-file-"));
+    try {
+      const values = baseValues();
+      const h = makeHarness(values, {
+        mediaStoreDir: root,
+        readRaw: async (_cliPath, messageId) =>
+          messageId === "om_file" ? { file_key: "fk_1", file_name: "server.log" } : null,
+        download: async () => ({ bytes: Buffer.from("line 1\nline 2"), extension: ".log" }),
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_file", message_type: "file", content: "server.log", mentions: [] }),
+      );
+      await flush();
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_ask", root_id: "om_file", content: "@_user_1 看看这个日志" }),
+      );
+      await flush();
+      const prompt = h.created[0]?.prompt ?? "";
+      assert.match(prompt, /【附件】/);
+      assert.match(prompt, /server\.log/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uploads files dropped into the outbox and replies with them", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lark-bot-outbox-"));
+    try {
+      const outbox = join(root, "outbox");
+      mkdirSync(outbox, { recursive: true });
+      const image = join(root, "chart.png");
+      writeFileSync(image, "png");
+      const values = baseValues({ attachmentSend: true });
+      const h = makeHarness(values, { attachmentOutboxDir: outbox });
+      await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_trigger", content: "@_user_1 画图" }));
+      await flush();
+      assert.equal(h.created[0]?.env?.LARK_BOT_CHAT_ID, "oc_group");
+      assert.equal(h.created[0]?.env?.LARK_BOT_TOPIC, "om_trigger");
+      assert.equal(h.created[0]?.env?.LARK_BOT_OUTBOX, outbox);
+      writeFileSync(
+        join(outbox, "req.json"),
+        JSON.stringify({ version: 1, chatId: "oc_group", topicKey: "om_trigger", images: [image], files: [] }),
+      );
+      await h.dispatch.drainOutbox();
+      assert.deepEqual(h.uploads, [image]);
+      assert.equal(h.mediaReplies[0]?.kind, "image");
+      assert.equal(h.mediaReplies[0]?.key, "img_key");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("scheduled prompts", () => {
+  it("creates a job from chat and posts its result to the chat", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lark-bot-cron-"));
+    try {
+      let now = new Date(2026, 0, 1, 5, 0, 0).getTime();
+      const h = makeHarness(baseValues(), {
+        cronStorePath: join(root, "cron.json"),
+        now: () => now,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_cron", content: "@_user_1 /cron add 0 6 * * * 总结 今天的进展" }),
+      );
+      await flush();
+      assert.match(h.replies[0]?.text ?? "", /已创建定时任务/);
+
+      now = new Date(2026, 0, 1, 6, 0, 0).getTime();
+      await h.dispatch.runCronTick();
+      await flush();
+      assert.equal(h.runCalls[0]?.text, "总结 今天的进展");
+      assert.equal(h.chatMessages[0]?.chatId, "oc_group");
+      assert.equal(h.chatMessages[0]?.text, "ok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("main-stream commands", () => {
+  it("target the most recently active topic in a group", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_topic", content: "@_user_1 开始" }));
+    await flush();
+    assert.equal(h.created.length, 1);
+
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_status", content: "@_user_1 /status" }));
+    await flush();
+    assert.match(h.replies[h.replies.length - 1]?.text ?? "", /agent-1/);
+  });
+
+  it("falls back to the command message when no topic is active", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_cmd", content: "@_user_1 /status" }));
+    await flush();
+    assert.match(h.replies[0]?.text ?? "", /尚未创建/);
   });
 });

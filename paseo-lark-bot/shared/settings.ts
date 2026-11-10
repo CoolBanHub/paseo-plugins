@@ -106,12 +106,52 @@ export const botValuesSchema = z.object({
   replyInThread: z.boolean().default(true),
   /** Start a fresh agent session after this many idle minutes. */
   sessionIdleMinutes: z.number().int().min(0).max(24 * 60).default(30),
-  /** Clip replies longer than this many characters. */
+  /**
+   * Split replies longer than this many characters into several thread
+   * replies (code-fence aware) instead of clipping them.
+   */
   maxReplyChars: z.number().int().min(200).max(30_000).default(4000),
+  /** Hard cap on split parts per reply; the remainder is clipped. */
+  maxReplyChunks: z.number().int().min(1).max(10).default(4),
   /** Reply with a hint when an unconfigured chat @-mentions the bot. */
   notifyUnmatched: z.boolean().default(false),
-  /** Ack each received message so senders see it was picked up. */
-  ackOnReceive: z.boolean().default(true),
+  /**
+   * Emoji receipt on the triggering message (OnIt while queued/running,
+   * DONE when the answer is delivered). Silent and dismissible, unlike a
+   * text ack in an active group.
+   */
+  ackReaction: z.boolean().default(true),
+  /** Post an explicit "received, working on it" text reply. Off by default. */
+  ackOnReceive: z.boolean().default(false),
+  /**
+   * Keep one live progress card per topic while a turn runs: elapsed time,
+   * queue depth, current tool and the latest output line. Requires the
+   * app to be able to send interactive cards; card updates never push a
+   * notification, so the DONE reaction marks completion.
+   */
+  progressCard: z.boolean().default(true),
+  /** Split long replies into thread parts. */
+  replySplit: z.boolean().default(true),
+  /** Append model/tokens/duration to each answer. */
+  replyFooter: z.boolean().default(false),
+  /**
+   * Accept files the agent drops into the plugin's outbox and post them back
+   * to the topic. Off means the helper exists but its requests are discarded.
+   */
+  attachmentSend: z.boolean().default(true),
+  /** Largest outbound attachment accepted, in MiB (inbound files cap at 20MB). */
+  attachmentMaxMb: z.number().int().min(1).max(200).default(50),
+  /**
+   * Per-sender inbound turn budget per hour. 0 disables the limit. Commands
+   * and messages from other senders do not consume another user's budget.
+   */
+  rateLimitPerHour: z.number().int().min(0).max(500).default(20),
+  /**
+   * Give each chat binding its own workspace (named after the chat) instead
+   * of putting every topic agent in the shared "飞书任务" workspace. Use this
+   * when bindings point at different project directories.
+   */
+  workspacePerBinding: z.boolean().default(false),
   /**
    * Name new topic sessions with a one-shot AI turn on the chat's bound
    * provider (adds a short delay to the first reply). On failure, timeout,

@@ -47,6 +47,20 @@ describe("chat binding schema", () => {
     assert.equal(parsed.enabled, true);
     assert.equal(botValuesSchema.parse({ enabled: false }).enabled, false);
   });
+
+  it("defaults to quiet receipts, progress cards and split replies", () => {
+    const parsed = botValuesSchema.parse({});
+    assert.equal(parsed.ackReaction, true);
+    assert.equal(parsed.ackOnReceive, false);
+    assert.equal(parsed.progressCard, true);
+    assert.equal(parsed.replySplit, true);
+    assert.equal(parsed.maxReplyChunks, 4);
+    assert.equal(parsed.replyFooter, false);
+    assert.equal(parsed.attachmentSend, true);
+    assert.equal(parsed.attachmentMaxMb, 50);
+    assert.equal(parsed.rateLimitPerHour, 20);
+    assert.equal(parsed.workspacePerBinding, false);
+  });
 });
 
 describe("isDshProvider", () => {

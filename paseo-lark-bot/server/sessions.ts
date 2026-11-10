@@ -8,15 +8,27 @@ import {
 } from "../shared/settings.ts";
 import { isMissingAgentError, isTransientTurnError, sanitizeTopicText } from "./format.ts";
 import { generateTopicTitle } from "./title.ts";
-import { ensureSharedWorkspace } from "./workspace.ts";
+import { ensureWorkspace, SHARED_WORKSPACE_TITLE } from "./workspace.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
-function resolveCwd(cwd: string): string {
+export function resolveCwd(cwd: string): string {
   const trimmed = cwd.trim();
   if (!trimmed) return homedir();
   if (trimmed === "~") return homedir();
   if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) return join(homedir(), trimmed.slice(2));
   return trimmed;
+}
+
+/** Accept only known string keys from persisted/command-supplied overrides. */
+export function sanitizeOverrides(value: unknown): TopicOverrides {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const output: TopicOverrides = {};
+  for (const key of ["provider", "model", "thinkingOptionId", "permission", "cwd"] as const) {
+    const entry = record[key];
+    if (typeof entry === "string" && entry.trim()) output[key] = entry.trim();
+  }
+  return output;
 }
 
 /** dsh permission preset ids are the only values accepted for that provider. */
@@ -43,13 +55,66 @@ const DEFAULT_TOPIC_SYSTEM_PROMPT = [
  * Other providers keep their own defaults unless the binding selects a mode,
  * model, or thinking depth.
  */
-function providerCreateConfig(provider: string, binding: ChatBinding): {
+/** Per-topic overrides set by chat commands; they outlive provider restarts. */
+export interface TopicOverrides {
+  provider?: string;
+  model?: string;
+  thinkingOptionId?: string;
+  permission?: string;
+  cwd?: string;
+}
+
+/** Normalized live activity forwarded from the agent timeline. */
+export interface AgentActivity {
+  kind: "tool" | "text" | "reasoning" | "todo" | "error";
+  text: string;
+  tool?: string;
+  status?: string;
+}
+
+/** Usage slice needed by the optional reply footer. */
+export interface TurnUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCostUsd?: number;
+}
+
+/** Default prompt plus the optional attachment-return instructions. */
+function defaultSystemPrompt(
+  helperPath: string | null | undefined,
+  context?: { chatId: string; topicKey: string },
+): string {
+  if (!helperPath) return DEFAULT_TOPIC_SYSTEM_PROMPT;
+  const fallback = context
+    ? `\n如果提示缺少会话信息，可显式追加 --chat ${context.chatId} --topic ${context.topicKey}。`
+    : "";
+  return (
+    DEFAULT_TOPIC_SYSTEM_PROMPT +
+    "\n\n### 把生成的图片或文件发回飞书\n" +
+    "需要把本地生成的图片/文件投递给用户时，运行：\n" +
+    `  ${helperPath} --image /绝对/路径/图.png\n` +
+    `  ${helperPath} --file /绝对/路径/报告.pdf\n` +
+    "只用于回传你生成、且用户需要看到的附件；路径必须在该会话的工作目录或系统临时目录内。" +
+    "普通回答仍按正常消息发送，不要重复文件路径。" +
+    fallback
+  );
+}
+
+function providerCreateConfig(
+  provider: string,
+  binding: ChatBinding,
+  overrides: TopicOverrides,
+  helperPath: string | null,
+  attachmentContext?: { chatId: string; topicKey: string },
+): {
   provider: string;
   systemPrompt?: string;
   modeId?: string;
   thinkingOptionId?: string;
   featureValues?: Record<string, unknown>;
 } {
+  const thinking = overrides.thinkingOptionId ?? binding.thinkingOptionId;
+  const permission = overrides.permission ?? binding.permission;
   const config: {
     provider: string;
     systemPrompt?: string;
@@ -58,22 +123,22 @@ function providerCreateConfig(provider: string, binding: ChatBinding): {
     featureValues?: Record<string, unknown>;
   } = {
     provider,
-    systemPrompt: binding.systemPrompt?.trim() || DEFAULT_TOPIC_SYSTEM_PROMPT,
+    systemPrompt: binding.systemPrompt?.trim() || defaultSystemPrompt(helperPath, attachmentContext),
   };
 
   if (isDshProvider(provider)) {
-    config.thinkingOptionId = binding.thinkingOptionId.trim() || "max";
+    config.thinkingOptionId = thinking.trim() || "max";
     config.featureValues = {
-      paseo_dsh_permission_preset: dshPermissionPreset(binding.permission),
+      paseo_dsh_permission_preset: dshPermissionPreset(permission),
     };
     return config;
   }
 
-  if (binding.permission.trim()) {
-    config.modeId = binding.permission.trim();
+  if (permission.trim()) {
+    config.modeId = permission.trim();
   }
-  if (binding.thinkingOptionId.trim()) {
-    config.thinkingOptionId = binding.thinkingOptionId.trim();
+  if (thinking.trim()) {
+    config.thinkingOptionId = thinking.trim();
   }
   return config;
 }
@@ -111,6 +176,10 @@ export interface SessionAgentHandle {
     requestId: string;
     response: SessionPermissionResponse;
   }): Promise<void>;
+  /** Live timeline feed, used by the progress card. */
+  timeline?: SessionTimelineHandle;
+  /** Last usage snapshot reported by the daemon, when available. */
+  readonly lastUsage?: TurnUsage | null;
 }
 
 export interface SessionRunResult {
@@ -119,11 +188,26 @@ export interface SessionRunResult {
   lastMessage: string | null;
 }
 
-/** Minimal timeline slice for fallback reply lookups. */
+/** One live timeline item as delivered by the daemon's agent stream. */
+export interface SessionTimelineEvent {
+  item?: {
+    type?: string;
+    text?: string;
+    name?: string;
+    detail?: Record<string, unknown>;
+    status?: string;
+    message?: string;
+    [key: string]: unknown;
+  };
+}
+
+/** Minimal timeline slice for fallback replies and live progress. */
 export interface SessionTimelineHandle {
   refetch(options?: { limit?: number }): Promise<{
     entries?: { item?: { type?: string; text?: string } }[];
   }>;
+  /** Live timeline events; optional on older hosts. */
+  subscribe?(handler: (event: unknown) => void): { unsubscribe?: () => void };
 }
 
 export interface SessionPaseoApi {
@@ -145,6 +229,8 @@ export interface SessionPaseoApi {
       autoArchive?: boolean;
       /** Keep helper sessions out of the interactive workspace focus. */
       background?: boolean;
+      /** Environment for the agent process and its tool shells. */
+      env?: Record<string, string>;
     }): Promise<SessionAgentHandle>;
     ref(id: string): SessionAgentHandle & { timeline?: SessionTimelineHandle };
   };
@@ -186,6 +272,7 @@ export interface SessionWorkspaceHandle {
       labels?: Record<string, string>;
       prompt?: string;
       images?: SessionImage[];
+      env?: Record<string, string>;
     }): Promise<SessionAgentHandle>;
   };
 }
@@ -224,6 +311,10 @@ export interface TurnOutcome {
   lastError: string | null;
   /** Automatic retries already spent on this turn (failed outcomes only). */
   retries?: number;
+  /** Wall-clock time from turn start to turn_ended, for the reply footer. */
+  durationMs?: number;
+  /** Provider-reported tokens/cost for this turn, when available. */
+  usage?: TurnUsage | null;
 }
 
 interface QueueItem {
@@ -268,6 +359,12 @@ interface TopicState {
   turnCounter: number;
   /** Fires if run() returns idle but turn_ended never arrives. */
   turnFallback: ReturnType<typeof setTimeout> | null;
+  /** Chat-command overrides for the next session of this topic. */
+  overrides: TopicOverrides;
+  /** Detaches the live timeline subscription when the agent is replaced. */
+  timelineUnsub: (() => void) | null;
+  /** Usage reported during the active turn, consumed by turn_ended. */
+  turnUsage: TurnUsage | null;
 }
 
 /** One persisted topic→agent entry of the topic store. */
@@ -278,6 +375,8 @@ interface StoredTopic {
   lastActivityAt: number;
   /** Fallback reply target, so pre-restart permission events can find it. */
   lastSeenMessageId?: string | null;
+  /** Chat-command overrides, persisted with the mapping. */
+  overrides?: TopicOverrides;
 }
 
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -310,7 +409,72 @@ export interface SessionCallbacks {
   onReply(chatId: string, messageId: string, outcome: TurnOutcome, topicKey?: string): void;
   /** Informational notice (errors, stuck sessions, unmatched chats). */
   onNotice(chatId: string | null, messageId: string, text: string): void;
+  /** A queued item started running; the progress card is created here. */
+  onTurnStarted?(info: {
+    chatId: string;
+    topicKey: string;
+    messageId: string;
+    agentId: string | null;
+    binding: ChatBinding;
+  }): void;
+  /** Live tool/text/reasoning activity for the running agent. */
+  onAgentActivity?(agentId: string, topicKey: string, activity: AgentActivity): void;
   log?(message: string): void;
+}
+
+/** Pull the interesting part out of an agent_stream/subscription event. */
+function streamEventOf(event: unknown): Record<string, unknown> | null {
+  if (!event || typeof event !== "object") return null;
+  const root = event as Record<string, unknown>;
+  const payload = (root.payload && typeof root.payload === "object" ? root.payload : root) as Record<string, unknown>;
+  const stream = (payload.event && typeof payload.event === "object" ? payload.event : payload) as Record<string, unknown>;
+  return stream && typeof stream === "object" ? stream : null;
+}
+
+function usageOf(stream: Record<string, unknown> | null): TurnUsage | null {
+  const usage = stream?.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const record = usage as Record<string, unknown>;
+  const pick = (key: string): number | undefined =>
+    typeof record[key] === "number" ? (record[key] as number) : undefined;
+  const inputTokens = pick("inputTokens");
+  const outputTokens = pick("outputTokens");
+  const totalCostUsd = pick("totalCostUsd");
+  if (inputTokens === undefined && outputTokens === undefined && totalCostUsd === undefined) return null;
+  return { inputTokens, outputTokens, totalCostUsd };
+}
+
+/** Convert a timeline item into the small shape the progress card renders. */
+function activityOf(item: Record<string, unknown> | null): AgentActivity | null {
+  if (!item || typeof item !== "object") return null;
+  const type = typeof item.type === "string" ? item.type : "";
+  const text = typeof item.text === "string" ? item.text.trim() : "";
+  if (type === "tool_call") {
+    const name = typeof item.name === "string" ? item.name : "工具";
+    const detail = item.detail && typeof item.detail === "object" ? (item.detail as Record<string, unknown>) : {};
+    const target =
+      typeof detail.description === "string" && detail.description.trim()
+        ? detail.description.trim()
+        : typeof detail.command === "string" && detail.command.trim()
+          ? detail.command.trim()
+          : typeof detail.filePath === "string" && detail.filePath.trim()
+            ? detail.filePath.trim()
+            : "";
+    const status = typeof item.status === "string" ? item.status : undefined;
+    return { kind: "tool", tool: name, text: target || name, ...(status ? { status } : {}) };
+  }
+  if (type === "assistant_message" && text) {
+    const lastLine = text.split(/\r?\n/).filter(Boolean).slice(-1)[0] ?? text;
+    return { kind: "text", text: lastLine };
+  }
+  if (type === "reasoning" && text) return { kind: "reasoning", text };
+  if (type === "error" && typeof item.message === "string") return { kind: "error", text: item.message };
+  if (type === "todo" && Array.isArray(item.items)) {
+    const active = (item.items as Record<string, unknown>[]).find((entry) => entry?.status === "in_progress");
+    const label = typeof active?.activeForm === "string" ? active.activeForm : typeof active?.text === "string" ? active.text : "";
+    return label ? { kind: "todo", text: label } : null;
+  }
+  return null;
 }
 
 /**
@@ -360,6 +524,12 @@ export function createSessionRegistry(options: {
   topicStorePath?: string;
   /** Write debounce for the topic store (default 5s); tests shrink it. */
   topicStoreDebounceMs?: number;
+  /** Give each chat its own workspace instead of the shared one. */
+  getWorkspacePerBinding?: () => boolean;
+  /** Absolute path of the attachment helper, injected into the default prompt. */
+  getAttachmentHelperPath?: () => string | null;
+  /** Per-agent env for the attachment helper (chat/topic/outbox). */
+  getAttachmentEnv?: (chatId: string, topicKey: string) => Record<string, string> | undefined;
 }) {
   const resolveProvider =
     options.resolveProvider ??
@@ -373,18 +543,41 @@ export function createSessionRegistry(options: {
   const getAiTitle = options.getAiTitle ?? (() => true);
   const turnRetryDelays = options.turnRetryDelaysMs ?? TURN_RETRY_DELAYS_MS;
   const stuckBusyMs = options.stuckBusyMs ?? STUCK_BUSY_MS;
-  // Cached shared workspace handle; null (unavailable) is retried on the
-  // next ensureAgent so a recovered daemon heals the shared-workspace path.
-  let sharedWorkspace: SessionWorkspaceHandle | null = null;
+  // Workspace handles cached per chat (per-binding mode) or once for the
+  // shared "飞书任务" workspace. A failed lookup is not cached, so the next
+  // turn retries and a recovered daemon heals the path.
+  function effectiveBinding(binding: ChatBinding, overrides: TopicOverrides): ChatBinding {
+    return {
+      ...binding,
+      provider: overrides.provider ?? binding.provider,
+      model: overrides.model ?? binding.model,
+      thinkingOptionId: overrides.thinkingOptionId ?? binding.thinkingOptionId,
+      permission: overrides.permission ?? binding.permission,
+      cwd: overrides.cwd ?? binding.cwd,
+    };
+  }
 
-  function workspaceForAgent(item: QueueItem): Promise<SessionWorkspaceHandle | null> {
-    if (sharedWorkspace) return Promise.resolve(sharedWorkspace);
-    return ensureSharedWorkspace({
+  const workspaceCache = new Map<string, SessionWorkspaceHandle>();
+  const getWorkspacePerBinding = options.getWorkspacePerBinding ?? (() => false);
+
+  function workspaceForAgent(item: QueueItem, cwd: string): Promise<SessionWorkspaceHandle | null> {
+    const perBinding = getWorkspacePerBinding();
+    const key = perBinding ? `chat:${item.binding.chatId}` : "shared";
+    const cached = workspaceCache.get(key);
+    if (cached) return Promise.resolve(cached);
+    const title = perBinding
+      ? "飞书 · " +
+        (item.binding.chatName || item.binding.chatId).slice(0, 32) +
+        " · " +
+        item.binding.chatId.slice(-4)
+      : SHARED_WORKSPACE_TITLE;
+    return ensureWorkspace({
       paseo: options.paseo,
-      directory: resolveCwd(item.binding.cwd),
+      title,
+      directory: cwd,
       log: options.callbacks.log,
     }).then((workspace) => {
-      sharedWorkspace = workspace;
+      if (workspace) workspaceCache.set(key, workspace);
       return workspace;
     });
   }
@@ -415,6 +608,9 @@ export function createSessionRegistry(options: {
       activeTurn: null,
       turnCounter: 0,
       turnFallback: null,
+      overrides: {},
+      timelineUnsub: null,
+      turnUsage: null,
     };
   }
 
@@ -447,6 +643,7 @@ export function createSessionRegistry(options: {
             typeof record.lastSeenMessageId === "string" && record.lastSeenMessageId
               ? record.lastSeenMessageId
               : null;
+          state.overrides = sanitizeOverrides(record.overrides);
           topics.set(topicKey, state);
           // Restore the reverse mapping so turn_ended/permission events for a
           // turn that outlived the restart still route to their topic. Idle
@@ -474,6 +671,7 @@ export function createSessionRegistry(options: {
           agentId: state.agentId,
           lastActivityAt: state.lastActivityAt,
           lastSeenMessageId: state.lastSeenMessageId,
+          ...(Object.keys(state.overrides).length > 0 ? { overrides: state.overrides } : {}),
         });
       }
       mkdirSync(dirname(topicStorePath), { recursive: true });
@@ -613,6 +811,7 @@ export function createSessionRegistry(options: {
     state.busySince = busy ? now() : null;
     if (busy) {
       state.awaitingPermission = false;
+      state.turnUsage = null;
       return;
     }
     state.activeTurn = null;
@@ -661,6 +860,8 @@ export function createSessionRegistry(options: {
   function resetTopic(topicKey: string): void {
     const state = topics.get(topicKey);
     if (!state) return;
+    detachTimeline(state);
+    state.turnUsage = null;
     if (state.agentId) agentToTopic.delete(state.agentId);
     state.agentId = null;
     state.handle = null;
@@ -692,6 +893,13 @@ export function createSessionRegistry(options: {
     // or retry it instead of dropping the user's request.
     state.activeItem = item;
     armStuckWatchdog(topicKey, state, turn);
+    options.callbacks.onTurnStarted?.({
+      chatId: state.chatId,
+      topicKey,
+      messageId: item.messageId,
+      agentId: state.agentId,
+      binding: item.binding,
+    });
     try {
       // ensureAgent() passes the prompt to agents.create() for fresh sessions,
       // which already starts the first turn — running it again would duplicate
@@ -764,6 +972,8 @@ export function createSessionRegistry(options: {
   ): void {
     state.activeItem = null;
     if (disposed) return;
+    const durationMs = state.busySince !== null ? now() - state.busySince : undefined;
+    const usage = state.turnUsage ?? state.handle?.lastUsage ?? null;
 
     // agents.ref() is lazy: a deleted/archived agent only fails when run()
     // reaches the daemon. Rebuild and rerun this request once instead of
@@ -828,6 +1038,8 @@ export function createSessionRegistry(options: {
         lastText: null,
         lastError: message,
         retries: state.turnRetries,
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(usage ? { usage } : {}),
       });
     }
     state.turnRetries = 0;
@@ -867,6 +1079,49 @@ export function createSessionRegistry(options: {
     return sanitizeTopicText(instruction, TITLE_FALLBACK_SNIPPET);
   }
 
+  /** Subscribe the progress card to the agent's live timeline. */
+  function attachTimeline(topicKey: string, state: TopicState, handle: SessionAgentHandle): void {
+    if (state.timelineUnsub) return;
+    const timeline = handle.timeline;
+    if (!timeline?.subscribe) return;
+    try {
+      const subscription = timeline.subscribe((event) => {
+        const stream = streamEventOf(event);
+        if (!stream) return;
+        if (stream.type === "turn_completed" || stream.type === "usage_updated") {
+          const usage = usageOf(stream);
+          if (usage) state.turnUsage = usage;
+          return;
+        }
+        if (stream.type !== "timeline") return;
+        const item =
+          stream.item && typeof stream.item === "object"
+            ? (stream.item as Record<string, unknown>)
+            : null;
+        const activity = activityOf(item);
+        if (activity) options.callbacks.onAgentActivity?.(handle.id, topicKey, activity);
+      });
+      state.timelineUnsub = () => subscription?.unsubscribe?.();
+      const ready = (subscription as { ready?: Promise<unknown> } | undefined)?.ready;
+      void ready?.catch((error: unknown) => {
+        options.callbacks.log?.(
+          `topic ${topicKey} timeline subscription failed: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      });
+    } catch (error) {
+      options.callbacks.log?.(
+        `topic ${topicKey} timeline subscribe failed: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    }
+  }
+
+  function detachTimeline(state: TopicState): void {
+    state.timelineUnsub?.();
+    state.timelineUnsub = null;
+  }
+
   /**
    * Prefer an AI one-line title; anything less becomes the sanitized text.
    * The title is the bare task description: the shared workspace is already
@@ -876,13 +1131,14 @@ export function createSessionRegistry(options: {
     topicKey: string,
     item: QueueItem,
     provider: string,
+    cwd: string,
   ): Promise<string> {
     const state = stateFor(topicKey, "");
     if (getAiTitle()) {
       const generated = await generateTopicTitle({
         paseo: options.paseo,
         provider,
-        cwd: resolveCwd(item.binding.cwd),
+        cwd,
         chatId: state.chatId,
         topicKey,
         topicRootText: item.topicRootText ?? null,
@@ -937,27 +1193,44 @@ export function createSessionRegistry(options: {
         state.agentId = null;
       }
     }
-    if (state.handle && !expired) return { handle: state.handle, created: false };
+    if (state.handle && !expired) {
+      attachTimeline(topicKey, state, state.handle);
+      return { handle: state.handle, created: false };
+    }
 
-    if (state.agentId) agentToTopic.delete(state.agentId);
-    const provider = await resolveProvider(item.binding.provider, item.binding.model);
+    if (state.agentId) {
+      detachTimeline(state);
+      agentToTopic.delete(state.agentId);
+    }
+    const effective = effectiveBinding(item.binding, state.overrides);
+    const provider = await resolveProvider(effective.provider, effective.model);
+    const cwd = resolveCwd(effective.cwd);
     // Topic agents share one "飞书任务" workspace when the daemon supports
-    // it; the agent cwd then comes from the workspace directory. Without the
-    // workspaces slice (older daemon / failure), fall back to a standalone
-    // agents.create() with the binding cwd.
-    const workspace = await workspaceForAgent(item);
+    // it (or one workspace per binding when configured); the agent cwd then
+    // comes from the workspace directory. Without the workspaces slice (older
+    // daemon / failure), fall back to a standalone create() with the cwd.
+    const workspace = await workspaceForAgent(item, cwd);
+    const attachmentEnv = options.getAttachmentEnv?.(state.chatId, topicKey);
     const agentOptions = {
-      config: providerCreateConfig(provider, item.binding),
-      title: await resolveTitle(topicKey, item, provider),
+      config: providerCreateConfig(
+        provider,
+        effective,
+        state.overrides,
+        options.getAttachmentHelperPath?.() ?? null,
+        { chatId: state.chatId, topicKey },
+      ),
+      title: await resolveTitle(topicKey, item, provider, cwd),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
       images: item.images,
+      ...(attachmentEnv ? { env: attachmentEnv } : {}),
     };
     const handle = workspace
       ? await workspace.agents.create(agentOptions)
-      : await options.paseo.agents.create({ ...agentOptions, cwd: resolveCwd(item.binding.cwd) });
+      : await options.paseo.agents.create({ ...agentOptions, cwd });
     state.agentId = handle.id;
     state.handle = handle;
+    attachTimeline(topicKey, state, handle);
     scheduleTopicStoreSave();
     return { handle, created: true };
   }
@@ -993,6 +1266,8 @@ export function createSessionRegistry(options: {
     // retry/rebuild path as a run() error, which needs the item to requeue.
     const item = state.activeItem;
     state.activeItem = null;
+    const durationMs = state.busySince !== null ? now() - state.busySince : undefined;
+    const usage = state.turnUsage ?? state.handle?.lastUsage ?? null;
 
     if (outcome.outcome === "failed") {
       const message = outcome.lastError?.trim() || "智能体执行出错";
@@ -1008,6 +1283,8 @@ export function createSessionRegistry(options: {
           ...outcome,
           lastError: message,
           retries: state.turnRetries,
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(usage ? { usage } : {}),
         });
       }
       state.turnRetries = 0;
@@ -1035,7 +1312,12 @@ export function createSessionRegistry(options: {
     state.stuckRequeues = 0;
     setBusy(state, false);
     if (target) {
-      options.callbacks.onReply(state.chatId, target, outcome, topicKey);
+      options.callbacks.onReply(
+        state.chatId,
+        target,
+        { ...outcome, ...(durationMs !== undefined ? { durationMs } : {}), ...(usage ? { usage } : {}) },
+        topicKey,
+      );
     }
     state.lastActivityAt = now();
     scheduleTopicStoreSave();
@@ -1064,12 +1346,70 @@ export function createSessionRegistry(options: {
     return state?.pendingTargets[0] ?? state?.lastSeenMessageId ?? null;
   }
 
+  /** Most recently active topic in a chat, for commands sent in the main stream. */
+  function latestTopicKey(chatId: string): string | null {
+    let best: { key: string; at: number } | null = null;
+    for (const [key, state] of topics) {
+      if (state.chatId !== chatId) continue;
+      if (!state.agentId && !state.busy && state.queue.length === 0) continue;
+      const at = Math.max(state.lastActivityAt, state.busySince ?? 0);
+      if (!best || at > best.at) best = { key, at };
+    }
+    return best?.key ?? null;
+  }
+
   /** True when the next message will start a fresh agent (no reusable context). */
   function needsRebuild(topicKey: string): boolean {
     const state = topics.get(topicKey);
     if (!state?.handle) return true;
     const idleMs = options.getIdleMs();
     return idleMs > 0 && now() - state.lastActivityAt > idleMs;
+  }
+
+  function overridesFor(topicKey: string): TopicOverrides {
+    return { ...(topics.get(topicKey)?.overrides ?? {}) };
+  }
+
+  function setOverrides(topicKey: string, chatId: string, patch: TopicOverrides): void {
+    const state = stateFor(topicKey, chatId);
+    state.overrides = sanitizeOverrides({ ...state.overrides, ...patch });
+    scheduleTopicStoreSave();
+  }
+
+  function sessionInfo(topicKey: string, chatId: string): {
+    agentId: string | null;
+    busy: boolean;
+    queued: number;
+    overrides: TopicOverrides;
+  } {
+    const state = topics.get(topicKey) ?? stateFor(topicKey, chatId);
+    return {
+      agentId: state.agentId,
+      busy: state.busy,
+      queued: state.queue.length,
+      overrides: { ...state.overrides },
+    };
+  }
+
+  /** `/new` (keep overrides) and `/reset` (clear overrides) share this path. */
+  function resetTopicForCommand(topicKey: string, clearOverrides: boolean): void {
+    const state = topics.get(topicKey);
+    if (state && clearOverrides) state.overrides = {};
+    resetTopic(topicKey);
+    scheduleTopicStoreSave();
+    // A reset while a turn was running leaves queued messages behind; start
+    // them on the fresh session instead of waiting for the next @.
+    void drain(topicKey);
+  }
+
+  /** Drop queued messages; a running turn keeps going and still replies. */
+  function clearQueue(topicKey: string): number {
+    const state = topics.get(topicKey);
+    if (!state) return 0;
+    const count = state.queue.length;
+    state.queue = [];
+    if (!state.busy) state.pendingTargets = [];
+    return count;
   }
 
   function status(): ChatSessionStatus[] {
@@ -1096,6 +1436,7 @@ export function createSessionRegistry(options: {
     disposed = true;
     flushTopicStore();
     for (const state of topics.values()) {
+      detachTimeline(state);
       if (state.retryTimer) clearTimeout(state.retryTimer);
       if (state.stuckTimer) clearTimeout(state.stuckTimer);
       if (state.turnFallback) clearTimeout(state.turnFallback);
@@ -1117,6 +1458,12 @@ export function createSessionRegistry(options: {
     topicKeyForAgent,
     targetForAgent,
     needsRebuild,
+    latestTopicKey,
+    overridesFor,
+    setOverrides,
+    sessionInfo,
+    resetTopicForCommand,
+    clearQueue,
     status,
     dispose,
   };

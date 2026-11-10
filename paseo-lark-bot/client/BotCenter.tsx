@@ -56,6 +56,16 @@ interface StatusState {
   botOpenId: string | null;
   sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
   unmatched: { chatId: string; chatType: string; lastSeenAt: number }[];
+  cron: {
+    id: string;
+    expression: string;
+    prompt: string;
+    enabled: boolean;
+    nextRunAt: number | null;
+    lastRunAt: number | null;
+    lastError: string | null;
+  }[];
+  pendingQuestions: number;
 }
 
 const CONSUMER_LABELS: Record<string, { text: string; tone: "success" | "warning" | "danger" | "muted" }> = {
@@ -650,6 +660,31 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                 />
               ))
             )}
+            <InfoRow label="待答问题" value={String(status?.pendingQuestions ?? 0)} />
+          </Card>
+          <Card>
+            <CardTitle
+              text="定时任务"
+              hint="在会话里用 /cron 管理；这里只读展示。每次运行使用新会话，结果发到绑定会话"
+            />
+            {(status?.cron ?? []).length === 0 ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+                暂无定时任务。可在会话里发送 /cron add 0 6 * * * 总结 GitHub trending。
+              </Text>
+            ) : (
+              (status?.cron ?? []).map((job) => (
+                <InfoRow
+                  key={job.id}
+                  label={job.id}
+                  value={
+                    `\`${job.expression}\` · ${job.enabled ? "启用" : "暂停"} · 下次 ` +
+                    (job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—") +
+                    (job.lastError ? ` · 上次失败：${job.lastError}` : "") +
+                    `\n${job.prompt.length > 80 ? job.prompt.slice(0, 79) + "…" : job.prompt}`
+                  }
+                />
+              ))
+            )}
           </Card>
         </ScrollView>
       ) : selection.kind === "credentials" ? (
@@ -803,10 +838,34 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChange={(value) => patchDraft({ notifyUnmatched: value })}
             />
             <ToggleRow
-              label="收到消息先确认"
-              hint="收到 @ 消息立即回复一条「收到，正在处理」，处理完成后再回结果"
+              label="表情回执"
+              hint="收到 @ 后在被 @ 的消息上加「处理中」表情，完成后换成完成表情；不额外发消息"
+              value={draft.ackReaction}
+              onChange={(value) => patchDraft({ ackReaction: value })}
+            />
+            <ToggleRow
+              label="文字确认"
+              hint="额外回复一条「收到，正在处理」；默认关闭，群聊里会显得吵"
               value={draft.ackOnReceive}
               onChange={(value) => patchDraft({ ackOnReceive: value })}
+            />
+            <ToggleRow
+              label="处理进度卡片"
+              hint="处理中原地更新一张卡片（用时、排队、当前工具）；需要机器人能发交互卡片"
+              value={draft.progressCard}
+              onChange={(value) => patchDraft({ progressCard: value })}
+            />
+            <ToggleRow
+              label="长回复分段发送"
+              hint="超过截断长度时按代码块安全地拆成多条话题回复，而不是直接截断"
+              value={draft.replySplit}
+              onChange={(value) => patchDraft({ replySplit: value })}
+            />
+            <ToggleRow
+              label="回复页脚"
+              hint="在回答末尾追加模型、耗时和 token 用量"
+              value={draft.replyFooter}
+              onChange={(value) => patchDraft({ replyFooter: value })}
             />
             <ToggleRow
               label="AI 生成会话标题"
@@ -836,7 +895,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               }}
               style={inputStyle()}
             />
-            <FieldLabel text="回复截断长度（字符）" />
+            <FieldLabel text="单条回复长度（字符，超过后分段）" />
             <TextInput
               value={String(draft.maxReplyChars)}
               keyboardType="number-pad"
@@ -845,6 +904,48 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                 if (Number.isFinite(limit)) patchDraft({ maxReplyChars: limit });
               }}
               style={inputStyle()}
+            />
+            <FieldLabel text="每条回复最多分几段" />
+            <TextInput
+              value={String(draft.maxReplyChunks)}
+              keyboardType="number-pad"
+              onChangeText={(text) => {
+                const count = Number.parseInt(text, 10);
+                if (Number.isFinite(count)) patchDraft({ maxReplyChunks: count });
+              }}
+              style={inputStyle()}
+            />
+            <FieldLabel text="每人每小时请求上限（0 = 不限）" />
+            <TextInput
+              value={String(draft.rateLimitPerHour)}
+              keyboardType="number-pad"
+              onChangeText={(text) => {
+                const limit = Number.parseInt(text, 10);
+                if (Number.isFinite(limit)) patchDraft({ rateLimitPerHour: limit });
+              }}
+              style={inputStyle()}
+            />
+            <ToggleRow
+              label="回传生成的附件"
+              hint="允许智能体通过 lark-bot-send 把图片/文件发回话题（路径限定在工作目录或临时目录）"
+              value={draft.attachmentSend}
+              onChange={(value) => patchDraft({ attachmentSend: value })}
+            />
+            <FieldLabel text="附件大小上限（MB）" />
+            <TextInput
+              value={String(draft.attachmentMaxMb)}
+              keyboardType="number-pad"
+              onChangeText={(text) => {
+                const limit = Number.parseInt(text, 10);
+                if (Number.isFinite(limit)) patchDraft({ attachmentMaxMb: limit });
+              }}
+              style={inputStyle()}
+            />
+            <ToggleRow
+              label="按会话划分 workspace"
+              hint="每个会话一个以群名命名的 workspace，适合不同绑定指向不同项目目录；默认全部放进「飞书任务」"
+              value={draft.workspacePerBinding}
+              onChange={(value) => patchDraft({ workspacePerBinding: value })}
             />
           </Card>
         </ScrollView>

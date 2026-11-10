@@ -111,5 +111,19 @@ export const larkBotStatusRpc = defineRpc({
     unmatched: z.array(
       z.object({ chatId: z.string(), chatType: z.string(), lastSeenAt: z.number() }),
     ),
+    /** Scheduled prompts managed with /cron (read-only on the status page). */
+    cron: z.array(
+      z.object({
+        id: z.string(),
+        expression: z.string(),
+        prompt: z.string(),
+        enabled: z.boolean(),
+        nextRunAt: z.number().nullable(),
+        lastRunAt: z.number().nullable(),
+        lastError: z.string().nullable(),
+      }),
+    ),
+    /** ask_user_question cards still waiting for an answer. */
+    pendingQuestions: z.number(),
   }),
 });

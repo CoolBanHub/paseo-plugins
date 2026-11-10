@@ -421,3 +421,232 @@ export async function replyMessage(options: ReplyOptions): Promise<string | null
   const messageId = (payload.data as { message_id?: unknown } | undefined)?.message_id;
   return typeof messageId === "string" ? messageId : null;
 }
+
+/** lark-cli version string, e.g. "1.0.98"; null when the binary cannot run. */
+export async function readCliVersion(cliPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(cliPath, ["version"], {
+      timeout: 10_000,
+      maxBuffer: 64 * 1024,
+    });
+    const match = /(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(stdout);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Add an emoji reaction (e.g. "OnIt" / "DONE"). Returns the reaction id so a
+ * later removal targets exactly this reaction instead of someone else's.
+ */
+export async function addReaction(options: {
+  cliPath: string;
+  messageId: string;
+  emojiType: string;
+}): Promise<string | null> {
+  const payload = await runCli(
+    options.cliPath,
+    [
+      "im",
+      "reactions",
+      "create",
+      "--params",
+      JSON.stringify({ message_id: options.messageId }),
+      "--data",
+      JSON.stringify({ reaction_type: { emoji_type: options.emojiType } }),
+      "--as",
+      "bot",
+      "--format",
+      "json",
+    ],
+    "添加表情回执",
+  );
+  const reactionId = (payload.data as { reaction_id?: unknown } | undefined)?.reaction_id;
+  return typeof reactionId === "string" && reactionId ? reactionId : null;
+}
+
+/** Best-effort removal of a reaction this plugin added. */
+export async function removeReaction(options: {
+  cliPath: string;
+  messageId: string;
+  reactionId: string;
+}): Promise<void> {
+  await runCli(
+    options.cliPath,
+    [
+      "im",
+      "reactions",
+      "delete",
+      "--params",
+      JSON.stringify({ message_id: options.messageId, reaction_id: options.reactionId }),
+      "--as",
+      "bot",
+      "--format",
+      "json",
+    ],
+    "移除表情回执",
+  );
+}
+
+/**
+ * Patch an interactive card in place. Feishu expects `content` as a
+ * stringified card JSON; updates do not push a notification, which is why the
+ * dispatcher adds a DONE reaction when the turn finishes.
+ */
+export async function updateCard(options: {
+  cliPath: string;
+  messageId: string;
+  card: Record<string, unknown>;
+}): Promise<void> {
+  const content = JSON.stringify(options.card);
+  if (content.length > 30 * 1024) throw new Error("进度卡片超过 30KB，无法更新");
+  // Feishu occasionally returns internal error 2200 on a valid PATCH; retry a
+  // few times with a short backoff before giving up (the caller keeps the old
+  // card and logs the failure).
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const stdout = await runWithStdin(
+        options.cliPath,
+        [
+          "im",
+          "messages",
+          "patch",
+          "--message-id",
+          options.messageId,
+          "--data",
+          "-",
+          "--as",
+          "bot",
+          "--format",
+          "json",
+        ],
+        JSON.stringify({ content }),
+      );
+      const payload = parseLarkJson(stdout);
+      if (payload?.ok !== true) {
+        const error = payload?.error;
+        throw new Error(
+          "更新卡片失败：" + (error?.message || stdout.trim() || "lark-cli 无输出").slice(0, 400),
+        );
+      }
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= 3 || !/2200|internal error|internal_error|系统繁忙/i.test(message)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+    }
+  }
+}
+
+/** Upload a local image and return its image_key. */
+export async function uploadImage(cliPath: string, path: string): Promise<string> {
+  const payload = await runCli(
+    cliPath,
+    ["im", "images", "create", "--data", '{"image_type":"message"}', "--file", path, "--as", "bot", "--format", "json"],
+    "上传图片",
+  );
+  const imageKey = (payload.data as { image_key?: unknown } | undefined)?.image_key;
+  if (typeof imageKey !== "string" || !imageKey) throw new Error("上传图片失败：lark-cli 未返回 image_key");
+  return imageKey;
+}
+
+/** Upload a local file and return its file_key (file_type by extension). */
+export async function uploadFile(cliPath: string, path: string, name: string): Promise<string> {
+  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  const type =
+    extension === "pdf"
+      ? "pdf"
+      : extension === "doc" || extension === "docx"
+        ? "doc"
+        : extension === "xls" || extension === "xlsx"
+          ? "xls"
+          : extension === "ppt" || extension === "pptx"
+            ? "ppt"
+            : extension === "mp4"
+              ? "mp4"
+              : extension === "opus" || extension === "ogg"
+                ? "opus"
+                : "stream";
+  const payload = await runCli(
+    cliPath,
+    [
+      "im",
+      "files",
+      "create",
+      "--data",
+      JSON.stringify({ file_name: name, file_type: type }),
+      "--file",
+      path,
+      "--as",
+      "bot",
+      "--format",
+      "json",
+    ],
+    "上传文件",
+  );
+  const fileKey = (payload.data as { file_key?: unknown } | undefined)?.file_key;
+  if (typeof fileKey !== "string" || !fileKey) throw new Error("上传文件失败：lark-cli 未返回 file_key");
+  return fileKey;
+}
+
+/** Reply with an already-uploaded image/file key, inside the topic. */
+export async function replyMedia(options: {
+  cliPath: string;
+  messageId: string;
+  kind: "image" | "file";
+  key: string;
+  replyInThread: boolean;
+  idempotencyKey?: string;
+}): Promise<string | null> {
+  const args = [
+    "im",
+    "+messages-reply",
+    "--message-id",
+    options.messageId,
+    "--as",
+    "bot",
+    "--msg-type",
+    options.kind,
+    "--content",
+    JSON.stringify(options.kind === "image" ? { image_key: options.key } : { file_key: options.key }),
+  ];
+  if (options.replyInThread) args.push("--reply-in-thread");
+  if (options.idempotencyKey) args.push("--idempotency-key", options.idempotencyKey.slice(0, 50));
+  const payload = await runCli(options.cliPath, args, "回复附件");
+  return typeof (payload.data as { message_id?: unknown } | undefined)?.message_id === "string"
+    ? ((payload.data as { message_id: string }).message_id)
+    : null;
+}
+
+/**
+ * Send a new message to a chat (scheduled jobs have no source message to
+ * reply under). Returns the message id when lark-cli reports one.
+ */
+export async function sendChatMessage(options: {
+  cliPath: string;
+  chatId: string;
+  text: string;
+  format: ReplyFormat;
+}): Promise<string | null> {
+  const args = ["im", "+messages-send", "--chat-id", options.chatId, "--as", "bot"];
+  let stdin: string;
+  if (options.format === "text") {
+    args.push("--text", "-");
+    stdin = options.text;
+  } else if (options.format === "post") {
+    args.push("--msg-type", "post", "--content", "-");
+    stdin = buildPostContent(options.text);
+  } else {
+    args.push("--markdown", "-");
+    stdin = options.text;
+  }
+  const stdout = await runWithStdin(options.cliPath, args, stdin);
+  const payload = parseLarkJson(stdout);
+  if (payload?.ok !== true) {
+    const error = payload?.error;
+    throw new Error("发送消息失败：" + (error?.message || stdout.trim() || "lark-cli 无输出").slice(0, 400));
+  }
+  const messageId = (payload.data as { message_id?: unknown } | undefined)?.message_id;
+  return typeof messageId === "string" ? messageId : null;
+}

@@ -19,6 +19,7 @@ import {
   applyAppCredentials,
   listChatMembers,
   listChats,
+  readCliVersion,
   readCurrentAppId,
   resolveLarkCli,
   stopLarkEventBus,
@@ -27,6 +28,9 @@ import { createAppCreationController } from "./server/app-creation.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
+import { resolveFfmpeg } from "./server/media.ts";
+import { installOutboxHelper } from "./server/attachments.ts";
+import { renderDoctorReport, runDoctorChecks } from "./server/doctor.ts";
 import {
   DSH_DEFAULT_PERMISSION,
   DSH_PERMISSION_OPTIONS,
@@ -60,6 +64,12 @@ const pendingCardActions: LarkCardActionEvent[] = [];
 const MAX_PENDING_CARD_ACTIONS = 20;
 /** provider → provider/<default-model>, filled lazily per daemon lifetime. */
 const providerModelCache = new Map<string, string>();
+/** All plugin-owned state (stores, media, outbox, helper) lives here. */
+const PLUGIN_DATA_ROOT = join(
+  process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
+  "plugin-data",
+  "lark-bot",
+);
 
 function credentialFingerprint(appId: string, appSecret: string): string {
   return createHash("sha256").update(appId).update("\0").update(appSecret).digest("hex");
@@ -97,17 +107,41 @@ async function resolveProviderModel(provider: string, model = ""): Promise<strin
   }
 }
 
-function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotValues>): Dispatcher {
+function ensureDispatcher(
+  api: SessionPaseoApi,
+  readValues: () => Promise<BotValues>,
+  doctor: () => Promise<string>,
+): Dispatcher {
   paseo = api;
   if (!dispatcher) {
-    const pluginDataRoot = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "plugin-data", "lark-bot");
+    let helperPath: string | null = null;
+    try {
+      helperPath = installOutboxHelper(PLUGIN_DATA_ROOT, process.execPath);
+    } catch (error) {
+      console.log(
+        "[lark-bot] 附件回传 helper 安装失败",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     dispatcher = createDispatcher({
-      dedupStorePath: join(pluginDataRoot, "seen-message-ids.json"),
-      topicStorePath: join(pluginDataRoot, "topic-agents.json"),
-      pendingStorePath: join(pluginDataRoot, "pending-questions.json"),
-      mediaStoreDir: join(pluginDataRoot, "media"),
+      dedupStorePath: join(PLUGIN_DATA_ROOT, "seen-message-ids.json"),
+      topicStorePath: join(PLUGIN_DATA_ROOT, "topic-agents.json"),
+      pendingStorePath: join(PLUGIN_DATA_ROOT, "pending-questions.json"),
+      mediaStoreDir: join(PLUGIN_DATA_ROOT, "media"),
+      pluginDataDir: PLUGIN_DATA_ROOT,
+      attachmentOutboxDir: join(PLUGIN_DATA_ROOT, "outbox"),
+      ...(helperPath ? { attachmentHelperPath: helperPath } : {}),
+      cronStorePath: join(PLUGIN_DATA_ROOT, "cron-jobs.json"),
       paseo: api,
       readValues,
+      doctor,
+      readProviders: async () => {
+        try {
+          return await api.providers?.waitForReady({ timeoutMs: 3_000 }) ?? null;
+        } catch {
+          return null;
+        }
+      },
       resolveProvider: resolveProviderModel,
       fetchLastReply: async (agentId: string) => {
         // The turn_ended projection can lag the persisted timeline by a few
@@ -150,6 +184,46 @@ export default function contribute(server: PluginServerContext) {
 
   const log = (message: string, detail?: unknown): void => {
     console.log("[lark-bot] " + message, detail === undefined ? "" : detail);
+  };
+
+  /** `/doctor` — reports the silent-degradation states this plugin can hit. */
+  const buildDoctor = async (): Promise<string> => {
+    const values = await readValues();
+    const status = dispatcher?.status();
+    const cliPath = resolveLarkCli(values.larkCliPath);
+    const cliVersion = cliPath ? await readCliVersion(cliPath) : null;
+    let appId = currentAppIdCache ?? (values.appId.trim() || null);
+    if (!appId && cliPath) {
+      appId = await readCurrentAppId(cliPath).catch(() => null);
+      if (appId) currentAppIdCache = appId;
+    }
+    let providerCount = 0;
+    if (paseo?.providers) {
+      try {
+        const snapshot = await paseo.providers.waitForReady({ timeoutMs: 3_000 });
+        providerCount = snapshot.entries.filter((entry) => entry.enabled !== false).length;
+      } catch {
+        providerCount = 0;
+      }
+    }
+    return renderDoctorReport(
+      runDoctorChecks({
+        cliPath,
+        cliVersion,
+        currentAppId: appId,
+        botOpenId: status?.botOpenId ?? null,
+        consumerState: consumer?.status().state ?? "stopped",
+        consumerError: consumer?.status().lastError ?? null,
+        cardConsumerState: cardConsumer?.status().state ?? "stopped",
+        cardConsumerError: cardConsumer?.status().lastError ?? null,
+        bindingCount: values.chats.length,
+        providerCount,
+        ffmpegPath: resolveFfmpeg(),
+        pluginDataDir: PLUGIN_DATA_ROOT,
+        cronJobs: status?.cron ?? [],
+        pendingQuestions: status?.pendingQuestions ?? 0,
+      }),
+    );
   };
 
   // Apply user-configured app credentials before anything talks to Feishu:
@@ -327,7 +401,7 @@ export default function contribute(server: PluginServerContext) {
 
   const capture = (api: unknown): void => {
     if (paseo || !api) return;
-    ensureDispatcher(api as SessionPaseoApi, readValues);
+    ensureDispatcher(api as SessionPaseoApi, readValues, buildDoctor);
   };
 
   server.handle(larkBotChatsRpc, async (_input, context) => {
@@ -414,6 +488,8 @@ export default function contribute(server: PluginServerContext) {
       botOpenId: status?.botOpenId ?? null,
       sessions: status?.sessions ?? [],
       unmatched: status?.unmatched ?? [],
+      cron: status?.cron ?? [],
+      pendingQuestions: status?.pendingQuestions ?? 0,
     };
   });
 

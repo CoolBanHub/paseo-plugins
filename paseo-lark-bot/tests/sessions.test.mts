@@ -49,6 +49,8 @@ interface Harness {
   /** workspace ids handed back via workspaces.ref(). */
   wsRefs: string[];
   runCalls: { agentId: string; text: string }[];
+  activities: { agentId: string; topicKey: string; activity: { kind: string; text: string; tool?: string; status?: string } }[];
+  emitTimeline: (event: unknown) => void;
   agentCounter: number;
   currentAgent: () => SessionAgentHandle;
   finishRun: (result: SessionRunResult) => void;
@@ -79,6 +81,7 @@ function makeHarness(
     workspaces?: WorkspacesFakeOptions;
     turnRetryDelaysMs?: number[];
     stuckBusyMs?: number;
+    workspacePerBinding?: boolean;
   },
 ): Harness {
   const replies: ReplyCall[] = [];
@@ -88,6 +91,8 @@ function makeHarness(
   const wsCreated: Harness["wsCreated"] = [];
   const wsRefs: string[] = [];
   const runCalls: Harness["runCalls"] = [];
+  const activities: Harness["activities"] = [];
+  let timelineHandler: ((event: unknown) => void) | null = null;
   let agentCounter = 0;
   let current: SessionAgentHandle | null = null;
   let pendingRun: ((result: SessionRunResult) => void) | null = null;
@@ -102,6 +107,13 @@ function makeHarness(
         return new Promise<SessionRunResult>((resolve) => {
           pendingRun = resolve;
         });
+      },
+      timeline: {
+        refetch: async () => ({ entries: [] }),
+        subscribe: (handler: (event: unknown) => void) => {
+          timelineHandler = handler;
+          return { unsubscribe: () => undefined };
+        },
       },
     };
     return current;
@@ -170,11 +182,13 @@ function makeHarness(
       : paseo,
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
+    getWorkspacePerBinding: () => options?.workspacePerBinding ?? false,
     turnRetryDelaysMs: options?.turnRetryDelaysMs,
     stuckBusyMs: options?.stuckBusyMs,
     callbacks: {
       onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
       onNotice: (chatId, messageId, text) => notices.push({ chatId, messageId, text }),
+      onAgentActivity: (agentId, topicKey, activity) => activities.push({ agentId, topicKey, activity }),
     },
   });
 
@@ -187,6 +201,8 @@ function makeHarness(
     wsCreated,
     wsRefs,
     runCalls,
+    activities,
+    emitTimeline: (event) => timelineHandler?.(event),
     agentCounter,
     currentAgent: () => {
       assert.ok(current);
@@ -228,7 +244,11 @@ describe("createSessionRegistry", () => {
 
     h.registry.handleTurnEnded(agent.id, completed("第一轮答复"));
     await flush();
-    assert.deepEqual(h.replies, [{ chatId: "oc_group", messageId: "om_1", outcome: completed("第一轮答复") }]);
+    assert.equal(h.replies.length, 1);
+    assert.equal(h.replies[0]?.chatId, "oc_group");
+    assert.equal(h.replies[0]?.messageId, "om_1");
+    assert.equal(h.replies[0]?.outcome.outcome, "completed");
+    assert.equal(h.replies[0]?.outcome.lastText, "第一轮答复");
 
     h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", binding);
     await flush();
@@ -611,7 +631,7 @@ describe("reply fallbacks", () => {
           timeline: {
             refetch: async () => {
               fetched = true;
-              return { entries: [{ type: "assistant_message", text: "时间线兜底的答复" }] };
+              return { entries: [{ item: { type: "assistant_message", text: "时间线兜底的答复" } }] };
             },
           },
         }),
@@ -772,6 +792,15 @@ describe("shared workspace", () => {
     assert.equal(byName.wsCreated.length, 0);
     assert.deepEqual(byName.wsRefs, ["ws-named"]);
     assert.equal(byName.wsAgentCreates.length, 1);
+  });
+
+  it("uses one workspace per binding when enabled", async () => {
+    const h = makeHarness({ workspaces: { entries: [] }, workspacePerBinding: true });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(h.wsCreated.length, 1);
+    assert.match(String(h.wsCreated[0].title), /^飞书 · 测试群/);
+    assert.deepEqual(h.wsCreated[0].source, { kind: "directory", path: "/tmp/project" });
   });
 
   it("falls back to a standalone agents.create when the workspace create fails", async () => {
@@ -1291,5 +1320,33 @@ describe("default system prompt", () => {
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     assert.equal(h.created[0].config.systemPrompt, "用中文回答");
+  });
+});
+
+describe("live activity forwarding", () => {
+  it("normalizes tool calls and assistant text from the agent stream", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "跑测试", binding);
+    await flush();
+
+    h.emitTimeline({
+      type: "agent_stream",
+      payload: {
+        event: {
+          type: "timeline",
+          item: { type: "tool_call", name: "bash", detail: { command: "npm test" }, status: "running" },
+        },
+      },
+    });
+    h.emitTimeline({
+      type: "agent_stream",
+      payload: { event: { type: "timeline", item: { type: "assistant_message", text: "第一行\n最后一行" } } },
+    });
+    assert.equal(h.activities.length, 2);
+    assert.equal(h.activities[0]?.activity.kind, "tool");
+    assert.equal(h.activities[0]?.activity.tool, "bash");
+    assert.equal(h.activities[0]?.activity.text, "npm test");
+    assert.equal(h.activities[1]?.activity.kind, "text");
+    assert.equal(h.activities[1]?.activity.text, "最后一行");
   });
 });
