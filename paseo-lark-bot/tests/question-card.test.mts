@@ -193,9 +193,9 @@ describe("parseFormAnswer", () => {
 });
 
 describe("questionCardToken", () => {
-  it("is stable and short", () => {
+  it("is stable and long enough to avoid cross-request collisions", () => {
     const token = questionCardToken("permission:paseo-question-q-1");
-    assert.match(token, /^[a-f0-9]{8}$/);
+    assert.match(token, /^[a-f0-9]{16}$/);
     assert.equal(token, questionCardToken("permission:paseo-question-q-1"));
   });
 });

@@ -124,7 +124,7 @@ export function parseQuestionAction(value: string | undefined): QuestionActionPa
 
 /** Stable short token used in form submit names to find the pending request. */
 export function questionCardToken(requestId: string): string {
-  return createHash("sha256").update(requestId).digest("hex").slice(0, 8);
+  return createHash("sha256").update(requestId).digest("hex").slice(0, 16);
 }
 
 /**
@@ -136,7 +136,7 @@ export function parseFormActionName(
   actionName: string | undefined,
 ): { questionIndex: number; token: string | null } | null {
   if (!actionName) return null;
-  const match = /^submit_(?:other|multi)_(\d+)(?:_([a-f0-9]{8}))?$/.exec(actionName);
+  const match = /^submit_(?:other|multi)_(\d+)(?:_([a-f0-9]{8,16}))?$/.exec(actionName);
   if (!match?.[1]) return null;
   const index = Number(match[1]);
   if (!Number.isInteger(index) || index < 0) return null;

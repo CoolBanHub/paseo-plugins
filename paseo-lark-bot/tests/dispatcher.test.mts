@@ -893,6 +893,128 @@ describe("question cards", () => {
     }
   });
 
+  it("routes answers to the right agent when several cards are pending", async () => {
+    const replies: ReplyCall[] = [];
+    const cards: string[] = [];
+    const responses: { agentId: string; requestId: string; response: SessionPermissionResponse }[] = [];
+    const agents = new Map<string, SessionAgentHandle>();
+    const paseo: SessionPaseoApi = {
+      agents: {
+        create: async () => {
+          const id = `agent-${agents.size + 1}`;
+          const handle: SessionAgentHandle = {
+            id,
+            send: async () => {},
+            run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+            respondToPermission: async (options) => {
+              responses.push({ agentId: id, requestId: options.requestId, response: options.response });
+            },
+          };
+          agents.set(id, handle);
+          return handle;
+        },
+        ref: (id) => {
+          const handle = agents.get(id);
+          if (!handle) throw new Error("unexpected ref");
+          return handle;
+        },
+      },
+    };
+    const dispatch = createDispatcher({
+      paseo,
+      readValues: async () => baseValues({ questionCards: true }),
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async (options) => {
+        replies.push({
+          messageId: options.messageId,
+          text: options.text,
+          format: options.format,
+          replyInThread: options.replyInThread,
+        });
+        return null;
+      },
+      replyCard: async () => {
+        const cardMessageId = `om_card_${cards.length + 1}`;
+        cards.push(cardMessageId);
+        return cardMessageId;
+      },
+    });
+
+    // Two topics in the same chat => two agents with one pending card each.
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_topic_a", content: "@_user_1 任务 A" }),
+    );
+    await dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_topic_b", content: "@_user_1 任务 B" }),
+    );
+    await flush();
+    assert.equal(agents.size, 2);
+
+    dispatch.handlePermission(
+      questionPermission("agent-1", "permission:q-a", [
+        { header: "A 题", question: "A?", options: [{ label: "A1" }, { label: "A2" }] },
+      ]),
+    );
+    dispatch.handlePermission(
+      questionPermission("agent-2", "permission:q-b", [
+        { header: "B 题", question: "B?", options: [{ label: "B1" }, { label: "B2" }] },
+      ]),
+    );
+    await flush();
+    assert.equal(cards.length, 2);
+
+    // A click from another chat must not settle either pending question.
+    dispatch.handleCardAction(
+      cardAction({
+        chat_id: "oc_other",
+        message_id: cards[0]!,
+        action_value: JSON.stringify({
+          requestId: "permission:q-a",
+          questionIndex: 0,
+          optionIndex: 0,
+        }),
+        event_id: "evt-cross-chat",
+      }),
+    );
+    await flush();
+    assert.equal(responses.length, 0);
+
+    dispatch.handleCardAction(
+      cardAction({
+        message_id: cards[0]!,
+        action_value: JSON.stringify({
+          requestId: "permission:q-a",
+          questionIndex: 0,
+          optionIndex: 1,
+        }),
+        event_id: "evt-agent-a",
+      }),
+    );
+    await flush();
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0]?.agentId, "agent-1");
+    assert.equal(responses[0]?.requestId, "permission:q-a");
+    assert.deepEqual(responses[0]?.response.updatedInput, { answers: { "A 题": "A2" } });
+
+    dispatch.handleCardAction(
+      cardAction({
+        message_id: cards[1]!,
+        action_value: JSON.stringify({
+          requestId: "permission:q-b",
+          questionIndex: 0,
+          optionIndex: 0,
+        }),
+        event_id: "evt-agent-b",
+      }),
+    );
+    await flush();
+    assert.equal(responses.length, 2);
+    assert.equal(responses[1]?.agentId, "agent-2");
+    assert.equal(responses[1]?.requestId, "permission:q-b");
+    assert.deepEqual(responses[1]?.response.updatedInput, { answers: { "B 题": "B1" } });
+  });
+
   it("ignores unauthorized operators and duplicate callbacks", async () => {
     const first = baseValues().chats[0]!;
     const h = makeHarness(
