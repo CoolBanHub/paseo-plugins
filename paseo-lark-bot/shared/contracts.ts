@@ -60,6 +60,30 @@ export const larkBotChatMembersRpc = defineRpc({
 export type LarkBotProviderInfo = z.output<typeof larkBotProvidersRpc.output>["providers"][number];
 export type LarkBotChatMember = z.output<typeof larkBotChatMembersRpc.output>["members"][number];
 
+/**
+ * One-click Feishu app creation (`lark-cli config init --new`). A single RPC
+ * carries the start/status/cancel actions so the settings screen can poll a
+ * running device-flow login without spawning duplicates.
+ */
+export const larkBotAppCreationRpc = defineRpc({
+  name: "lark-bot.app-creation",
+  input: z
+    .object({
+      action: z.enum(["start", "status", "cancel"]),
+    })
+    .strict(),
+  output: z.object({
+    state: z.enum(["idle", "starting", "waiting", "success", "error"]),
+    url: z.string().nullable(),
+    /** PNG data URL for the verification link; null while starting or on failure. */
+    qrDataUrl: z.string().nullable(),
+    appId: z.string().nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+export type LarkBotAppCreation = z.output<typeof larkBotAppCreationRpc.output>;
+
 /** Runtime status for the settings screen. */
 export const larkBotStatusRpc = defineRpc({
   name: "lark-bot.status",

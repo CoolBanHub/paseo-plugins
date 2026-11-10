@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ScrollView, Text, TextInput, View, useWindowDimensions } from "react-native";
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/react-native";
@@ -22,6 +22,7 @@ import {
   findProvider,
   type MemberCatalogState,
 } from "./BindingEditor.tsx";
+import { AppCreationSection } from "./AppCreation.tsx";
 import {
   Card,
   CardTitle,
@@ -95,6 +96,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [loaded, setLoaded] = useState<BotValues | null>(null);
   const [draft, setDraft] = useState<BotValues | null>(null);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [chatCatalog, setChatCatalog] = useState<{ chatId: string; name: string }[]>([]);
   const [providers, setProviders] = useState<LarkBotProviderInfo[]>([]);
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
@@ -301,32 +303,70 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     setDraft(loaded);
   }, [loaded]);
 
-  const save = useCallback(async () => {
-    if (revision === null || draft === null || saving) return;
-    setSaving(true);
-    try {
-      const result = await writeRpc({ revision, values: normalize(draft) });
-      if (result.status === "saved") {
-        setRevision(result.revision);
-        const parsed = botValuesSchema.safeParse(result.values ?? {});
-        if (parsed.success) {
-          setLoaded(parsed.data);
-          setDraft(parsed.data);
+  const persistDraft = useCallback(
+    async (values: BotValues, message: string): Promise<boolean> => {
+      if (revision === null || savingRef.current) return false;
+      savingRef.current = true;
+      setSaving(true);
+      try {
+        const result = await writeRpc({ revision, values: normalize(values) });
+        if (result.status === "saved") {
+          setRevision(result.revision);
+          const parsed = botValuesSchema.safeParse(result.values ?? {});
+          if (parsed.success) {
+            setLoaded(parsed.data);
+            setDraft(parsed.data);
+          }
+          toast.show(message);
+          void refreshStatus();
+          return true;
         }
-        toast.show("已保存，机器人设置已生效");
-        void refreshStatus();
-      } else if (result.status === "conflict") {
-        toast.error("设置已被其他端修改，已重新加载，请再次保存");
-        await reload();
-      } else {
+        if (result.status === "conflict") {
+          toast.error("设置已被其他端修改，已重新加载，请再次操作");
+          await reload();
+          return false;
+        }
         toast.error(`保存失败：${result.error}`);
+        return false;
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err));
+        return false;
+      } finally {
+        savingRef.current = false;
+        setSaving(false);
       }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }, [draft, reload, refreshStatus, revision, saving, toast, writeRpc]);
+    },
+    [reload, refreshStatus, revision, toast, writeRpc],
+  );
+
+  const save = useCallback(() => {
+    if (!draft) return;
+    void persistDraft(draft, "已保存，机器人设置已生效");
+  }, [draft, persistDraft]);
+
+  /** Switch to the app just created by the scan flow: clear the plugin's
+   * saved credentials so lark-cli's new keychain config takes over. */
+  const applyScannedApp = useCallback(
+    async (appId: string): Promise<boolean> => {
+      if (!draft) return false;
+      // Only SAVED credentials override lark-cli. If the draft was merely
+      // cleared without saving, the old values still win and must be written.
+      const savedOverrides = Boolean(loaded?.appId.trim() || loaded?.appSecret);
+      if (!savedOverrides) {
+        // Nothing saved overrides lark-cli; the server already restarted the
+        // consumers. Drop any unsaved credential text so a later save cannot
+        // accidentally switch back.
+        if (draft.appId || draft.appSecret) patchDraft({ appId: "", appSecret: "" });
+        void refreshStatus();
+        return true;
+      }
+      return persistDraft(
+        { ...draft, appId: "", appSecret: "" },
+        `已创建并切换到新应用 ${appId}；当前设置已保存、旧凭证已清空`,
+      );
+    },
+    [draft, loaded, patchDraft, persistDraft, refreshStatus],
+  );
 
   if (!draft || !loaded) {
     return (
@@ -565,8 +605,19 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
             <CardTitle
-              text="飞书应用凭证"
-              hint="留空沿用 lark-cli 已有配置；填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
+              text="扫码创建飞书应用（推荐）"
+              hint="用飞书扫码自动创建一个 PersonalAgent 应用，默认带机器人能力、长连接事件订阅和常用权限"
+            />
+            <AppCreationSection
+              currentAppId={status?.currentAppId ?? null}
+              storedAppId={draft.appId}
+              onCreated={applyScannedApp}
+            />
+          </Card>
+          <Card>
+            <CardTitle
+              text="手动填写应用凭证"
+              hint="已有应用时使用；留空沿用 lark-cli 已有配置，填写后保存即验证并写入 lark-cli（按本地使用场景明文保存，不加密）"
             />
             <FieldLabel text="App ID（cli_ 开头）" />
             <TextInput

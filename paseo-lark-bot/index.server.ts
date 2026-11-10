@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
+  larkBotAppCreationRpc,
   larkBotChatMembersRpc,
   larkBotChatsRpc,
   larkBotProvidersRpc,
@@ -20,7 +21,9 @@ import {
   listChats,
   readCurrentAppId,
   resolveLarkCli,
+  stopLarkEventBus,
 } from "./server/lark.ts";
+import { createAppCreationController } from "./server/app-creation.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
@@ -154,7 +157,21 @@ export default function contribute(server: PluginServerContext) {
   // never clobber the working keychain config and fall back to it.
   const applyCredentials = async (values: BotValues, cliPath: string | null): Promise<void> => {
     const wanted = values.appId.trim();
-    if (!wanted || !values.appSecret || !cliPath) return;
+    if (!wanted || !values.appSecret || !cliPath) {
+      // The user cleared the plugin-level credentials (typically after the
+      // scan flow created a new app). Drop the identity this lifetime applied
+      // and reconnect with lark-cli's current keychain config.
+      if (appliedCredentialKey !== null) {
+        await consumer?.stop();
+        consumer = null;
+        consumerCli = null;
+        appliedCredentialKey = null;
+        currentAppIdCache = null;
+        dispatcher?.resetIdentity();
+        log("已清空插件内应用凭证，改用 lark-cli 当前配置");
+      }
+      return;
+    }
     // Compare the secret too: rotating the secret for the same App ID must
     // still validate and write. The Secret stays plaintext in host settings by
     // design (local-only use); only a hash is kept in memory here.
@@ -271,6 +288,31 @@ export default function contribute(server: PluginServerContext) {
     pendingCardActions.push(event);
   };
 
+  // One-click app creation. The CLI owns the device flow and writes the new
+  // App ID/Secret into its keychain; we only restart the consumers so they
+  // pick it up (when no plugin-level credentials override it).
+  const appCreation = createAppCreationController({
+    readAppId: readCurrentAppId,
+    log,
+    onSuccess: async (appId, cliPath) => {
+      const previous = currentAppIdCache;
+      currentAppIdCache = appId;
+      if (previous && previous !== appId) {
+        await stopLarkEventBus(cliPath, previous);
+      }
+      if (disposed) return;
+      const values = await readValues();
+      // Saved plugin credentials take precedence over lark-cli's config, so
+      // wait for the settings screen to clear them before restarting. With no
+      // override we can switch the consumers immediately.
+      if (!values.appId.trim() || !values.appSecret) {
+        dispatcher?.resetIdentity();
+        await stopConsumers();
+        requestSync();
+      }
+    },
+  });
+
   requestSync();
   const offSettings = settings.subscribe(() => {
     requestSync();
@@ -367,6 +409,33 @@ export default function contribute(server: PluginServerContext) {
     };
   });
 
+  server.handle(larkBotAppCreationRpc, async (input) => {
+    if (input.action === "status") return appCreation.status();
+    if (input.action === "cancel") return appCreation.cancel();
+    const values = await readValues();
+    const cliPath = resolveLarkCli(values.larkCliPath);
+    if (!cliPath) {
+      return {
+        state: "error" as const,
+        url: null,
+        qrDataUrl: null,
+        appId: null,
+        error: "找不到 lark-cli，请先在全局设置填写路径",
+      };
+    }
+    try {
+      return appCreation.start(cliPath);
+    } catch (error) {
+      return {
+        state: "error" as const,
+        url: null,
+        qrDataUrl: null,
+        appId: null,
+        error: "启动扫码创建失败：" + (error instanceof Error ? error.message : String(error)),
+      };
+    }
+  });
+
   const offTurnEnded = server.on("agent.turn_ended", (event, context) => {
     capture(context.paseo);
     dispatcher?.handleTurnEnded(event);
@@ -392,6 +461,7 @@ export default function contribute(server: PluginServerContext) {
     offPermission();
     offPermissionResolved();
     offSettings();
+    appCreation.dispose();
     await syncQueue.catch(() => undefined);
     // Stop retry/watchdog/fallback timers and flush the topic store before the
     // registry becomes unreachable; otherwise a 30-minute watchdog could fire

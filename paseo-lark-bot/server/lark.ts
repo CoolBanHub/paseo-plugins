@@ -116,6 +116,17 @@ export async function readCurrentAppId(cliPath: string): Promise<string | null> 
   }
 }
 
+/**
+ * Stop the shared event-bus daemon for one app. Used when the plugin switches
+ * to another app (via settings or the one-click creation flow) so the old
+ * process does not keep reconnecting with stale credentials.
+ */
+export async function stopLarkEventBus(cliPath: string, appId: string | null): Promise<void> {
+  const args = ["event", "stop"];
+  if (appId) args.push("--app-id", appId);
+  await execFileAsync(cliPath, args, { timeout: CLI_TIMEOUT_MS }).catch(() => undefined);
+}
+
 export interface ApplyCredentialsOptions {
   cliPath: string;
   appId: string;
@@ -158,13 +169,7 @@ export async function applyAppCredentials(options: ApplyCredentialsOptions): Pro
         "feishu",
       ], secret);
     });
-  const stopEventBus =
-    options.stopEventBus ??
-    (async (cliPath: string, previousAppId: string | null) => {
-      const args = ["event", "stop"];
-      if (previousAppId) args.push("--app-id", previousAppId);
-      await execFileAsync(cliPath, args, { timeout: CLI_TIMEOUT_MS }).catch(() => undefined);
-    });
+  const stopEventBus = options.stopEventBus ?? stopLarkEventBus;
 
   const response = await (async () => {
     const controller = new AbortController();
