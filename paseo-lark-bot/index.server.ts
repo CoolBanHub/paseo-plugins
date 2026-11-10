@@ -52,6 +52,9 @@ let currentAppIdCache: string | null = null;
 /** Events that arrived before the first PaseoApi handle; replayed on capture. */
 const pendingEvents: LarkMessageEvent[] = [];
 const MAX_PENDING_EVENTS = 50;
+/** Card actions that arrived before the dispatcher; replayed on capture. */
+const pendingCardActions: LarkCardActionEvent[] = [];
+const MAX_PENDING_CARD_ACTIONS = 20;
 /** provider → provider/<default-model>, filled lazily per daemon lifetime. */
 const providerModelCache = new Map<string, string>();
 
@@ -98,6 +101,7 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
     dispatcher = createDispatcher({
       dedupStorePath: join(pluginDataRoot, "seen-message-ids.json"),
       topicStorePath: join(pluginDataRoot, "topic-agents.json"),
+      pendingStorePath: join(pluginDataRoot, "pending-questions.json"),
       mediaStoreDir: join(pluginDataRoot, "media"),
       paseo: api,
       readValues,
@@ -125,6 +129,10 @@ function ensureDispatcher(api: SessionPaseoApi, readValues: () => Promise<BotVal
   if (pendingEvents.length > 0) {
     const replay = pendingEvents.splice(0);
     for (const event of replay) void dispatcher.handleMessageEvent(event);
+  }
+  if (pendingCardActions.length > 0) {
+    const replayCards = pendingCardActions.splice(0);
+    for (const event of replayCards) void dispatcher.handleCardAction(event);
   }
   return dispatcher;
 }
@@ -256,8 +264,11 @@ export default function contribute(server: PluginServerContext) {
       void dispatcher.handleCardAction(event);
       return;
     }
-    // A question card cannot be sent before the dispatcher exists, so an
-    // action arriving this early has nothing to resolve.
+    // After a reload the card consumer can deliver a click before the first
+    // hook/RPC hands us a PaseoApi; buffer a bounded window instead of losing
+    // the answer.
+    if (pendingCardActions.length >= MAX_PENDING_CARD_ACTIONS) pendingCardActions.shift();
+    pendingCardActions.push(event);
   };
 
   requestSync();
@@ -395,6 +406,7 @@ export default function contribute(server: PluginServerContext) {
     cardConsumer = null;
     cardConsumerCli = null;
     pendingEvents.length = 0;
+    pendingCardActions.length = 0;
     appliedCredentialKey = null;
     currentAppIdCache = null;
   };

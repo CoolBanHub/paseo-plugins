@@ -39,6 +39,11 @@ import {
   questionCardToken,
   type QuestionForm,
 } from "./question-card.ts";
+import {
+  readPendingQuestions,
+  writePendingQuestions,
+  type PendingQuestion,
+} from "./question-store.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
 import type { BotValues, ReplyFormat } from "../shared/settings.ts";
 
@@ -59,6 +64,12 @@ export interface DispatcherOptions {
    * (within the idle window) instead of starting a cold session.
    */
   topicStorePath?: string;
+  /**
+   * Path of the persisted pending-question store. When set, ask_user_question
+   * cards keep working after a plugin reload or daemon restart instead of
+   * becoming dead buttons.
+   */
+  pendingStorePath?: string;
   /**
    * Directory where ingested topic media is persisted as files. The paths
    * are quoted in the prompt's attachment note so users (and file-capable
@@ -135,20 +146,7 @@ const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
 
-/** One pending dsh ask_user_question, keyed by its permission request id. */
-interface PendingQuestion {
-  requestId: string;
-  agentId: string;
-  chatId: string;
-  topicKey: string | null;
-  questions: QuestionForm[];
-  answers: Map<number, string>;
-  cardMessageId?: string;
-  createdAt: number;
-}
-
-const MAX_PENDING_QUESTIONS = 50;
-const PENDING_QUESTION_TTL_MS = 30 * 60_000;
+const MAX_PENDING_QUESTIONS = 200;
 
 /**
  * Wires inbound Feishu message events to per-chat agent sessions and sends
@@ -188,6 +186,37 @@ export function createDispatcher(options: DispatcherOptions) {
   // card.action.trigger delivery can repeat too; dedup on its event id.
   const seenCardEventIds = new Set<string>();
   const seenCardEventOrder: string[] = [];
+  // Pending questions are durable: reloading the plugin must not turn an
+  // already-sent card into a dead button.
+  const pendingStorePath = options.pendingStorePath;
+  for (const pending of readPendingQuestions(pendingStorePath)) {
+    pendingQuestions.set(pending.requestId, pending);
+    if (pending.cardMessageId) {
+      pendingByCardMessageId.set(pending.cardMessageId, pending.requestId);
+    }
+    pendingByFormToken.set(questionCardToken(pending.requestId), pending.requestId);
+  }
+  let pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  const persistPendingNow = (): void => {
+    if (pendingFlushTimer) {
+      clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = null;
+    }
+    if (!pendingStorePath) return;
+    try {
+      writePendingQuestions(pendingStorePath, pendingQuestions.values());
+    } catch (error) {
+      log("待答问题写入失败", error instanceof Error ? error.message : String(error));
+    }
+  };
+  const schedulePendingFlush = (): void => {
+    if (!pendingStorePath || pendingFlushTimer) return;
+    pendingFlushTimer = setTimeout(() => {
+      pendingFlushTimer = null;
+      persistPendingNow();
+    }, 300);
+    pendingFlushTimer.unref?.();
+  };
   // Optional persistence of the dedup window across daemon restarts.
   const dedupStorePath = options.dedupStorePath;
   let dedupFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -959,6 +988,7 @@ export function createDispatcher(options: DispatcherOptions) {
     pendingQuestions.set(requestId, pending);
     pendingByFormToken.set(token, requestId);
     prunePendingQuestions();
+    persistPendingNow();
     try {
       const cardMessageId = await sendCard({
         cliPath,
@@ -971,6 +1001,7 @@ export function createDispatcher(options: DispatcherOptions) {
         pending.cardMessageId = cardMessageId;
         pendingByCardMessageId.set(cardMessageId, requestId);
       }
+      persistPendingNow();
       log(`已发送问题卡片 ${requestId}（${questions.length} 题）`);
     } catch (error) {
       removePendingQuestion(requestId);
@@ -994,13 +1025,10 @@ export function createDispatcher(options: DispatcherOptions) {
     pendingQuestions.delete(requestId);
     if (pending.cardMessageId) pendingByCardMessageId.delete(pending.cardMessageId);
     pendingByFormToken.delete(questionCardToken(requestId));
+    persistPendingNow();
   }
 
   function prunePendingQuestions(): void {
-    const cutoff = Date.now() - PENDING_QUESTION_TTL_MS;
-    for (const [requestId, pending] of [...pendingQuestions]) {
-      if (pending.createdAt < cutoff) removePendingQuestion(requestId);
-    }
     while (pendingQuestions.size > MAX_PENDING_QUESTIONS) {
       const oldest = pendingQuestions.keys().next().value;
       if (!oldest) break;
@@ -1037,10 +1065,6 @@ export function createDispatcher(options: DispatcherOptions) {
       if (!requestId) return;
       const pending = pendingQuestions.get(requestId);
       if (!pending) return;
-      if (Date.now() - pending.createdAt > PENDING_QUESTION_TTL_MS) {
-        removePendingQuestion(requestId);
-        return;
-      }
       if (pending.chatId !== event.chat_id) return;
 
       const values = await currentValues();
@@ -1082,6 +1106,7 @@ export function createDispatcher(options: DispatcherOptions) {
       if (answer === null) return;
 
       pending.answers.set(questionIndex, answer);
+      schedulePendingFlush();
       if (pending.answers.size < pending.questions.length) {
         await send(
           cliPath,
@@ -1311,7 +1336,10 @@ export function createDispatcher(options: DispatcherOptions) {
     handlePermissionResolved,
     handleCardAction,
     resetIdentity,
-    dispose: () => sessions.dispose(),
+    dispose: () => {
+      persistPendingNow();
+      sessions.dispose();
+    },
     status: () => ({
       sessions: sessions.status(),
       unmatched: [...unmatchedRecent.values()],

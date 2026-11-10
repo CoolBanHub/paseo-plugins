@@ -811,6 +811,88 @@ describe("question cards", () => {
     });
   });
 
+  it("resumes a partially answered card after a dispatcher restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-pending-dispatch-"));
+    const storePath = join(dir, "pending-questions.json");
+    const responses: { requestId: string; response: SessionPermissionResponse }[] = [];
+    let current: SessionAgentHandle | null = null;
+    const paseo: SessionPaseoApi = {
+      agents: {
+        create: async () => {
+          current = {
+            id: "agent-1",
+            send: async () => {},
+            run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+            respondToPermission: async (options) => {
+              responses.push({ requestId: options.requestId, response: options.response });
+            },
+          };
+          return current;
+        },
+        ref: (id) => {
+          if (!current || current.id !== id) throw new Error("unexpected ref");
+          return current;
+        },
+      },
+    };
+    const values = baseValues({ questionCards: true });
+    const requestId = "permission:paseo-question-q-restart";
+    const first = createDispatcher({
+      paseo,
+      readValues: async () => values,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async () => null,
+      replyCard: async () => "om_card_restart",
+      pendingStorePath: storePath,
+    });
+    try {
+      await first.handleMessageEvent(groupEvent());
+      await flush();
+      first.handlePermission(
+        questionPermission("agent-1", requestId, [
+          { header: "第一题", question: "A?", options: [{ label: "A1" }, { label: "A2" }] },
+          { header: "第二题", question: "B?", options: [{ label: "B1" }, { label: "B2" }] },
+        ]),
+      );
+      await flush();
+      first.handleCardAction(
+        cardAction({
+          message_id: "om_card_restart",
+          action_value: JSON.stringify({ requestId, questionIndex: 0, optionIndex: 1 }),
+          event_id: "evt-restart-1",
+        }),
+      );
+      await flush();
+      assert.equal(responses.length, 0, "the first answer must not submit yet");
+      first.dispose();
+
+      const second = createDispatcher({
+        paseo,
+        readValues: async () => values,
+        resolveCli: () => "/fake/lark-cli",
+        readOpenId: async () => BOT,
+        reply: async () => null,
+        pendingStorePath: storePath,
+      });
+      second.handleCardAction(
+        cardAction({
+          message_id: "om_card_restart",
+          action_value: JSON.stringify({ requestId, questionIndex: 1, optionIndex: 0 }),
+          event_id: "evt-restart-2",
+        }),
+      );
+      await flush();
+      assert.equal(responses.length, 1);
+      assert.deepEqual(responses[0]?.response.updatedInput, {
+        answers: { 第一题: "A2", 第二题: "B1" },
+      });
+      second.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("ignores unauthorized operators and duplicate callbacks", async () => {
     const first = baseValues().chats[0]!;
     const h = makeHarness(
