@@ -91,6 +91,15 @@ export function FieldLabel({ text }: { text: string }) {
   return <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>{text}</Text>;
 }
 
+/** Small in-card heading that groups related fields inside one card. */
+export function SectionLabel({ text }: { text: string }) {
+  return (
+    <Text style={{ fontSize: 11, fontWeight: "700", color: colors().foregroundMuted }}>
+      {text}
+    </Text>
+  );
+}
+
 /** Hairline separating sections inside one card. */
 export function Divider() {
   return <View style={{ height: 1, backgroundColor: colors().border }} />;

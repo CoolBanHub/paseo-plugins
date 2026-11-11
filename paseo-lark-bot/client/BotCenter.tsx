@@ -30,12 +30,14 @@ import {
   Card,
   CardTitle,
   ChoicePill,
+  Divider,
   FieldLabel,
   HoverPressable,
   InfoRow,
   NumberField,
   Pill,
   PrimaryButton,
+  SectionLabel,
   SelectRow,
   ToggleRow,
   applyTheme,
@@ -777,13 +779,21 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           <Card>
             <CardTitle
               text="使用已有应用"
-              hint="已经在飞书开放平台创建过应用：沿用 lark-cli 当前配置，或手动填写 App ID / App Secret"
+              hint="已经在飞书开放平台创建过应用时，从下面两种方式中选一种"
             />
             <InfoRow
-              label="lark-cli 当前应用"
-              value={status ? (status.currentAppId ?? "未配置") : "读取中…"}
+              label="当前生效"
+              value={
+                status
+                  ? status.currentAppId
+                    ? `${status.currentAppId} · ${loaded.appId.trim() === status.currentAppId ? "插件保存" : "lark-cli"}`
+                    : "未配置"
+                  : "读取中…"
+              }
               muted={!status?.currentAppId}
             />
+            <Divider />
+            <SectionLabel text="方式一 · 沿用 lark-cli 当前应用" />
             <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
               <PrimaryButton
                 label="使用 lark-cli 当前应用"
@@ -791,13 +801,11 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                 disabled={!status?.currentAppId || saving}
               />
             </View>
-            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-              清空插件内保存的凭证，直接使用 lark-cli 钥匙串里的 App Secret；不会改动飞书应用。
+            <Text style={{ fontSize: 11, color: colors().foregroundMuted, lineHeight: 17 }}>
+              清空插件内保存的凭证，改用 lark-cli 钥匙串里的 App Secret；不会改动飞书应用。
             </Text>
-            <View style={{ height: 1, backgroundColor: colors().border, marginVertical: 4 }} />
-            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-              如果这个应用还没配置到 lark-cli，填写下面两项。App Secret 在飞书开发者后台「凭证与基础信息」里。
-            </Text>
+            <Divider />
+            <SectionLabel text="方式二 · 手动填写凭证" />
             <FieldLabel text="App ID（cli_ 开头）" />
             <TextInput
               value={draft.appId}
@@ -818,14 +826,10 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChangeText={(text) => patchDraft({ appSecret: text })}
               style={inputStyle()}
             />
-            {status?.currentAppId ? (
-              <InfoRow
-                label="当前生效"
-                value={
-                  status.currentAppId +
-                  (draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? "（保存后切换）" : "")
-                }
-              />
+            {status?.currentAppId && draft.appId.trim() && draft.appId.trim() !== status.currentAppId ? (
+              <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                保存后将切换到 {draft.appId.trim()}（当前 {status.currentAppId}）。
+              </Text>
             ) : null}
             <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
               <PrimaryButton
@@ -839,8 +843,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                 当前事件监听已停止；点上面的按钮会同时启用。
               </Text>
             ) : null}
-            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-              已有配置的 Secret 存在系统钥匙串里、无法回显；要从界面管理凭证，请到飞书开发者后台（凭证与基础信息）复制 App Secret 填入并保存。按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示；请确保本机账户与备份安全。
+            <Text style={{ fontSize: 11, color: colors().foregroundMuted, lineHeight: 17 }}>
+              App Secret 在飞书开发者后台「凭证与基础信息」页复制；已有配置的 Secret 存在系统钥匙串里、无法回显。
+              按当前本地使用场景，这份值会明文保存在 Paseo 设置中并明文显示，请确保本机账户与备份安全。
             </Text>
           </Card>
           <Card>

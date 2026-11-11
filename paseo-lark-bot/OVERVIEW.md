@@ -63,7 +63,7 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 
 「应用凭证」页分三块：
 
-- **使用已有应用**：lark-cli 已配置应用时，点「使用 lark-cli 当前应用」会清空插件内保存的凭证，直接沿用 lark-cli 钥匙串里的 App Secret（不会改动飞书应用）；也可以手动填写 App ID / App Secret 后点「保存并使用这个应用」，该按钮会同时启用事件监听。
+- **使用已有应用**：卡片顶部一行显示**当前生效**的应用与凭证来源（插件保存 / lark-cli），下分两个小节——「方式一 · 沿用 lark-cli 当前应用」：点按钮清空插件内保存的凭证，直接沿用 lark-cli 钥匙串里的 App Secret（不会改动飞书应用）；「方式二 · 手动填写凭证」：填 App ID / App Secret 后点「保存并使用这个应用」，该按钮会同时启用事件监听。
 - **创建新应用（扫码）**：点击后插件在后台运行 `lark-cli config init --new --brand feishu`，把 stderr 里的验证链接解析出来，用 `lark-cli auth qrcode` 生成 PNG 二维码显示在页面内；用飞书扫码并确认后，lark-cli 会创建 PersonalAgent 应用并把 App ID/Secret 写入自己的钥匙串，插件再自动清空设置里的旧凭证、保存并重启事件监听。已有应用时会先二次确认；二维码 10 分钟内有效，可随时取消。**没有现成应用时再用这一块**，因为它会替换 lark-cli 默认应用配置。
 - **解绑当前机器人**：停止事件监听并清空插件内保存的 App ID / Secret；会保留飞书应用、lark-cli 配置和群绑定，可随时点「重新启用事件监听」恢复（使用 lark-cli 当前应用）。
 
