@@ -11,17 +11,21 @@ import {
   Card,
   CardTitle,
   ChoicePill,
+  Divider,
   FieldLabel,
   PrimaryButton,
+  SectionLabel,
   ToggleRow,
   colors,
   inputStyle,
 } from "./widgets.tsx";
 
 /**
- * The right-hand pane for one chat binding: provider/model/thinking/permission
- * pickers, the @-allowlist, and per-chat options. All edits go through the
- * parent's draft; nothing saves until the pane's save action.
+ * The right-hand pane for one chat binding, one card per concern: the agent
+ * (provider/model/thinking/permission), its runtime (cwd/system prompt/
+ * delegation), how replies are presented (style/rewrite/format/mention), and
+ * the @-allowlist. All edits go through the parent's draft; nothing saves
+ * until the pane's save action.
  */
 
 export const REPLY_FORMATS: { value: ReplyFormat; label: string }[] = [
@@ -140,7 +144,7 @@ export function BindingEditor({
       </Card>
 
       <Card>
-        <CardTitle text="Provider 与模型" hint="群里 @ 机器人（或单聊直发）即由这里选的 provider 处理" />
+        <CardTitle text="智能体" hint="群里 @ 机器人（或单聊直发）即由这里选择的 provider 与模型处理" />
         <FieldLabel text="Provider" />
         {providers.length > 0 ? (
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
@@ -180,10 +184,8 @@ export function BindingEditor({
             未获取到模型列表，留空使用 provider 默认模型。
           </Text>
         )}
-      </Card>
-
-      <Card>
-        <CardTitle text="思考与权限" hint="两者都留空时用 provider / 模型默认" />
+        <Divider />
+        <SectionLabel text="思考与权限（留空 = provider / 模型默认）" />
         <FieldLabel text="思考深度（dsh 留空 = 最深）" />
         {thinkingOptions.length > 0 ? (
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
@@ -241,66 +243,7 @@ export function BindingEditor({
       </Card>
 
       <Card>
-        <CardTitle text="允许 @ 的成员" hint="留空 = 所有人可触发；非指定成员 @ 时只提示、不触发，其未 @ 的发言仍会进入话题上下文" />
-        {binding.allowedUsers.length === 0 ? (
-          <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
-            当前所有人都可以 @ 我处理。
-          </Text>
-        ) : (
-          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-            {binding.allowedUsers.map((user) => (
-              <ChoicePill
-                key={user.openId}
-                label={`${user.name || user.openId} ×`}
-                active
-                onPress={() => onRemoveAllowedUser(user.openId)}
-              />
-            ))}
-          </View>
-        )}
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <TextInput
-            value={allowedText}
-            placeholder="ou_xxx，多个用逗号分隔"
-            placeholderTextColor={colors().foregroundMuted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="done"
-            onSubmitEditing={onAddAllowedFromText}
-            onChangeText={onAllowedTextChange}
-            style={inputStyle({ flex: 1 })}
-          />
-          <PrimaryButton label="添加" onPress={onAddAllowedFromText} subtle />
-          <PrimaryButton
-            label={memberCatalog?.loading ? "读取中…" : "读取群成员"}
-            onPress={onLoadMembers}
-            subtle
-          />
-        </View>
-        {memberCatalog?.error ? (
-          <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
-            读取群成员失败：{memberCatalog.error}。仍可手动填写 open_id。
-          </Text>
-        ) : null}
-        {addableMembers.length > 0 ? (
-          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-            {addableMembers.slice(0, 50).map((member) => (
-              <ChoicePill
-                key={member.openId}
-                label={member.name || member.openId}
-                active={false}
-                onPress={() => onAddAllowedUser(member)}
-              />
-            ))}
-          </View>
-        ) : null}
-        <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
-          读取成员需要飞书权限 im:chat.members:read。
-        </Text>
-      </Card>
-
-      <Card>
-        <CardTitle text="会话设置" />
+        <CardTitle text="运行环境" hint="智能体在哪运行、以什么身份运行" />
         <FieldLabel text="工作目录（空 = 用户主目录；支持 ~/ 开头）" />
         <TextInput
           value={binding.cwd}
@@ -320,6 +263,16 @@ export function BindingEditor({
           onChangeText={(text) => onPatch({ systemPrompt: text })}
           style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
         />
+        <ToggleRow
+          label="允许 /delegate 调用其他 Paseo Agent"
+          hint="白名单成员可把任务转给本机其他 agent；目标 agent 的权限和目录由它自己决定，请只开给可信群"
+          value={binding.allowAgentDelegation}
+          onChange={(value) => onPatch({ allowAgentDelegation: value })}
+        />
+      </Card>
+
+      <Card>
+        <CardTitle text="回复呈现" hint="回答的风格、长度、格式与完成提醒" />
         <FieldLabel text="回复风格（追加到系统提示末尾；只影响智能体的文本回答）" />
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {REPLY_STYLE_OPTIONS.map((style) => (
@@ -462,12 +415,65 @@ export function BindingEditor({
           {MENTION_ON_REPLY_OPTIONS.find((option) => option.value === binding.mentionOnReply)?.hint ?? ""}
           完成提醒以独立的纯文本消息发送（飞书只在文本消息里触发 @ 通知），不会影响正文格式；读取不到发送者姓名时会跳过 @。
         </Text>
-        <ToggleRow
-          label="允许 /delegate 调用其他 Paseo Agent"
-          hint="白名单成员可把任务转给本机其他 agent；目标 agent 的权限和目录由它自己决定，请只开给可信群"
-          value={binding.allowAgentDelegation}
-          onChange={(value) => onPatch({ allowAgentDelegation: value })}
-        />
+      </Card>
+
+      <Card>
+        <CardTitle text="允许 @ 的成员" hint="留空 = 所有人可触发；非指定成员 @ 时只提示、不触发，其未 @ 的发言仍会进入话题上下文" />
+        {binding.allowedUsers.length === 0 ? (
+          <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
+            当前所有人都可以 @ 我处理。
+          </Text>
+        ) : (
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+            {binding.allowedUsers.map((user) => (
+              <ChoicePill
+                key={user.openId}
+                label={`${user.name || user.openId} ×`}
+                active
+                onPress={() => onRemoveAllowedUser(user.openId)}
+              />
+            ))}
+          </View>
+        )}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <TextInput
+            value={allowedText}
+            placeholder="ou_xxx，多个用逗号分隔"
+            placeholderTextColor={colors().foregroundMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="done"
+            onSubmitEditing={onAddAllowedFromText}
+            onChangeText={onAllowedTextChange}
+            style={inputStyle({ flex: 1 })}
+          />
+          <PrimaryButton label="添加" onPress={onAddAllowedFromText} subtle />
+          <PrimaryButton
+            label={memberCatalog?.loading ? "读取中…" : "读取群成员"}
+            onPress={onLoadMembers}
+            subtle
+          />
+        </View>
+        {memberCatalog?.error ? (
+          <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
+            读取群成员失败：{memberCatalog.error}。仍可手动填写 open_id。
+          </Text>
+        ) : null}
+        {addableMembers.length > 0 ? (
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+            {addableMembers.slice(0, 50).map((member) => (
+              <ChoicePill
+                key={member.openId}
+                label={member.name || member.openId}
+                active={false}
+                onPress={() => onAddAllowedUser(member)}
+              />
+            ))}
+          </View>
+        ) : null}
+        <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
+          读取成员需要飞书权限 im:chat.members:read。
+        </Text>
       </Card>
     </ScrollView>
   );

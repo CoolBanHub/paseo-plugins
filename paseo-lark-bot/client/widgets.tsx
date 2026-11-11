@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Pressable, Switch, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { Pressable, Switch, Text, TextInput, View, type StyleProp, type ViewStyle } from "react-native";
 import type { PluginTheme } from "@getpaseo/plugin";
 
 /**
@@ -89,6 +89,56 @@ export function InfoRow({ label, value, muted = true }: { label: string; value: 
 
 export function FieldLabel({ text }: { text: string }) {
   return <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>{text}</Text>;
+}
+
+/** Small in-card heading that groups related fields inside one card. */
+export function SectionLabel({ text }: { text: string }) {
+  return (
+    <Text style={{ fontSize: 11, fontWeight: "700", color: colors().foregroundMuted }}>
+      {text}
+    </Text>
+  );
+}
+
+/** Hairline separating sections inside one card. */
+export function Divider() {
+  return <View style={{ height: 1, backgroundColor: colors().border }} />;
+}
+
+/** Label on the left, numeric input on the right — compact one-line field. */
+export function NumberField({
+  label,
+  hint,
+  value,
+  onChange,
+  suffix,
+}: {
+  label: string;
+  hint?: string;
+  value: number;
+  onChange(value: number): void;
+  suffix?: string;
+}) {
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+      <View style={{ flex: 1 }}>
+        <Text style={{ fontSize: 13, color: colors().foreground }}>{label}</Text>
+        {hint ? (
+          <Text style={{ fontSize: 12, color: colors().foregroundMuted, marginTop: 1 }}>{hint}</Text>
+        ) : null}
+      </View>
+      <TextInput
+        value={String(value)}
+        keyboardType="number-pad"
+        onChangeText={(text) => {
+          const parsed = Number.parseInt(text, 10);
+          if (Number.isFinite(parsed)) onChange(parsed);
+        }}
+        style={inputStyle({ width: 96, textAlign: "right" })}
+      />
+      {suffix ? <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>{suffix}</Text> : null}
+    </View>
+  );
 }
 
 export function inputStyle(extra?: object): object {

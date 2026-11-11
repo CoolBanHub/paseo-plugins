@@ -29,6 +29,7 @@ import {
   FieldLabel,
   HoverPressable,
   InfoRow,
+  NumberField,
   Pill,
   PrimaryButton,
   ToggleRow,
@@ -564,7 +565,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           selection.kind === "credentials",
           () => setSelection({ kind: "credentials" }),
         )}
-        {navRow("global", "全局设置", "路径、话题、回复选项", selection.kind === "global", () => setSelection({ kind: "global" }))}
+        {navRow("global", "全局设置", "回复、通知、会话与限制", selection.kind === "global", () => setSelection({ kind: "global" }))}
       </ScrollView>
     </View>
   );
@@ -640,7 +641,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       ) : selection.kind === "status" ? (
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
-            <CardTitle text="运行状态" />
+            <CardTitle text="连接与身份" hint="插件与飞书、lark-cli 的连接状态" />
             <InfoRow
               label="事件监听"
               value={consumer ? consumer.text + (status?.enabled && status.lastError ? `（${status.lastError}）` : "") : "未知"}
@@ -653,44 +654,35 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                   : "未知"
               }
             />
+            <InfoRow label="待答问题" value={String(status?.pendingQuestions ?? 0)} muted={(status?.pendingQuestions ?? 0) === 0} />
             <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在全局设置填写路径）"} muted={!status?.cliPath} />
             <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
             <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
-            {(status?.sessions ?? []).length === 0 ? (
-              <Text style={{ color: colors().foregroundMuted, fontSize: 13, marginTop: 6 }}>暂无进行中的话题会话。</Text>
-            ) : (
-              (status?.sessions ?? []).map((session) => (
-                <InfoRow
-                  key={session.topicKey}
-                  label={`话题 …${session.topicKey.slice(-10)}`}
-                  value={`${session.busy ? "处理中" : "空闲"}${session.queued > 0 ? ` · 排队 ${session.queued} 条` : ""}`}
-                />
-              ))
-            )}
-            <InfoRow label="待答问题" value={String(status?.pendingQuestions ?? 0)} />
           </Card>
           <Card>
             <CardTitle
-              text="定时任务"
-              hint="在会话里用 /cron 管理；这里只读展示。每次运行使用新会话，结果发到绑定会话"
+              text={`话题会话（${(status?.sessions ?? []).length}）`}
+              hint="群聊里一个话题一个智能体会话；显示当前映射的会话与排队情况"
+            />
+            {(status?.sessions ?? []).length === 0 ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>暂无进行中的话题会话。</Text>
+            ) : (
+              (status?.sessions ?? []).map((session) => (
+                <SessionRow key={session.topicKey} session={session} />
+              ))
+            )}
+          </Card>
+          <Card>
+            <CardTitle
+              text={`定时任务（${(status?.cron ?? []).length}）`}
+              hint="在会话里用 /cron 管理，这里只读展示。每次运行使用新会话，结果发到绑定会话"
             />
             {(status?.cron ?? []).length === 0 ? (
               <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
                 暂无定时任务。可在会话里发送 /cron add 0 6 * * * 总结 GitHub trending。
               </Text>
             ) : (
-              (status?.cron ?? []).map((job) => (
-                <InfoRow
-                  key={job.id}
-                  label={job.id}
-                  value={
-                    `\`${job.expression}\` · ${job.enabled ? "启用" : "暂停"} · 下次 ` +
-                    (job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—") +
-                    (job.lastError ? ` · 上次失败：${job.lastError}` : "") +
-                    `\n${job.prompt.length > 80 ? job.prompt.slice(0, 79) + "…" : job.prompt}`
-                  }
-                />
-              ))
+              (status?.cron ?? []).map((job) => <CronJobRow key={job.id} job={job} />)
             )}
           </Card>
         </ScrollView>
@@ -815,7 +807,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       ) : selection.kind === "global" ? (
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
-            <CardTitle text="全局设置" hint="对全部会话生效" />
+            <CardTitle text="监听与运行" hint="插件如何接收飞书消息、调用本机 lark-cli" />
             <ToggleRow
               label="启用事件监听"
               hint="关闭后停止接收飞书消息，保留应用、凭证与群绑定；重新开启即恢复"
@@ -832,6 +824,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChangeText={(text) => patchDraft({ larkCliPath: text })}
               style={inputStyle()}
             />
+          </Card>
+          <Card>
+            <CardTitle text="回复与话题" hint="回答发到哪里、超长时如何处理" />
             <ToggleRow
               label="回复进话题"
               hint="回复挂在被 @ 消息的话题下，而不是群消息流"
@@ -839,11 +834,34 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChange={(value) => patchDraft({ replyInThread: value })}
             />
             <ToggleRow
-              label="提示未配置会话"
-              hint="未绑定的会话 @ 机器人时回复一条配置提示"
-              value={draft.notifyUnmatched}
-              onChange={(value) => patchDraft({ notifyUnmatched: value })}
+              label="长回复分段发送"
+              hint="超过截断长度时按代码块安全地拆成多条话题回复，而不是直接截断"
+              value={draft.replySplit}
+              onChange={(value) => patchDraft({ replySplit: value })}
             />
+            <NumberField
+              label="单条回复长度"
+              hint="超过该字符数后分段（关闭分段时截断）"
+              value={draft.maxReplyChars}
+              onChange={(value) => patchDraft({ maxReplyChars: value })}
+              suffix="字符"
+            />
+            <NumberField
+              label="每条回复最多分几段"
+              hint="超出部分截断并提示去 Paseo 查看"
+              value={draft.maxReplyChunks}
+              onChange={(value) => patchDraft({ maxReplyChunks: value })}
+              suffix="段"
+            />
+            <ToggleRow
+              label="回复页脚"
+              hint="在回答末尾追加模型、耗时和 token 用量"
+              value={draft.replyFooter}
+              onChange={(value) => patchDraft({ replyFooter: value })}
+            />
+          </Card>
+          <Card>
+            <CardTitle text="回执与通知" hint="处理过程中的可见性与提醒，只影响过程提示，不影响答案内容" />
             <ToggleRow
               label="表情回执"
               hint="收到 @ 后在被 @ 的消息上加「处理中」表情，完成后换成完成表情；不额外发消息"
@@ -863,24 +881,6 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChange={(value) => patchDraft({ progressCard: value })}
             />
             <ToggleRow
-              label="长回复分段发送"
-              hint="超过截断长度时按代码块安全地拆成多条话题回复，而不是直接截断"
-              value={draft.replySplit}
-              onChange={(value) => patchDraft({ replySplit: value })}
-            />
-            <ToggleRow
-              label="回复页脚"
-              hint="在回答末尾追加模型、耗时和 token 用量"
-              value={draft.replyFooter}
-              onChange={(value) => patchDraft({ replyFooter: value })}
-            />
-            <ToggleRow
-              label="AI 生成会话标题"
-              hint="新话题首次 @ 时用绑定的模型生成一句可读标题；失败或超时回退为清洗后的话题文本"
-              value={draft.aiTitle}
-              onChange={(value) => patchDraft({ aiTitle: value })}
-            />
-            <ToggleRow
               label="权限请求通知到群"
               hint="默认关闭；开启后普通权限请求会发到话题，仍需在 Paseo 客户端批准"
               value={draft.notifyPermission}
@@ -892,45 +892,43 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               value={draft.questionCards}
               onChange={(value) => patchDraft({ questionCards: value })}
             />
-            <FieldLabel text="话题空闲重建（分钟，0 = 一直复用）" />
-            <TextInput
-              value={String(draft.sessionIdleMinutes)}
-              keyboardType="number-pad"
-              onChangeText={(text) => {
-                const minutes = Number.parseInt(text, 10);
-                if (Number.isFinite(minutes)) patchDraft({ sessionIdleMinutes: minutes });
-              }}
-              style={inputStyle()}
+            <ToggleRow
+              label="提示未配置会话"
+              hint="未绑定的会话 @ 机器人时回复一条配置提示"
+              value={draft.notifyUnmatched}
+              onChange={(value) => patchDraft({ notifyUnmatched: value })}
             />
-            <FieldLabel text="单条回复长度（字符，超过后分段）" />
-            <TextInput
-              value={String(draft.maxReplyChars)}
-              keyboardType="number-pad"
-              onChangeText={(text) => {
-                const limit = Number.parseInt(text, 10);
-                if (Number.isFinite(limit)) patchDraft({ maxReplyChars: limit });
-              }}
-              style={inputStyle()}
+          </Card>
+          <Card>
+            <CardTitle text="会话与工作区" hint="智能体会话如何创建、命名与归属" />
+            <ToggleRow
+              label="AI 生成会话标题"
+              hint="新话题首次 @ 时用绑定的模型生成一句可读标题；失败或超时回退为清洗后的话题文本"
+              value={draft.aiTitle}
+              onChange={(value) => patchDraft({ aiTitle: value })}
             />
-            <FieldLabel text="每条回复最多分几段" />
-            <TextInput
-              value={String(draft.maxReplyChunks)}
-              keyboardType="number-pad"
-              onChangeText={(text) => {
-                const count = Number.parseInt(text, 10);
-                if (Number.isFinite(count)) patchDraft({ maxReplyChunks: count });
-              }}
-              style={inputStyle()}
+            <NumberField
+              label="话题空闲重建"
+              hint="0 = 一直复用；空闲超过该时长的话题，下次 @ 时新建智能体会话"
+              value={draft.sessionIdleMinutes}
+              onChange={(value) => patchDraft({ sessionIdleMinutes: value })}
+              suffix="分钟"
             />
-            <FieldLabel text="每人每小时请求上限（0 = 不限）" />
-            <TextInput
-              value={String(draft.rateLimitPerHour)}
-              keyboardType="number-pad"
-              onChangeText={(text) => {
-                const limit = Number.parseInt(text, 10);
-                if (Number.isFinite(limit)) patchDraft({ rateLimitPerHour: limit });
-              }}
-              style={inputStyle()}
+            <ToggleRow
+              label="按会话划分 workspace"
+              hint="每个会话一个以群名命名的 workspace，适合不同绑定指向不同项目目录；默认全部放进「飞书任务」"
+              value={draft.workspacePerBinding}
+              onChange={(value) => patchDraft({ workspacePerBinding: value })}
+            />
+          </Card>
+          <Card>
+            <CardTitle text="安全与限制" hint="谁能用、能用多少、能发什么文件" />
+            <NumberField
+              label="每人每小时请求上限"
+              hint="0 = 不限；按发送者计，命令不占额度"
+              value={draft.rateLimitPerHour}
+              onChange={(value) => patchDraft({ rateLimitPerHour: value })}
+              suffix="次/时"
             />
             <ToggleRow
               label="回传生成的附件"
@@ -938,21 +936,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               value={draft.attachmentSend}
               onChange={(value) => patchDraft({ attachmentSend: value })}
             />
-            <FieldLabel text="附件大小上限（MB）" />
-            <TextInput
-              value={String(draft.attachmentMaxMb)}
-              keyboardType="number-pad"
-              onChangeText={(text) => {
-                const limit = Number.parseInt(text, 10);
-                if (Number.isFinite(limit)) patchDraft({ attachmentMaxMb: limit });
-              }}
-              style={inputStyle()}
-            />
-            <ToggleRow
-              label="按会话划分 workspace"
-              hint="每个会话一个以群名命名的 workspace，适合不同绑定指向不同项目目录；默认全部放进「飞书任务」"
-              value={draft.workspacePerBinding}
-              onChange={(value) => patchDraft({ workspacePerBinding: value })}
+            <NumberField
+              label="附件大小上限"
+              hint="出站附件的单文件上限；入站文件另有 20MB 限制"
+              value={draft.attachmentMaxMb}
+              onChange={(value) => patchDraft({ attachmentMaxMb: value })}
+              suffix="MB"
             />
           </Card>
         </ScrollView>
@@ -982,6 +971,49 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   return (
     <View style={{ flex: 1, backgroundColor: colors().surface0 }}>
       {selection.kind === "none" ? listPane : detailPane}
+    </View>
+  );
+}
+
+/** One live topic session on the status page: topic key + state pills. */
+function SessionRow({ session }: { session: StatusState["sessions"][number] }) {
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+      <Text
+        numberOfLines={1}
+        style={{ color: colors().foreground, fontSize: 13, flex: 1, flexShrink: 1 }}
+      >
+        话题 …{session.topicKey.slice(-12)}
+      </Text>
+      {session.busy ? <Pill text="处理中" tone="warning" /> : <Pill text="空闲" tone="muted" />}
+      {session.queued > 0 ? <Pill text={`排队 ${session.queued}`} tone="warning" /> : null}
+    </View>
+  );
+}
+
+/** One cron job on the status page: expression + state on the first line,
+ * prompt and schedule below, last error in danger color if present. */
+function CronJobRow({ job }: { job: StatusState["cron"][number] }) {
+  return (
+    <View style={{ gap: 3 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text style={{ color: colors().foreground, fontSize: 13, fontWeight: "600" }}>{job.expression}</Text>
+        <Pill text={job.enabled ? "启用" : "暂停"} tone={job.enabled ? "success" : "muted"} />
+        <View style={{ flex: 1 }} />
+        <Text style={{ color: colors().foregroundMuted, fontSize: 11 }}>{job.id}</Text>
+      </View>
+      <Text numberOfLines={1} style={{ color: colors().foregroundMuted, fontSize: 12 }}>
+        {job.prompt}
+      </Text>
+      <Text style={{ color: colors().foregroundMuted, fontSize: 11 }}>
+        下次 {job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"}
+        {job.lastRunAt ? ` · 上次 ${new Date(job.lastRunAt).toLocaleString()}` : ""}
+      </Text>
+      {job.lastError ? (
+        <Text numberOfLines={1} style={{ color: colors().statusDanger, fontSize: 11 }}>
+          上次失败：{job.lastError}
+        </Text>
+      ) : null}
     </View>
   );
 }
