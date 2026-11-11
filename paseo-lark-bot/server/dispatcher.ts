@@ -58,6 +58,7 @@ import {
 import { mentionsBot, routeMessage, extractPrompt, isSenderAllowed } from "./router.ts";
 import {
   buildQuestionCard,
+  buildSubmittedQuestionCard,
   parseFormActionName,
   parseFormAnswer,
   parseQuestionAction,
@@ -1528,6 +1529,7 @@ export function createDispatcher(options: DispatcherOptions) {
       topicKey: sessions.topicKeyForAgent(event.agent.id),
       questions,
       answers: new Map(),
+      title,
       createdAt: Date.now(),
     };
     pendingQuestions.set(requestId, pending);
@@ -1698,7 +1700,26 @@ export function createDispatcher(options: DispatcherOptions) {
         );
         return;
       }
+      // Remove the pending entry before the card PATCH so a second click during
+      // the network call cannot submit the same question twice.
       removePendingQuestion(requestId);
+      if (pending.cardMessageId) {
+        try {
+          await patchCard({
+            cliPath,
+            messageId: pending.cardMessageId,
+            card: buildSubmittedQuestionCard({
+              title: pending.title ?? pending.questions[0]?.header ?? "需要你选择",
+              questions: pending.questions,
+              answers: pending.answers,
+            }),
+          });
+        } catch (error) {
+          // The answer is already delivered; a card PATCH failure only leaves
+          // the old interactive card behind.
+          log("更新问题卡片失败", error instanceof Error ? error.message : String(error));
+        }
+      }
       const lines = pending.questions.map((entry, index) => {
         const value = pending.answers.get(index) ?? "";
         return `${index + 1}. ${entry.header}：${value || "跳过"}`;

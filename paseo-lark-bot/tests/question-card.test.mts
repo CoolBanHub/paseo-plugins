@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   buildQuestionCard,
+  buildSubmittedQuestionCard,
   parseFormActionName,
   parseFormAnswer,
   parseQuestionAction,
@@ -197,5 +198,29 @@ describe("questionCardToken", () => {
     const token = questionCardToken("permission:paseo-question-q-1");
     assert.match(token, /^[a-f0-9]{16}$/);
     assert.equal(token, questionCardToken("permission:paseo-question-q-1"));
+  });
+});
+
+
+describe("buildSubmittedQuestionCard", () => {
+  it("renders the submitted answers and drops all controls", () => {
+    const forms = parseQuestionForms(SAMPLE_INPUT);
+    const card = buildSubmittedQuestionCard({
+      title: "选择方案",
+      questions: forms,
+      answers: new Map([
+        [0, "方案B"],
+        [1, "X, 补充"],
+      ]),
+    });
+    const text = JSON.stringify(card);
+    assert.equal((card as { schema?: string }).schema, "2.0");
+    assert.equal((card as { header?: { template?: string } }).header?.template, "green");
+    assert.match(text, /已提交 · 选择方案/);
+    assert.match(text, /方案B/);
+    assert.match(text, /X, 补充/);
+    assert.match(text, /（跳过）/);
+    assert.doesNotMatch(text, /"tag":"button"/);
+    assert.doesNotMatch(text, /"tag":"form"/);
   });
 });

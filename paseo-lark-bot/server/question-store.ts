@@ -18,6 +18,8 @@ export interface PendingQuestion {
   questions: QuestionForm[];
   answers: Map<number, string>;
   cardMessageId?: string;
+  /** Card header title; falls back to the first question header. */
+  title?: string;
   createdAt: number;
 }
 
@@ -43,6 +45,7 @@ const storedQuestionSchema = z.object({
   ),
   answers: z.record(z.string(), z.string()).default({}),
   cardMessageId: z.string().optional(),
+  title: z.string().optional(),
   createdAt: z.number(),
 });
 

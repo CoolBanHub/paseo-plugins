@@ -315,7 +315,7 @@ export function buildQuestionCard(options: {
   });
   elements.push({
     tag: "markdown",
-    content: "点击选项即提交；多选问题勾选后点「提交选择」。也可以在 Paseo 客户端处理。",
+    content: "点击选项即提交，提交后不能修改；多选问题勾选后点「提交选择」。也可以在 Paseo 客户端处理。",
   });
 
   return {
@@ -332,3 +332,57 @@ export function buildQuestionCard(options: {
     },
   };
 }
+
+/** Cap each answer in the static summary; keeps many-question cards small. */
+const MAX_SUBMITTED_ANSWER = 800;
+
+/**
+ * Static replacement card shown after the answer has been submitted. Feishu
+ * leaves the original buttons in place forever unless the message is PATCHed,
+ * so collapsing it here also makes it obvious that the choice is final.
+ */
+export function buildSubmittedQuestionCard(options: {
+  title: string;
+  questions: QuestionForm[];
+  answers: ReadonlyMap<number, string>;
+}): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = [];
+  options.questions.forEach((question, index) => {
+    if (index > 0) elements.push({ tag: "hr" });
+    const heading = question.header || `问题 ${index + 1}`;
+    const prompt = question.question || heading;
+    elements.push({
+      tag: "markdown",
+      content: clipCardMarkdown(`**${index + 1}. ${heading}**\n${prompt}`),
+    });
+    const raw = (options.answers.get(index) ?? "").trim();
+    const answer =
+      raw.length > MAX_SUBMITTED_ANSWER ? raw.slice(0, MAX_SUBMITTED_ANSWER - 1) + "…" : raw;
+    elements.push({
+      tag: "markdown",
+      content: clipCardMarkdown(`✅ **已提交：** ${answer || "（跳过）"}`),
+    });
+  });
+  elements.push({
+    tag: "markdown",
+    content: "已提交，不能重复选择。如需更改，请在话题里发消息说明，或在 Paseo 客户端处理。",
+  });
+
+  return {
+    schema: "2.0",
+    config: { update_multi: true, width_mode: "default" },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: clipButtonText(`已提交 · ${options.title || "需要你选择"}`),
+      },
+      template: "green",
+    },
+    body: {
+      direction: "vertical",
+      padding: "12px 12px 20px 12px",
+      elements,
+    },
+  };
+}
+

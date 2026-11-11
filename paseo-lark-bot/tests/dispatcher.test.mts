@@ -994,6 +994,39 @@ describe("question cards", () => {
       updatedInput: { answers: { 选择方案: "方案B" } },
     });
     assert.ok(h.replies.some((reply) => reply.text.includes("已提交选择")));
+    const submitted = h.cardUpdates.find((entry) => entry.messageId === card.cardMessageId);
+    assert.ok(submitted, "the answered card must be replaced");
+    const submittedText = JSON.stringify(submitted.card);
+    assert.match(submittedText, /已提交 · 选择方案/);
+    assert.match(submittedText, /方案B/);
+    assert.doesNotMatch(submittedText, /"tag":"button"/);
+  });
+
+  it("still submits when replacing the answered card fails", async () => {
+    const h = makeHarness(baseValues({ questionCards: true }), {
+      updateCard: async () => {
+        throw new Error("patch failed");
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handlePermission(questionPermission(h.agentId));
+    await flush();
+    const card = h.cards[0]!;
+    h.dispatch.handleCardAction(
+      cardAction({
+        message_id: card.cardMessageId,
+        action_value: JSON.stringify({
+          requestId: "permission:paseo-question-q-1",
+          questionIndex: 0,
+          optionIndex: 1,
+        }),
+        event_id: "evt-patch-fail",
+      }),
+    );
+    await flush();
+    assert.equal(h.permissionResponses.length, 1);
+    assert.ok(h.replies.some((reply) => reply.text.includes("已提交选择")));
   });
 
   it("submits a multi-select form", async () => {
@@ -1053,6 +1086,7 @@ describe("question cards", () => {
     await flush();
     assert.equal(h.permissionResponses.length, 0);
     assert.ok(h.replies.some((reply) => reply.text.includes("已记录第 1 题")));
+    assert.equal(h.cardUpdates.length, 0, "partial answers keep the card interactive");
 
     h.dispatch.handleCardAction(
       cardAction({
@@ -1065,6 +1099,12 @@ describe("question cards", () => {
     assert.deepEqual(h.permissionResponses[0]?.response.updatedInput, {
       answers: { 第一题: "A2", 第二题: "B1" },
     });
+    assert.equal(h.cardUpdates.length, 1);
+    const submitted = JSON.stringify(h.cardUpdates[0]?.card);
+    assert.match(submitted, /第一题/);
+    assert.match(submitted, /A2/);
+    assert.match(submitted, /第二题/);
+    assert.match(submitted, /B1/);
   });
 
   it("resumes a partially answered card after a dispatcher restart", async () => {
