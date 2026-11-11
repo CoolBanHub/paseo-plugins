@@ -381,6 +381,100 @@ export async function listChatMembers(cliPath: string, chatId: string): Promise<
   return members;
 }
 
+export interface LarkUserProfile {
+  openId: string;
+  /** Default display name, when the app may read basic user fields. */
+  name: string | null;
+  /** Primary department id (`od-…`), when the app may read organization data. */
+  departmentId: string | null;
+}
+
+/**
+ * Optional contact-card lookup for a p2p peer. Chat membership already gives
+ * us the display name; contact scopes add the department/organization fields
+ * that disambiguate duplicate names. Missing field permissions just yield
+ * nulls, so callers can render the name-only fallback.
+ */
+export async function readUserProfile(cliPath: string, openId: string): Promise<LarkUserProfile> {
+  const payload = await runCli(
+    cliPath,
+    [
+      "api",
+      "GET",
+      "/open-apis/contact/v3/users/" + encodeURIComponent(openId),
+      "--params",
+      JSON.stringify({ user_id_type: "open_id", department_id_type: "open_department_id" }),
+      "--as",
+      "bot",
+    ],
+    "读取用户资料",
+  );
+  const user = (payload.data as { user?: Record<string, unknown> } | undefined)?.user;
+  if (!user) return { openId, name: null, departmentId: null };
+  const name = typeof user.name === "string" && user.name.trim() ? user.name.trim() : null;
+  const ids = Array.isArray(user.department_ids)
+    ? user.department_ids.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  return { openId, name, departmentId: ids[0] ?? null };
+}
+
+async function readDepartment(
+  cliPath: string,
+  departmentId: string,
+): Promise<{ name: string | null; parentId: string | null } | null> {
+  const payload = await runCli(
+    cliPath,
+    [
+      "api",
+      "GET",
+      "/open-apis/contact/v3/departments/" + encodeURIComponent(departmentId),
+      "--params",
+      JSON.stringify({ department_id_type: "open_department_id", user_id_type: "open_id" }),
+      "--as",
+      "bot",
+    ],
+    "读取部门信息",
+  );
+  const department = (payload.data as { department?: Record<string, unknown> } | undefined)?.department;
+  if (!department) return null;
+  const name = typeof department.name === "string" && department.name.trim() ? department.name.trim() : null;
+  const parent =
+    typeof department.parent_department_id === "string" && department.parent_department_id !== "0"
+      ? department.parent_department_id
+      : null;
+  return { name, parentId: parent };
+}
+
+/** Full `部门 / 子部门 / 小组` path, walking up to the tenant root. */
+export async function readDepartmentPath(cliPath: string, departmentId: string): Promise<string | null> {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  let current: string | null = departmentId;
+  while (current && !seen.has(current) && names.length < 5) {
+    seen.add(current);
+    const department = await readDepartment(cliPath, current);
+    if (!department) break;
+    if (department.name) names.unshift(department.name);
+    current = department.parentId;
+  }
+  return names.length > 0 ? names.join(" / ") : null;
+}
+
+/** Tenant display name, shown as the organization when the app may read it. */
+export async function readTenantName(cliPath: string): Promise<string | null> {
+  const payload = await runCli(
+    cliPath,
+    ["api", "GET", "/open-apis/tenant/v2/tenant/query", "--as", "bot"],
+    "读取组织信息",
+  );
+  const tenant = (payload.data as { tenant?: Record<string, unknown> } | undefined)?.tenant;
+  if (!tenant) return null;
+  for (const candidate of [tenant.name, tenant.display_name]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
 export interface LarkChatBot {
   openId: string;
   name: string;

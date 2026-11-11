@@ -541,6 +541,23 @@ console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv" } })
     );
   });
 
+  it("records the p2p peer open_id for the settings add list", async () => {
+    const h = makeHarness();
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        chat_id: "oc_unknown_p2p",
+        chat_type: "p2p",
+        content: "你好",
+        sender_id: "ou_peer",
+        mentions: undefined,
+      }),
+    );
+    await flush();
+    const entry = h.dispatch.status().unmatched.find((item) => item.chatId === "oc_unknown_p2p");
+    assert.equal(entry?.chatType, "p2p");
+    assert.equal(entry?.peerOpenId, "ou_peer");
+  });
+
   it("hints unmatched chats when notifyUnmatched is on", async () => {
     const h = makeHarness(baseValues({ notifyUnmatched: true }));
     await h.dispatch.handleMessageEvent(groupEvent({ chat_id: "oc_unknown" }));

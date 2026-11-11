@@ -580,8 +580,8 @@ export function AddChatPicker({
   addable,
   onPick,
 }: {
-  addable: { chatId: string; label: string; note?: string }[];
-  onPick(chatId: string): void;
+  addable: { chatId: string; label: string; note?: string; chatName?: string }[];
+  onPick(chatId: string, chatName?: string): void;
 }) {
   return (
     <ScrollView contentContainerStyle={{ padding: 16, gap: 8, maxWidth: 880, width: "100%", alignSelf: "center" }}>
@@ -594,7 +594,7 @@ export function AddChatPicker({
         addable.map((chat) => (
           <Pressable
             key={chat.chatId}
-            onPress={() => onPick(chat.chatId)}
+            onPress={() => onPick(chat.chatId, chat.chatName)}
             style={({ pressed }) => ({
               borderWidth: 1,
               borderColor: colors().border,

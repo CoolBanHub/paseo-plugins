@@ -27,6 +27,7 @@ import {
 } from "./server/lark.ts";
 import { createAppCreationController } from "./server/app-creation.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
+import { enrichUnmatchedChats } from "./server/peer.ts";
 import {
   createIssueTracker,
   installIssueHelper,
@@ -527,6 +528,7 @@ export default function contribute(server: PluginServerContext) {
     if (cliPath && currentAppIdCache === null) {
       currentAppIdCache = await readCurrentAppId(cliPath).catch(() => null);
     }
+    const unmatched = await enrichUnmatchedChats(cliPath, status?.unmatched ?? []);
     return {
       consumerState: consumer?.status().state ?? "stopped",
       lastError: consumer?.status().lastError ?? null,
@@ -537,7 +539,7 @@ export default function contribute(server: PluginServerContext) {
       enabled: values.enabled,
       botOpenId: status?.botOpenId ?? null,
       sessions: status?.sessions ?? [],
-      unmatched: status?.unmatched ?? [],
+      unmatched,
       cron: status?.cron ?? [],
       pendingQuestions: status?.pendingQuestions ?? 0,
     };

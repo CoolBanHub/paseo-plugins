@@ -383,7 +383,10 @@ export function createDispatcher(options: DispatcherOptions) {
   // Serialize preprocessing per topic so a slow root lookup cannot let a later
   // message overtake an earlier one.
   const topicChains = new Map<string, Promise<void>>();
-  const unmatchedRecent = new Map<string, { chatId: string; chatType: string; lastSeenAt: number }>();
+  const unmatchedRecent = new Map<
+    string,
+    { chatId: string; chatType: string; lastSeenAt: number; peerOpenId?: string }
+  >();
   // Thread roots rarely change; cache their text to avoid repeated mgets.
   const threadRootCache = new Map<string, MessageDetail | null>();
   /**
@@ -1599,10 +1602,16 @@ export function createDispatcher(options: DispatcherOptions) {
   }
 
   function rememberUnmatched(event: LarkMessageEvent): void {
+    const previous = unmatchedRecent.get(event.chat_id);
+    const peerOpenId =
+      event.chat_type === "p2p" && event.sender_type === "user"
+        ? event.sender_id
+        : previous?.peerOpenId;
     unmatchedRecent.set(event.chat_id, {
       chatId: event.chat_id,
       chatType: event.chat_type,
       lastSeenAt: Date.now(),
+      ...(peerOpenId ? { peerOpenId } : {}),
     });
     if (unmatchedRecent.size > UNMATCHED_KEEP) {
       const oldest = unmatchedRecent.keys().next().value;

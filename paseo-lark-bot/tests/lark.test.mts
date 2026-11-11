@@ -3,7 +3,18 @@ import { describe, it } from "node:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listChatBots, listChatDirectory, listChatMembers, parseLarkJson, replyCard, replyMessage, resolveLarkCli } from "../server/lark.ts";
+import {
+  listChatBots,
+  listChatDirectory,
+  listChatMembers,
+  parseLarkJson,
+  readDepartmentPath,
+  readTenantName,
+  readUserProfile,
+  replyCard,
+  replyMessage,
+  resolveLarkCli,
+} from "../server/lark.ts";
 
 describe("parseLarkJson", () => {
   it("parses JSON after leading warnings", () => {
@@ -172,6 +183,49 @@ console.log(JSON.stringify({
     try {
       const members = await listChatMembers(cli, "oc_chat");
       assert.deepEqual(members, [{ openId: "ou_a", name: "甲" }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readUserProfile / readDepartmentPath / readTenantName", () => {
+  it("parses contact fields and walks the department path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-profile-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+const path = args.find((arg) => arg.startsWith("/open-apis/"));
+if (path && path.includes("/contact/v3/users/ou_peer")) {
+  console.log(JSON.stringify({
+    ok: true,
+    data: { user: { open_id: "ou_peer", name: "赖大昌", department_ids: ["od-dept"] } },
+  }));
+} else if (path === "/open-apis/contact/v3/departments/od-dept") {
+  console.log(JSON.stringify({
+    ok: true,
+    data: { department: { name: "研发中心", parent_department_id: "od-root" } },
+  }));
+} else if (path === "/open-apis/contact/v3/departments/od-root") {
+  console.log(JSON.stringify({
+    ok: true,
+    data: { department: { name: "示例公司", parent_department_id: "0" } },
+  }));
+} else if (path === "/open-apis/tenant/v2/tenant/query") {
+  console.log(JSON.stringify({ ok: true, data: { tenant: { name: "示例公司" } } }));
+} else {
+  console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv: " + args.join(" ") } }));
+}
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const profile = await readUserProfile(cli, "ou_peer");
+      assert.deepEqual(profile, { openId: "ou_peer", name: "赖大昌", departmentId: "od-dept" });
+      assert.equal(await readDepartmentPath(cli, "od-dept"), "示例公司 / 研发中心");
+      assert.equal(await readTenantName(cli), "示例公司");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

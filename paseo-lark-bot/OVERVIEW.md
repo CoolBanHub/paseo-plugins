@@ -49,12 +49,13 @@ dsh ask_user_question → 开启 questionCards 后以交互卡片发到话题，
     - `im:message.group_msg`（敏感权限）：读取群消息详情、下载群内图片/视频；没有它时，话题根消息和媒体会失败并降级为无上下文；
     - 如果要接收**未 @ 的群消息**（完整群历史），还需要 `im:message.group_msg` 或 `im:message.group_msg:readonly`；这是敏感权限，请按实际隐私边界决定是否开启；
     - `im:chat:read`：设置界面的群列表选择器；
-    - `im:chat.members:read`（可选）：设置界面的「读取群成员」按钮，用于按成员勾选 @ 白名单；没有该权限时仍可手动填写 open_id。
+    - `im:chat.members:read`（可选）：设置界面的「读取群成员」按钮，以及「最近发过消息」里单聊对方的名字解析；没有该权限时仍可手动填写 open_id，单聊只显示 chat_id/open_id。
+    - 单聊的部门/组织（可选）：调用通讯录 API 需要 `contact:contact.base:readonly`（扫码应用自带），字段权限还需要 `contact:user.base:readonly`、`contact:user.department:readonly`、`contact:department.base:readonly`（部门路径另需 `contact:department.organize:readonly`）和 `tenant:tenant:readonly`；同时要把对方及所在部门加进应用的**通讯录权限范围**。缺失时只显示名字，部门/组织留空，不影响绑定和消息路由。
   - 问题跟踪（可选，`issueTracking` 开启时）：
     - `im:message.group_msg` 或 `im:message.group_msg:readonly`（敏感权限）：接收未 @ 的群消息。没有它时机器人根本收不到未 @ 的话题，只能跟踪 @ 过机器人的话题；
     - `base:app:create`、`base:record:create/read/update`、`base:field:read`、`docs:permission.member:create`：机器人创建/读写跟踪表、给群授权；
     - 使用已有表时，把机器人加为该 Base 的**可编辑协作者**；scope 只代表“能调 API”，协作者才代表“能进这张表”。
-- 扫码创建的应用会自动带上机器人能力、WebSocket 长连接、`im.message.receive_v1`、`card.action.trigger` 和上表列出的基础/群聊/媒体权限；但**不包含**敏感权限 `im:message.group_msg`、可选的 `im:chat.members:read`、表情回复和资源上传权限，需要时去开发者后台手动补。
+- 扫码创建的应用会自动带上机器人能力、WebSocket 长连接、`im.message.receive_v1`、`card.action.trigger` 和上表列出的基础/群聊/媒体权限，并自带 `contact:contact.base:readonly`；但**不包含**敏感权限 `im:message.group_msg`、可选的 `im:chat.members:read`、单聊部门/组织所需的通讯录字段权限、表情回复和资源上传权限，需要时去开发者后台手动补。
 - 机器人已被拉进目标群（单聊则需用户能搜到该机器人）。
 
 ## 设置
@@ -107,7 +108,7 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 - 每条绑定可开启 `allowAgentDelegation`（默认关）：白名单成员可用 `/agents` 查看本机非 lark-bot 管理的 Paseo Agent，再用 `/delegate <id 前 8 位> <任务>` 委派并等待结果（最长 5 分钟）。目标 Agent 的模型/权限/工作目录由它自己决定；这是跨 Agent 控制，请只开给可信群。
 - 每条绑定可开启**问题跟踪采集**（`issueTracking`，默认 `off`）：只应对**话题群**开启。开启后每个新话题根消息都会写一条记录，不需要 @ 机器人；普通群开启会把每条消息都当成新话题，产生大量噪音。变更后需保存设置；已有话题需要一次性回填（见「问题跟踪」）。跟踪文档也挂在绑定上：`issueBaseToken` / `issueTableId` / `issueBaseUrl`，**一个会话最多一个文档**；多个会话填相同的 token/table 就复用同一个文档。
 - `cwd` 留空表示用户主目录；支持 `~/` 开头的路径。生产使用时建议填一个专用、低权限的项目目录。
-- 设置界面的会话选择器来自 lark-cli 的群列表；单聊的 chat_id 拿不到，可先给机器人发条消息，再从「添加会话」的“最近发过消息”里一键添加。
+- 设置界面的会话选择器来自 lark-cli 的群列表；单聊不在群列表里，可先给机器人发条消息，再从「添加会话」的“最近发过消息”里一键添加。插件会用 `im:chat.members:read` 解析对方名字并写入新绑定的 `chatName`；有通讯录字段权限时同时显示部门/组织，缺失时以 `open_id` 兜底。名字只用于设置页展示和工作区命名，不参与消息路由。
 
 ## 聊天内命令
 
@@ -242,6 +243,7 @@ npm run typecheck
 ## 已知限制
 
 - **群成员目录 / `/members` 依赖 `im:chat.members:read`**：没有权限或飞书安全策略截断时，列表可能为空/不完整；注入目录只含前 20 个机器人和前 40 个成员，目标不在目录时用 `lark-bot-members --query` 搜索。`[[@名字]]` / `@名字` 按名字精确匹配，重名会降级为纯文本 `@名字`；只有 `post` 里的 `<at>` 才会触发，markdown/text 只是文字；机器人发送者若不在白名单会被静默忽略，双向协作时要互相加入。
+- **单聊名字/部门是可选增强**：名字优先取 `im:chat.members:read` 的成员列表；没有时用最近一条单聊消息的发送者 open_id 查通讯录（需 `contact:user.base:readonly`），都失败则显示 chat_id。部门/组织还需要上文的通讯录字段权限，并把对方加入应用的通讯录权限范围；缺失时以 `open_id` 兜底，不影响绑定和消息路由。查询结果在进程内缓存 10 分钟（失败缓存 1 分钟），不会每次刷新设置页都打飞书接口。
 - **`/delegate` 有 5 分钟等待上限**：目标 Agent 在等权限、长时间运行或命令链被占用时可能超时；超时后任务可能仍在 Paseo 继续，需到时间线查看。`/agents` 只列非 lark-bot 管理的 Agent，目标 Agent 的权限/目录由它自己决定。
 - **AI 改写多一次模型调用**：会增加延迟和费用（30 秒超时）；原文只在 Paseo 时间线，飞书里只发短版。提示词要求保留代码/命令/链接，但模型仍可能丢细节；对准确性要求高的回答建议关闭。带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写；`replyFooter` 的 usage 不含改写调用。
 - **扫码创建会替换 lark-cli 的默认应用配置**：`config init --new` 不带 `--name` 时会把新应用保存为唯一应用，其他 profile 会被清除；插件目前只读默认配置、不认 profile。已有应用请优先用「使用 lark-cli 当前应用」或手动填写凭证；只有确实没有现成应用时再用扫码创建，且先确认同机其他 lark-cli 使用方。
@@ -249,10 +251,10 @@ npm run typecheck
 - **问题跟踪依赖敏感权限**：没有 `im:message.group_msg`（或 readonly）时，机器人收不到未 @ 的话题，只能跟踪 @ 过机器人的话题；这不是代码能绕过的。只应对话题群开启 `issueTracking`，普通群会把每条消息当新话题。
 - **问题跟踪的边界**：上线前已存在的话题不会自动回填；一个话题对应一条记录，多个问题建议拆话题；Base 字段被人工改名/删除后写入会失败，可在设置页点「测试连接」检查；插件只在自己预期的前置状态推进，人工改过的已修复/已发布/已关闭不会被自动重开。文档配置跟会话绑定走：一个会话最多一个文档，多个会话可填相同的 Base；记录会记住创建时的 Base，之后改绑会话不会把旧记录写到新表。
 - **自动创建的 Base 归机器人应用**：Base 在应用空间，不在个人「我的空间」，通过链接和该会话的群协作者访问；需要归个人时请在飞书里手动建表并使用已有表，或把所有权转给个人。创建过程中插件重启可能留下未登记的 Base；可在设置页重新创建，或手动把已有表填进会话配置。
-- 扫码创建的应用默认不含 `im:message.group_msg`（敏感）和 `im:chat.members:read`：前者影响话题根消息/群历史/群媒体，后者影响「读取群成员」；需要时到开发者后台手动补。问题跟踪还需要 `base:app:create` / `base:record:*` / `docs:permission.member:create`，使用已有表时需要把机器人加为 Base 协作者。
+- 扫码创建的应用默认不含 `im:message.group_msg`（敏感）和 `im:chat.members:read`：前者影响话题根消息/群历史/群媒体，后者影响「读取群成员」和单聊名字解析；需要时到开发者后台手动补。问题跟踪还需要 `base:app:create` / `base:record:*` / `docs:permission.member:create`，使用已有表时需要把机器人加为 Base 协作者。
 - 指令只处理 text / post；`file` 会下载并列出路径，语音、表情、卡片等非文本类型仍只记占位（不做 STT）。post 的入站文本由 lark-cli 预渲染，排版细节以实际渲染为准。
 - 群聊上下文/媒体/群列表依赖上文列出的额外权限；只授予 @ 权限时，插件仍能回复简单文本，但话题根消息、历史和图片会静默降级（日志可见）。
-- 「读取群成员」依赖 `im:chat.members:read`；服务端对超大群成员列表有安全上限，返回的成员可能不完整，此时可手动填写 open_id。白名单按 open_id 精确匹配，换绑飞书应用或用户 open_id 变化后需重新选择。
+- 「读取群成员」和单聊名字解析依赖 `im:chat.members:read`；服务端对超大群成员列表有安全上限，返回的成员可能不完整，此时可手动填写 open_id。白名单按 open_id 精确匹配，换绑飞书应用或用户 open_id 变化后需重新选择。
 - 模型/思考深度/权限选项来自 Paseo 的 provider 快照；provider 未发现模型或模式时界面只显示「默认」，服务端仍可创建会话。切换 provider 会清空该绑定的模型/思考/权限，避免把上一个 provider 的值带过去。
 - 视频抽帧依赖 ffmpeg/ffprobe；没有时退化为占位。图片/视频/文件大小超过上限会跳过。
 - 机器人自己发起的回复不会触发其他会话轮次，但若 post 回复中 @ 了其他机器人，对方 agent 的响应由对方的接入方处理。**接力循环熔断**（仅对 `post` 生效）：同一话题内连续 3 条回复都提及**本话题出现过的机器人**、或连续 3 条回复内容完全相同时，第 3 条会自动降级为纯文本（提及以 @名称 文字呈现，不会再触发其他机器人）并附一行说明；@ 人类成员不计入提及连击，单次正常交接不受影响，熔断后窗口重置。

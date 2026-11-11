@@ -63,7 +63,15 @@ interface StatusState {
   enabled: boolean;
   botOpenId: string | null;
   sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
-  unmatched: { chatId: string; chatType: string; lastSeenAt: number }[];
+  unmatched: {
+    chatId: string;
+    chatType: string;
+    lastSeenAt: number;
+    peerOpenId?: string;
+    peerName?: string;
+    peerDepartment?: string;
+    peerOrganization?: string;
+  }[];
   cron: {
     id: string;
     expression: string;
@@ -251,11 +259,11 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const boundIds = useMemo(() => new Set(draft?.chats.map((chat) => chat.chatId) ?? []), [draft]);
 
   const addBinding = useCallback(
-    (chatId: string) => {
+    (chatId: string, chatName = "") => {
       if (!chatId) return;
       setDraft((current) => {
         if (!current || current.chats.some((chat) => chat.chatId === chatId)) return current;
-        const catalogName = chatCatalog.find((chat) => chat.chatId === chatId)?.name ?? "";
+        const catalogName = chatName || chatCatalog.find((chat) => chat.chatId === chatId)?.name || "";
         return {
           ...current,
           chats: [
@@ -527,14 +535,31 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const addableChats = [
     ...chatCatalog
       .filter((chat) => !boundIds.has(chat.chatId))
-      .map((chat) => ({ chatId: chat.chatId, label: chat.name || chat.chatId })),
+      .map((chat) => ({ chatId: chat.chatId, label: chat.name || chat.chatId, chatName: chat.name })),
     ...(status?.unmatched ?? [])
       .filter((chat) => !boundIds.has(chat.chatId))
-      .map((chat) => ({
-        chatId: chat.chatId,
-        label: `${chat.chatType === "p2p" ? "单聊" : "会话"} ${chat.chatId}`,
-        note: "最近有人给机器人发过消息",
-      })),
+      .map((chat) => {
+        const peerName = chat.peerName?.trim() ?? "";
+        const department = chat.peerDepartment?.trim() ?? "";
+        const tenant = chat.peerOrganization?.trim() ?? "";
+        // Department paths often start with the tenant name; don't repeat it.
+        const organization =
+          department && tenant && !department.includes(tenant)
+            ? `${department} · ${tenant}`
+            : department || tenant;
+        const fallback = chat.peerOpenId ? `open_id ${chat.peerOpenId}` : "";
+        return {
+          chatId: chat.chatId,
+          label:
+            chat.chatType === "p2p"
+              ? peerName
+                ? `单聊 · ${peerName}`
+                : `单聊 ${chat.chatId}`
+              : `会话 ${chat.chatId}`,
+          note: [organization || fallback, "最近有人给机器人发过消息"].filter(Boolean).join(" · "),
+          chatName: peerName,
+        };
+      }),
   ];
   const selectedBinding = selection.kind === "binding"
     ? draft.chats.find((chat) => chat.chatId === selection.chatId) ?? null

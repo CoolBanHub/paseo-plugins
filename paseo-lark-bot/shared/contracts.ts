@@ -136,7 +136,18 @@ export const larkBotStatusRpc = defineRpc({
     ),
     /** Recently seen chats without a binding, offered as one-click additions. */
     unmatched: z.array(
-      z.object({ chatId: z.string(), chatType: z.string(), lastSeenAt: z.number() }),
+      z.object({
+        chatId: z.string(),
+        chatType: z.string(),
+        lastSeenAt: z.number(),
+        /** P2p peer open_id, from the last inbound message or member lookup. */
+        peerOpenId: z.string().optional(),
+        peerName: z.string().optional(),
+        /** Department path when contact scopes expose it. */
+        peerDepartment: z.string().optional(),
+        /** Tenant display name when the app may read it. */
+        peerOrganization: z.string().optional(),
+      }),
     ),
     /** Scheduled prompts managed with /cron (read-only on the status page). */
     cron: z.array(
