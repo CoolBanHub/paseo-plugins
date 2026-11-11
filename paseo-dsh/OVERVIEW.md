@@ -58,10 +58,12 @@ The plugin resolves the dsh bin script in this order:
    (`~/.npm/_npx/…`), which exists once you have run
    `npx @deepseek-ai/dsh web`.
 
-The script is always spawned through an explicit node executable
-(`DSH_NODE_PATH`, else the newest `node` found on the daemon's `PATH`, in
-nvm, or in Homebrew) because the Paseo daemon itself runs on Electron and
-dsh's launcher refuses Electron runtime fingerprints.
+The script is spawned through a real node executable when one can be found
+(`DSH_NODE_PATH`, else the newest `node` on the daemon's `PATH`, in nvm, or
+in Homebrew) because the Paseo daemon itself runs on Electron and dsh's
+launcher refuses Electron runtime fingerprints; when none of those exist the
+daemon's own executable is the last resort, which dsh's launcher may still
+reject by its Electron fingerprint.
 
 ## Requirements
 
