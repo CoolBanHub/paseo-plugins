@@ -460,11 +460,28 @@ export function createDispatcher(options: DispatcherOptions) {
       onNotice: (chatId, messageId, text) => {
         if (chatId) void deliver(chatId, null, messageId, text);
       },
+      onRecoveredReply: (chatId, messageId, text, topicKey) => {
+        // No `meta`: skip the rewrite/footer pass, but keep the topic key so
+        // post formatting and the bot-relay loop guard still apply.
+        void deliver(chatId, topicKey, messageId, text);
+      },
       onTurnStarted: (info) => startProgress(info.topicKey, info.chatId, info.messageId),
       onAgentActivity: (_agentId, topicKey, activity) => noteActivity(topicKey, activity),
       log,
     },
   });
+
+  // Recover turns that were in flight when the plugin or daemon restarted.
+  // Runs once per dispatcher; the registry keeps restored topics busy until
+  // it decides whether they are still running or already finished.
+  void (async () => {
+    try {
+      await currentValues();
+      await sessions.recoverPendingTurns();
+    } catch (error) {
+      log("恢复重启前的轮次失败", error instanceof Error ? error.message : String(error));
+    }
+  })();
 
   async function currentValues(): Promise<BotValues> {
     valuesCache = await options.readValues();

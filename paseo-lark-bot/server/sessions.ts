@@ -461,6 +461,20 @@ interface TopicState {
   timelineUnsub: (() => void) | null;
   /** Usage reported during the active turn, consumed by turn_ended. */
   turnUsage: TurnUsage | null;
+  /**
+   * Durable marker for the in-flight turn. Written synchronously when the
+   * turn starts and cleared when it finishes, so a reload or hard restart can
+   * still recover the final reply instead of dropping it.
+   */
+  pendingTurn: StoredPendingTurn | null;
+}
+
+/** Persisted description of a turn that may outlive the plugin process. */
+interface StoredPendingTurn {
+  /** Trigger message to reply under; null falls back to lastSeenMessageId. */
+  target: string | null;
+  /** Turn start in epoch milliseconds. */
+  startedAt: number;
 }
 
 /** One persisted topic→agent entry of the topic store. */
@@ -473,6 +487,39 @@ interface StoredTopic {
   lastSeenMessageId?: string | null;
   /** Chat-command overrides, persisted with the mapping. */
   overrides?: TopicOverrides;
+  /** Set while a turn is in flight; recovered on the next plugin startup. */
+  pendingTurn?: StoredPendingTurn;
+}
+
+/** Validate a persisted pending-turn marker; malformed entries are ignored. */
+function parsePendingTurn(value: unknown): StoredPendingTurn | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const startedAt = record.startedAt;
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt) || startedAt <= 0) return null;
+  const target = typeof record.target === "string" && record.target ? record.target : null;
+  return { target, startedAt };
+}
+
+/** Best-effort status/timestamp extraction from an agent snapshot. */
+function snapshotStatus(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of ["lastStatus", "status"]) {
+    if (typeof record[key] === "string" && record[key]) return record[key] as string;
+  }
+  return null;
+}
+
+function snapshotTimestamp(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of ["lastActivityAt", "updatedAt"]) {
+    const raw = record[key];
+    const ms = typeof raw === "number" ? raw : typeof raw === "string" ? Date.parse(raw) : NaN;
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
 }
 
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -486,6 +533,10 @@ const STUCK_BUSY_MS = 30 * 60_000;
 const TURN_RETRY_DELAYS_MS = [5_000, 20_000];
 /** Give turn_ended a short window after run() resolves before synthesizing it. */
 const DEFAULT_TURN_FALLBACK_MS = 5_000;
+/** Sentinel activeTurn token for a turn restored from the persisted store. */
+const RESTORED_TURN = -1;
+/** Agent statuses that still have a turn running in Paseo. */
+const RUNNING_STATUS = /run|busy|work|start|stream|permission|wait/i;
 /** Hard cap for queued messages per topic; prevents unbounded group spam. */
 const MAX_QUEUE_PER_TOPIC = 20;
 /** Bound topic state for long-running daemons. */
@@ -503,6 +554,12 @@ export interface SessionCallbacks {
    * state such as the bot-relay loop guard.
    */
   onReply(chatId: string, messageId: string, outcome: TurnOutcome, topicKey?: string): void;
+  /**
+   * Re-send the final text recovered after a restart. Kept separate from
+   * onReply so the caller can deliver it without a second AI rewrite while
+   * still keeping topic-scoped formatting/relay protection.
+   */
+  onRecoveredReply?(chatId: string, messageId: string, text: string, topicKey: string): void;
   /** Informational notice (errors, stuck sessions, unmatched chats). */
   onNotice(chatId: string | null, messageId: string, text: string): void;
   /** A queued item started running; the progress card is created here. */
@@ -728,6 +785,7 @@ export function createSessionRegistry(options: {
       overrides: {},
       timelineUnsub: null,
       turnUsage: null,
+      pendingTurn: null,
     };
   }
 
@@ -761,6 +819,17 @@ export function createSessionRegistry(options: {
               ? record.lastSeenMessageId
               : null;
           state.overrides = sanitizeOverrides(record.overrides);
+          const pendingTurn = parsePendingTurn(record.pendingTurn);
+          if (pendingTurn) {
+            // Restore the turn as busy immediately so a completion that races
+            // the status probe below is still handled (not dropped as manual).
+            state.pendingTurn = pendingTurn;
+            state.busy = true;
+            state.busySince = pendingTurn.startedAt;
+            state.activeTurn = RESTORED_TURN;
+            state.pendingTargets = pendingTurn.target ? [pendingTurn.target] : [];
+            armStuckWatchdog(topicKey, state, RESTORED_TURN);
+          }
           topics.set(topicKey, state);
           // Restore the reverse mapping so turn_ended/permission events for a
           // turn that outlived the restart still route to their topic. Idle
@@ -781,7 +850,9 @@ export function createSessionRegistry(options: {
       const entries: StoredTopic[] = [];
       for (const [topicKey, state] of topics) {
         if (!state.agentId) continue;
-        if (idleMs > 0 && now() - state.lastActivityAt > idleMs) continue;
+        // Never drop an in-flight turn just because its topic looks idle; the
+        // marker is the only way to recover its reply after a restart.
+        if (idleMs > 0 && now() - state.lastActivityAt > idleMs && !state.pendingTurn) continue;
         entries.push({
           topicKey,
           chatId: state.chatId,
@@ -789,8 +860,12 @@ export function createSessionRegistry(options: {
           lastActivityAt: state.lastActivityAt,
           lastSeenMessageId: state.lastSeenMessageId,
           ...(Object.keys(state.overrides).length > 0 ? { overrides: state.overrides } : {}),
+          ...(state.pendingTurn ? { pendingTurn: state.pendingTurn } : {}),
         });
       }
+      // Keep in-flight markers when the store hits its cap: they cannot be
+      // reconstructed from the agent mapping alone.
+      entries.sort((a, b) => Number(Boolean(a.pendingTurn)) - Number(Boolean(b.pendingTurn)));
       mkdirSync(dirname(topicStorePath), { recursive: true });
       const temporary = `${topicStorePath}.tmp`;
       writeFileSync(temporary, JSON.stringify({ version: 1, topics: entries.slice(-MAX_TOPICS) }), {
@@ -990,6 +1065,7 @@ export function createSessionRegistry(options: {
     state.turnRetries = 0;
     state.recoveries = 0;
     state.activeItem = null;
+    state.pendingTurn = null;
     setBusy(state, false);
     scheduleTopicStoreSave();
   }
@@ -1027,6 +1103,13 @@ export function createSessionRegistry(options: {
       if (state.activeTurn !== turn) return;
       state.lastActivityAt = now();
       agentToTopic.set(handle.id, topicKey);
+      // Persist the in-flight turn before any further await. A reload, crash
+      // or hard restart can then recover the final reply from the timeline.
+      state.pendingTurn = {
+        target: item.messageId,
+        startedAt: state.busySince ?? now(),
+      };
+      flushTopicStore();
       state.pendingTargets.push(item.messageId);
       if (created) {
         // The first turn is driven by create(); wait for turn_ended. If the
@@ -1395,6 +1478,7 @@ export function createSessionRegistry(options: {
     // Capture and clear the token before any await so a late fallback or a
     // duplicate turn_ended cannot release the next turn as well.
     state.activeTurn = null;
+    state.pendingTurn = null;
     if (state.turnFallback) {
       clearTimeout(state.turnFallback);
       state.turnFallback = null;
@@ -1459,6 +1543,111 @@ export function createSessionRegistry(options: {
     state.lastActivityAt = now();
     scheduleTopicStoreSave();
     drain(topicKey);
+  }
+
+  let recoveryStarted = false;
+
+  /**
+   * Reconcile turns that were in flight when the plugin (or the whole daemon)
+   * restarted. The topic store restores them as busy so a late turn_ended is
+   * still handled; this probe decides whether the turn is still running or
+   * already finished, and sends the final text (or an interruption notice) for
+   * the finished cases. Called once per dispatcher process.
+   */
+  async function recoverPendingTurns(): Promise<void> {
+    if (recoveryStarted || disposed) return;
+    recoveryStarted = true;
+    const pending = [...topics.entries()].filter(
+      ([, state]) => state.pendingTurn !== null && state.agentId !== null,
+    );
+    if (pending.length === 0) return;
+
+    // One list call covers every pending agent on hosts that expose it.
+    let statuses: Map<string, string> | null = null;
+    if (options.paseo.agents.list) {
+      try {
+        const result = await options.paseo.agents.list();
+        statuses = new Map();
+        for (const entry of result.entries) {
+          const status = entry.agent.status;
+          if (typeof status === "string" && status) statuses.set(entry.agent.id, status);
+        }
+      } catch (error) {
+        options.callbacks.log?.(
+          "恢复轮次时读取 agent 列表失败，改为逐个探测：" +
+            (error instanceof Error ? error.message : String(error)),
+        );
+        statuses = null;
+      }
+    }
+
+    for (const [topicKey, state] of pending) {
+      const marker = state.pendingTurn;
+      const agentId = state.agentId;
+      if (!marker || !agentId || disposed || state.pendingTurn !== marker) continue;
+
+      let status = statuses?.get(agentId) ?? null;
+      let snapshot: unknown = null;
+      let snapshotRead = false;
+      // Always probe once: the list status can be stale right after a restart,
+      // and the snapshot confirms the agent still exists and carries the
+      // timestamp used to reject an assistant message from a previous turn.
+      try {
+        const handle = options.paseo.agents.ref(agentId);
+        if (handle.refresh) {
+          snapshot = await handle.refresh();
+          snapshotRead = true;
+          status = snapshotStatus(snapshot) ?? status;
+        }
+      } catch {
+        snapshot = null;
+        snapshotRead = true;
+      }
+      // A live turn_ended may have finished this topic while we were probing.
+      if (disposed || state.pendingTurn !== marker) continue;
+
+      if (status && RUNNING_STATUS.test(status)) {
+        options.callbacks.log?.(`topic ${topicKey} 重启时轮次仍在运行，恢复等待 turn_ended`);
+        continue;
+      }
+
+      // Not running: completed, failed, or the agent is gone. Try the timeline
+      // for the final answer; a stale answer from before the turn is rejected
+      // when the snapshot exposes a timestamp.
+      const failed = Boolean(status && /error|fail/i.test(status));
+      const text = failed ? null : await fetchLastReply(agentId).catch(() => null);
+      if (disposed || state.pendingTurn !== marker) continue;
+      const lastActivity = snapshotTimestamp(snapshot);
+      const freshText =
+        text && (lastActivity === null || lastActivity >= marker.startedAt) && !(snapshotRead && snapshot === null)
+          ? text
+          : null;
+
+      const target = marker.target ?? state.lastSeenMessageId;
+      state.pendingTurn = null;
+      state.pendingTargets = [];
+      setBusy(state, false);
+      // Keep the write debounced: if the process dies right after sending, the
+      // marker survives and the next startup retries under the same content
+      // idempotency key instead of dropping the reply.
+      scheduleTopicStoreSave();
+      if (freshText && target) {
+        if (options.callbacks.onRecoveredReply) {
+          options.callbacks.onRecoveredReply(state.chatId, target, freshText, topicKey);
+        } else {
+          options.callbacks.onNotice(state.chatId, target, freshText);
+        }
+        options.callbacks.log?.(`topic ${topicKey} 重启后补发上一轮回复（${freshText.length} 字）`);
+      } else if (target) {
+        options.callbacks.onNotice(
+          state.chatId,
+          target,
+          "上一轮因 Paseo 重启中断，结果可能未生成；请在 Paseo 查看或重新发送。",
+        );
+        options.callbacks.log?.(`topic ${topicKey} 重启后未取回上一轮回复`);
+      }
+      void drain(topicKey);
+    }
   }
 
   /** Permission requests only surface in the chat; resolution happens in Paseo. */
@@ -1595,6 +1784,7 @@ export function createSessionRegistry(options: {
     noteMessage,
     enqueue,
     handleTurnEnded,
+    recoverPendingTurns,
     ownsAgent,
     chatIdForAgent,
     topicKeyForAgent,

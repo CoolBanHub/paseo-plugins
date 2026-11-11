@@ -1372,6 +1372,263 @@ describe("topic agent store", () => {
   });
 });
 
+describe("restart recovery", () => {
+  const startedAt = 1_800_000_000_000;
+
+  function writePendingStore(dir: string): string {
+    const storePath = join(dir, "topic-agents.json");
+    writeFileSync(
+      storePath,
+      JSON.stringify({
+        version: 1,
+        topics: [
+          {
+            topicKey: "om_1",
+            chatId: "oc_group",
+            agentId: "agent-1",
+            lastActivityAt: startedAt + 1_000,
+            lastSeenMessageId: "om_1",
+            pendingTurn: { target: "om_1", startedAt },
+          },
+        ],
+      }),
+    );
+    return storePath;
+  }
+
+  const handle: SessionAgentHandle = {
+    id: "agent-1",
+    send: async () => {},
+    run: async () => ({ status: "idle", error: null, lastMessage: null }),
+  };
+
+  it("persists an in-flight turn and clears it on turn_ended", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => handle,
+            ref: () => handle,
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+
+      const saved = JSON.parse(readFileSync(storePath, "utf8")) as {
+        topics?: { pendingTurn?: { target?: string | null; startedAt?: number } }[];
+      };
+      assert.equal(saved.topics?.[0]?.pendingTurn?.target, "om_1");
+
+      registry.handleTurnEnded("agent-1", completed("done"));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const after = JSON.parse(readFileSync(storePath, "utf8")) as {
+        topics?: { pendingTurn?: unknown }[];
+      };
+      assert.equal(after.topics?.[0]?.pendingTurn, undefined);
+      registry.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the pending marker when the plugin unloads mid-turn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => handle,
+            ref: () => handle,
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+      registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+      await flush();
+      registry.dispose();
+
+      const saved = JSON.parse(readFileSync(storePath, "utf8")) as {
+        topics?: { pendingTurn?: { target?: string | null } }[];
+      };
+      assert.equal(saved.topics?.[0]?.pendingTurn?.target, "om_1");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a running turn and replies when it finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = writePendingStore(dir);
+    const replies: { messageId: string; outcome: TurnOutcome }[] = [];
+    const notices: string[] = [];
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            list: async () => ({ entries: [{ agent: { id: "agent-1", status: "running" } }] }),
+            create: async () => {
+              throw new Error("a running turn must not create a new agent");
+            },
+            ref: () => ({ ...handle, refresh: async () => ({ lastStatus: "running" }) }),
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: {
+          onReply: (_chatId, messageId, outcome) => replies.push({ messageId, outcome }),
+          onNotice: (_chatId, _messageId, text) => notices.push(text),
+        },
+      });
+
+      await registry.recoverPendingTurns();
+      assert.equal(registry.sessionInfo("om_1", "oc_group").busy, true);
+      assert.equal(replies.length, 0);
+      assert.equal(notices.length, 0);
+
+      registry.handleTurnEnded("agent-1", completed("final answer"));
+      await flush();
+      assert.equal(replies[0]?.messageId, "om_1");
+      assert.equal(replies[0]?.outcome.lastText, "final answer");
+      assert.equal(registry.sessionInfo("om_1", "oc_group").busy, false);
+      registry.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resends a finished turn from the timeline after a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = writePendingStore(dir);
+    const recovered: { text: string; topicKey: string }[] = [];
+    const notices: string[] = [];
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            list: async () => ({ entries: [{ agent: { id: "agent-1", status: "idle" } }] }),
+            create: async () => {
+              throw new Error("a finished turn must not create a new agent");
+            },
+            ref: () => handle,
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        fetchLastReply: async () => "recovered answer",
+        callbacks: {
+          onReply: () => {},
+          onRecoveredReply: (_chatId, _messageId, text, topicKey) => recovered.push({ text, topicKey }),
+          onNotice: (_chatId, _messageId, text) => notices.push(text),
+        },
+      });
+
+      await registry.recoverPendingTurns();
+      assert.deepEqual(recovered, [{ text: "recovered answer", topicKey: "om_1" }]);
+      assert.equal(notices.length, 0);
+      assert.equal(registry.sessionInfo("om_1", "oc_group").busy, false);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const after = JSON.parse(readFileSync(storePath, "utf8")) as {
+        topics?: { pendingTurn?: unknown }[];
+      };
+      assert.equal(after.topics?.[0]?.pendingTurn, undefined);
+      registry.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("notifies the topic when the restored agent is gone", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = writePendingStore(dir);
+    const notices: string[] = [];
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            list: async () => ({ entries: [] }),
+            create: async () => {
+              throw new Error("must not create");
+            },
+            ref: () => ({ ...handle, refresh: async () => null }),
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: {
+          onReply: () => {},
+          onNotice: (_chatId, _messageId, text) => notices.push(text),
+        },
+      });
+
+      await registry.recoverPendingTurns();
+      assert.equal(notices.length, 1);
+      assert.match(notices[0] ?? "", /重启中断/);
+      assert.equal(registry.sessionInfo("om_1", "oc_group").busy, false);
+      registry.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resend an assistant message from before the turn started", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-recovery-"));
+    const storePath = writePendingStore(dir);
+    const notices: string[] = [];
+    try {
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            list: async () => ({ entries: [{ agent: { id: "agent-1", status: "idle" } }] }),
+            create: async () => {
+              throw new Error("must not create");
+            },
+            ref: () => ({
+              ...handle,
+              refresh: async () => ({ lastStatus: "idle", lastActivityAt: startedAt - 1_000 }),
+            }),
+          },
+        },
+        getIdleMs: () => 0,
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        fetchLastReply: async () => "old answer from a previous turn",
+        callbacks: {
+          onReply: () => {},
+          onNotice: (_chatId, _messageId, text) => notices.push(text),
+        },
+      });
+
+      await registry.recoverPendingTurns();
+      assert.equal(notices.length, 1);
+      assert.match(notices[0] ?? "", /重启中断/);
+      assert.doesNotMatch(notices[0] ?? "", /old answer/);
+      registry.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("default system prompt", () => {
   it("marks transcript blocks as data when the binding sets none", async () => {
     const h = makeHarness();
