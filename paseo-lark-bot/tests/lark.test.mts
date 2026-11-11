@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listChatBots, listChatMembers, parseLarkJson, replyCard, replyMessage, resolveLarkCli } from "../server/lark.ts";
+import { listChatBots, listChatDirectory, listChatMembers, parseLarkJson, replyCard, replyMessage, resolveLarkCli } from "../server/lark.ts";
 
 describe("parseLarkJson", () => {
   it("parses JSON after leading warnings", () => {
@@ -206,6 +206,43 @@ console.log(JSON.stringify({
     try {
       const bots = await listChatBots(cli, "oc_chat");
       assert.deepEqual(bots, [{ openId: "ou_bot", name: "OpsBot", appId: "cli_ops" }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("listChatDirectory", () => {
+  it("merges users and bots with kind markers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-directory-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+if (!args.includes("+chat-members-list") || !args.includes("oc_chat")) {
+  console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv" } }));
+  process.exit(0);
+}
+console.log(JSON.stringify({
+  ok: true,
+  data: {
+    users: [
+      { member_id: "ou_zhang", name: "张三" },
+      { member_id: "not-an-open-id", name: "坏数据" },
+    ],
+    bots: [{ member_id: "ou_bot", name: "OpsBot", app_id: "cli_ops" }],
+  },
+}));
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const entries = await listChatDirectory(cli, "oc_chat");
+      assert.deepEqual(entries, [
+        { openId: "ou_bot", name: "OpsBot", kind: "bot", appId: "cli_ops" },
+        { openId: "ou_zhang", name: "张三", kind: "user" },
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

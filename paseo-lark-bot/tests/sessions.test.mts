@@ -89,7 +89,7 @@ function makeHarness(
     turnRetryDelaysMs?: number[];
     stuckBusyMs?: number;
     workspacePerBinding?: boolean;
-    getBotDirectory?: (chatId: string, replyFormat: string) => Promise<string | null>;
+    getMemberDirectory?: (chatId: string, replyFormat: string) => Promise<string | null>;
   },
 ): Harness {
   const replies: ReplyCall[] = [];
@@ -191,7 +191,7 @@ function makeHarness(
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
     getWorkspacePerBinding: () => options?.workspacePerBinding ?? false,
-    getBotDirectory: options?.getBotDirectory,
+    getMemberDirectory: options?.getMemberDirectory,
     turnRetryDelaysMs: options?.turnRetryDelaysMs,
     stuckBusyMs: options?.stuckBusyMs,
     callbacks: {
@@ -1358,9 +1358,9 @@ describe("default system prompt", () => {
     assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);
   });
 
-  it("appends the group bot directory to new post sessions", async () => {
+  it("appends the group member directory to new post sessions", async () => {
     const h = makeHarness({
-      getBotDirectory: async () => "### 群内机器人（不是人类）\n- [机器人] OpsBot · open_id: `ou_bot`",
+      getMemberDirectory: async () => "### 群成员目录（仅用于 @）\n- [机器人] OpsBot · open_id: `ou_bot`\n- [成员] 张三 · open_id: `ou_zhang`",
     });
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
       ...binding,
@@ -1368,9 +1368,10 @@ describe("default system prompt", () => {
     });
     await flush();
     const prompt = h.created[0].config.systemPrompt ?? "";
-    assert.match(prompt, /群内机器人/);
+    assert.match(prompt, /群成员目录/);
     assert.match(prompt, /OpsBot/);
-    assert.match(prompt, /ou_bot/);
+    assert.match(prompt, /张三/);
+    assert.match(prompt, /ou_zhang/);
   });
 });
 

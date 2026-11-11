@@ -427,6 +427,62 @@ export async function listChatBots(cliPath: string, chatId: string): Promise<Lar
   return bots;
 }
 
+export interface LarkChatDirectoryEntry {
+  openId: string;
+  name: string;
+  kind: "user" | "bot";
+  /** App id (`cli_…`) for bots when the payload carries one. */
+  appId?: string;
+}
+
+/**
+ * Users + bots in one chat, for resolving `[[@名字]]` mentions and the
+ * `/members` search. One shortcut call returns both buckets.
+ */
+export async function listChatDirectory(
+  cliPath: string,
+  chatId: string,
+): Promise<LarkChatDirectoryEntry[]> {
+  const payload = await runCli(
+    cliPath,
+    [
+      "im",
+      "+chat-members-list",
+      "--chat-id",
+      chatId,
+      "--page-all",
+      "--format",
+      "json",
+    ],
+    "拉取群成员目录",
+  );
+  const data = payload.data as { users?: unknown; bots?: unknown } | undefined;
+  const entries: LarkChatDirectoryEntry[] = [];
+  const seen = new Set<string>();
+  const add = (items: unknown, kind: "user" | "bot"): void => {
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const openId = record.member_id;
+      const name = record.name;
+      const appId = record.app_id ?? record.bot_id;
+      if (typeof openId !== "string" || !openId.startsWith("ou_") || seen.has(openId)) continue;
+      seen.add(openId);
+      entries.push({
+        openId,
+        name: typeof name === "string" ? name : "",
+        kind,
+        ...(kind === "bot" && typeof appId === "string" && appId ? { appId } : {}),
+      });
+    }
+  };
+  // Bots first: they are the more common delegation target and usually few.
+  add(data?.bots, "bot");
+  add(data?.users, "user");
+  return entries;
+}
+
 export interface ReplyOptions {
   /** Stable per logical reply; lets a retry never duplicate a send. */
   idempotencyKey?: string;

@@ -81,25 +81,38 @@ export interface TurnUsage {
   totalCostUsd?: number;
 }
 
-/** Default prompt plus the optional attachment-return instructions. */
+/** Default prompt plus the optional attachment-return and @ instructions. */
 function defaultSystemPrompt(
   helperPath: string | null | undefined,
   context?: { chatId: string; topicKey: string },
+  membersHelperPath?: string | null,
 ): string {
-  if (!helperPath) return DEFAULT_TOPIC_SYSTEM_PROMPT;
-  const fallback = context
-    ? `\n如果提示缺少会话信息，可显式追加 --chat ${context.chatId} --topic ${context.topicKey}。`
-    : "";
-  return (
-    DEFAULT_TOPIC_SYSTEM_PROMPT +
-    "\n\n### 把生成的图片或文件发回飞书\n" +
-    "需要把本地生成的图片/文件投递给用户时，运行：\n" +
-    `  ${helperPath} --image /绝对/路径/图.png\n` +
-    `  ${helperPath} --file /绝对/路径/报告.pdf\n` +
-    "只用于回传你生成、且用户需要看到的附件；路径必须在该会话的工作目录或系统临时目录内。" +
-    "普通回答仍按正常消息发送，不要重复文件路径。" +
-    fallback
-  );
+  const parts = [DEFAULT_TOPIC_SYSTEM_PROMPT];
+  if (helperPath) {
+    const fallback = context
+      ? `\n如果提示缺少会话信息，可显式追加 --chat ${context.chatId} --topic ${context.topicKey}。`
+      : "";
+    parts.push(
+      "\n\n### 把生成的图片或文件发回飞书\n" +
+        "需要把本地生成的图片/文件投递给用户时，运行：\n" +
+        `  ${helperPath} --image /绝对/路径/图.png\n` +
+        `  ${helperPath} --file /绝对/路径/报告.pdf\n` +
+        "只用于回传你生成、且用户需要看到的附件；路径必须在该会话的工作目录或系统临时目录内。" +
+        "普通回答仍按正常消息发送，不要重复文件路径。" +
+        fallback,
+    );
+  }
+  if (membersHelperPath) {
+    parts.push(
+      "\n\n### @ 群成员\n" +
+        "需要 @ 群里的机器人或成员时，在最终回复里写 [[@名字]]，也可以直接写 @名字（精确匹配）；插件会换成真正的 @。\n" +
+        "如果不知道 open_id，运行：\n" +
+        `  ${membersHelperPath} --query "名字"\n` +
+        '然后按输出里的 open_id 用 <at user_id="ou_xxx">名字</at>。\n' +
+        "@ 只在 post（富文本@）格式生效；不要 @ 所有人。",
+    );
+  }
+  return parts.join("");
 }
 
 function providerCreateConfig(
@@ -108,7 +121,8 @@ function providerCreateConfig(
   overrides: TopicOverrides,
   helperPath: string | null,
   attachmentContext?: { chatId: string; topicKey: string },
-  botDirectory?: string | null,
+  memberDirectory?: string | null,
+  membersHelperPath?: string | null,
 ): {
   provider: string;
   systemPrompt?: string;
@@ -118,11 +132,23 @@ function providerCreateConfig(
 } {
   const thinking = overrides.thinkingOptionId ?? binding.thinkingOptionId;
   const permission = overrides.permission ?? binding.permission;
-  const basePrompt = binding.systemPrompt?.trim() || defaultSystemPrompt(helperPath, attachmentContext);
+  const mentionHelper = binding.replyFormat === "post" ? membersHelperPath : null;
+  const basePrompt =
+    binding.systemPrompt?.trim() ||
+    defaultSystemPrompt(helperPath, attachmentContext, mentionHelper);
   const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
   const promptParts = [basePrompt];
   if (styleInstruction) promptParts.push(`### 回复风格\n${styleInstruction}`);
-  if (botDirectory) promptParts.push(botDirectory);
+  if (mentionHelper && binding.systemPrompt?.trim()) {
+    promptParts.push(
+      "### @ 群成员\n" +
+        "需要 @ 群里的机器人或成员时，在最终回复里写 [[@名字]]，也可以直接写 @名字（精确匹配）；插件会换成真正的 @。\n" +
+        `如果不知道 open_id，运行：\n  ${mentionHelper} --query "名字"\n` +
+        '然后按输出里的 open_id 用 <at user_id="ou_xxx">名字</at>。\n' +
+        "@ 只在 post（富文本@）格式生效；不要 @ 所有人。",
+    );
+  }
+  if (memberDirectory) promptParts.push(memberDirectory);
   const config: {
     provider: string;
     systemPrompt?: string;
@@ -551,10 +577,12 @@ export function createSessionRegistry(options: {
   /** Per-agent env for the attachment helper (chat/topic/outbox). */
   getAttachmentEnv?: (chatId: string, topicKey: string) => Record<string, string> | undefined;
   /**
-   * Optional group-bot directory (names + open_ids) appended to a new
-   * session's system prompt so the agent can @ other bots by open_id.
+   * Optional user+bot directory (names + open_ids) appended to a new
+   * session system prompt so the agent can @ members by name.
    */
-  getBotDirectory?: (chatId: string, replyFormat: ReplyFormat) => Promise<string | null>;
+  getMemberDirectory?: (chatId: string, replyFormat: ReplyFormat) => Promise<string | null>;
+  /** Absolute path of the member-search helper, quoted in @ instructions. */
+  getMembersHelperPath?: () => string | null;
 }) {
   const resolveProvider =
     options.resolveProvider ??
@@ -1236,12 +1264,13 @@ export function createSessionRegistry(options: {
     // daemon / failure), fall back to a standalone create() with the cwd.
     const workspace = await workspaceForAgent(item, cwd);
     const attachmentEnv = options.getAttachmentEnv?.(state.chatId, topicKey);
-    let botDirectory: string | null = null;
+    let memberDirectory: string | null = null;
     if (effective.replyFormat === "post") {
       try {
-        botDirectory = (await options.getBotDirectory?.(state.chatId, effective.replyFormat)) ?? null;
+        memberDirectory =
+          (await options.getMemberDirectory?.(state.chatId, effective.replyFormat)) ?? null;
       } catch {
-        botDirectory = null;
+        memberDirectory = null;
       }
     }
     const agentOptions = {
@@ -1251,7 +1280,8 @@ export function createSessionRegistry(options: {
         state.overrides,
         options.getAttachmentHelperPath?.() ?? null,
         { chatId: state.chatId, topicKey },
-        botDirectory,
+        memberDirectory,
+        options.getMembersHelperPath?.() ?? null,
       ),
       title: await resolveTitle(topicKey, item, provider, cwd),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },

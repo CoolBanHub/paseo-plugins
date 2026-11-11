@@ -5,7 +5,7 @@ import type {
   SessionRunResult,
   TopicOverrides,
 } from "./sessions.ts";
-import type { LarkChatBot } from "./lark.ts";
+import type { LarkChatBot, LarkChatDirectoryEntry } from "./lark.ts";
 import { formatCronTime, nextCronTime } from "./cron.ts";
 import type { CronScheduler, CronJob } from "./cron.ts";
 
@@ -48,6 +48,8 @@ const ALIASES: Record<string, string> = {
   诊断: "doctor",
   bots: "bots",
   机器人: "bots",
+  members: "members",
+  成员: "members",
   agents: "agents",
   智能体: "agents",
   delegate: "delegate",
@@ -78,6 +80,7 @@ export function commandHelp(): string {
     "`/cron list` 查看定时任务；`/cron add 0 6 * * * 总结 GitHub trending` 新建",
     "`/cron remove|on|off|run <id>` 管理定时任务",
     "`/bots` 查看群内机器人及其 open_id（用富文本 @ 转交任务）",
+    "`/members [关键词]` 搜索群成员（含机器人），返回 open_id 用于 @",
     "`/agents` 列出可委派的 Paseo Agent（需在绑定里开启 Agent 委派）",
     "`/delegate <id|前缀> <任务>` 把任务交给其他 Paseo Agent 并等待结果（需开启）",
     "`/doctor` 自检 lark-cli、监听、卡片回调与 provider",
@@ -114,6 +117,8 @@ export interface CommandContext {
   doctor: () => Promise<string>;
   /** Group bots for /bots; omitted when the host cannot list members. */
   listBots?: () => Promise<LarkChatBot[]>;
+  /** Users + bots for /members; omitted when the host cannot list members. */
+  listMembers?: (query: string) => Promise<LarkChatDirectoryEntry[]>;
   /** Paseo agents for /agents and /delegate; omitted on older hosts. */
   listAgents?: () => Promise<SessionAgentSummary[]>;
   delegateAgent?: (agentId: string, task: string) => Promise<SessionRunResult>;
@@ -326,6 +331,9 @@ export async function runCommand(context: CommandContext): Promise<void> {
     case "bots":
       await runBotsCommand(context);
       return;
+    case "members":
+      await runMembersCommand(context, args);
+      return;
     case "agents":
       await runAgentsCommand(context);
       return;
@@ -370,6 +378,44 @@ async function runBotsCommand(context: CommandContext): Promise<void> {
     );
   } catch (error) {
     await reply(`读取群机器人失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function runMembersCommand(context: CommandContext, args: string): Promise<void> {
+  const { reply } = context;
+  if (!context.listMembers) {
+    await reply("当前宿主不支持读取群成员。");
+    return;
+  }
+  const query = args.trim();
+  try {
+    const entries = await context.listMembers(query);
+    if (entries.length === 0) {
+      await reply(
+        query
+          ? `没有找到匹配「${query}」的群成员。`
+          : "没有读到群成员；可能需要 `im:chat.members:read` 权限。",
+      );
+      return;
+    }
+    const lines = entries.slice(0, 30).map((entry, index) => {
+      const kind = entry.kind === "bot" ? "[机器人]" : "[成员]";
+      const name =
+        entry.name || (entry.kind === "bot" ? `机器人${index + 1}` : `成员${index + 1}`);
+      const app = entry.appId ? ` · app \`${entry.appId}\`` : "";
+      return `- ${kind} ${name} · \`${entry.openId}\`${app}`;
+    });
+    if (entries.length > 30) lines.push(`…还有 ${entries.length - 30} 个未列出，缩小关键词再搜。`);
+    await reply(
+      [
+        `**群成员（${entries.length}）${query ? ` · 关键词「${query}」` : ""}**`,
+        ...lines,
+        "",
+        "要 @ 谁：绑定回复格式选 `post`，在回复里写 `[[@名字]]` 或精确的 `@名字`（插件会换成真正的 @）；也可以直接写 `<at user_id=\"ou_xxx\">名字</at>`。只 @ 需要的人，不要 @ 所有人。",
+      ].join("\n"),
+    );
+  } catch (error) {
+    await reply(`读取群成员失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

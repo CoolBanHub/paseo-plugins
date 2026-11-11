@@ -8,7 +8,7 @@
 飞书（WebSocket 事件订阅，经 lark-cli）
   ├→ lark-cli event consume im.message.receive_v1（插件管理的长驻子进程，NDJSON 流）
   │    └→ 按 message_id 去重，并按会话串行预处理
-  │         ├→ 聊天命令（/status /model /mode /new /bots /agents /delegate /cron /doctor …）直接回复，不进入智能体
+  │         ├→ 聊天命令（/status /model /mode /new /bots /members /agents /delegate /cron /doctor …）直接回复，不进入智能体
   │         └→ 路由：chat_id → 绑定的 provider / cwd / systemPrompt / 回复风格 / 回复格式
   │              └→ 群聊：每个话题一个智能体会话；单聊：整个 chat 一个持续会话
   │                   ├→ 处理中：原地更新一张进度卡片（用时/排队/当前工具）
@@ -89,15 +89,15 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。设置保存会串行执行，避免并发 stop/start。
 - 每条绑定可选择**模型**、**思考深度**和**权限**：模型列表来自 Paseo provider 快照，留空使用 provider 默认模型；思考深度来自所选模型的 thinking options，留空使用模型默认（dsh 留空仍为最深 `max`）；权限在 Claude/Codex/ZCode 等 provider 上对应 provider mode（如 plan / acceptEdits / bypass、Codex default / full-access），在 dsh 上对应权限预设（仅可查看 / 工作区内修改 / 完全权限），留空时 dsh 沿用旧的 `danger-full-access`。
 - 每条绑定可选**回复风格**（`replyStyle`）：`default` / `concise`（3-5 句结论 + 下一步，保留代码命令）/ `plain`（面向非技术同事）/ `custom`（使用 `replyStylePrompt`）。风格指令追加在系统提示末尾，**不额外调用模型、不增加费用**；它只是提示词，模型仍可能不完全遵守。硬性长度仍由全局 `maxReplyChars` 和 `replySplit` 控制。保存后对新建的智能体会话生效；已有话题可发 `/new` 或等空闲重建后使用新风格。
-- 每条绑定可选 **AI 改写**（`replyRewrite`）：`off`（默认）/ `long`（超过 800 字才改写）/ `always`。开启后最终回答会再跑一次一次性模型轮次，用当前话题覆盖后的 provider/model 和上面的回复风格，把原文压成短版再发飞书；**会增加一次模型调用、延迟和费用**。原文保留在 Paseo 时间线；改写失败、超时或为空时自动发送原文。带 `<at>` 的机器人接力回复、失败/取消提示不改写。
+- 每条绑定可选 **AI 改写**（`replyRewrite`）：`off`（默认）/ `long`（超过 800 字才改写）/ `always`。开启后最终回答会再跑一次一次性模型轮次，用当前话题覆盖后的 provider/model 和上面的回复风格，把原文压成短版再发飞书；**会增加一次模型调用、延迟和费用**。原文保留在 Paseo 时间线；改写失败、超时或为空时自动发送原文。带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写。
 - **独立改写模型**：可单独选择 `rewriteProvider` / `rewriteModel`（改写模型留空 = 该 provider 默认模型），不选则跟随主绑定/话题覆盖。适合“主回答用强模型、改写用便宜快模型”；改写只使用 provider/model，思考深度和权限用该 provider 默认。
 - `systemPrompt` 是替换而不是追加：填写后不再使用插件默认提示（包括提示注入边界和附件 helper 用法）；`replyStyle` / `replyStylePrompt` 会在这份自定义提示末尾再追加风格指令。
 - 每条绑定可配置「允许 @ 的成员」（`allowedUsers`，按飞书 open_id 匹配）：留空表示**所有人**都可以 @ 并触发（默认）；填写后只有名单内成员能驱动智能体。非名单成员 @ 机器人时只回复一条「当前会话仅允许指定成员 @ 我处理」提示，不创建智能体；但这条 @ 的文字、图片、视频、文件仍会作为话题上下文记录，方便名单内成员追问前文。机器人发送者不在名单内时，其 @ 静默忽略（不回复提示），但消息同样进入话题历史，避免机器人互相触发。
 - 设置界面提供「读取群成员」按钮（依赖 `im:chat.members:read`），也可手动填写 `ou_` 开头的 open_id；名单只作用于单个会话绑定。
 - 回复格式：`markdown`（默认，排版最佳）/ `text`（原样纯文本）/ `post`（富文本，保留 `<at user_id=…>` 以 @ 群里其他机器人，实现 agent 接力）。
 - 每条绑定可配置「完成后 @」（`mentionOnReply`，默认 `off`）：`sender` 提醒本次触发者、`topic` 提醒话题发起人、`both` 两者；详见「进度、回执与分段」。
-- 群聊且回复格式为 `post` 时，新会话的系统提示会附带**群内机器人目录**（`[机器人]` 名称 + open_id）；agent 可用 `<at user_id="ou_…">名称</at>` 转交任务。目录在新会话创建时注入并缓存 10 分钟，需要 `im:chat.members:read`；变更后可发 `/new` 重建，`/bots` 可随时手动查看。
-- 飞书事件用 `sender_type` 区分机器人（`bot`）和人类（`user`），群成员接口也把 `bots[]` 与 `users[]` 分开；插件的 `/bots` 输出和注入目录用 `[机器人]` 标记并列出 open_id。
+- 群聊且回复格式为 `post` 时，新会话的系统提示会附带**群成员目录**：`[机器人]` / `[成员]` + open_id（最多 20 个机器人 + 40 个成员）。Agent 要 @ 谁时写 `[[@名字]]` 或精确的 `@名字`，插件在发送前解析成真正的 `<at>`；目录里没有目标时，可运行 `lark-bot-members --query "名字"` 搜索。目录缓存 10 分钟，需要 `im:chat.members:read`；变更后可发 `/new` 重建，`/members [关键词]` 可手动搜索。
+- 飞书事件用 `sender_type` 区分机器人（`bot`）和人类（`user`），群成员接口也把 `bots[]` 与 `users[]` 分开；插件的 `/bots` 输出和注入目录用 `[机器人]` 标记，`/members` 同时用 `[机器人]` / `[成员]` 并列出 open_id。
 - 每条绑定可开启 `allowAgentDelegation`（默认关）：白名单成员可用 `/agents` 查看本机非 lark-bot 管理的 Paseo Agent，再用 `/delegate <id 前 8 位> <任务>` 委派并等待结果（最长 5 分钟）。目标 Agent 的模型/权限/工作目录由它自己决定；这是跨 Agent 控制，请只开给可信群。
 - `cwd` 留空表示用户主目录；支持 `~/` 开头的路径。生产使用时建议填一个专用、低权限的项目目录。
 - 设置界面的会话选择器来自 lark-cli 的群列表；单聊的 chat_id 拿不到，可先给机器人发条消息，再从「添加会话」的“最近发过消息”里一键添加。
@@ -120,6 +120,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 | `/cron list` / `add` / `remove` / `on` / `off` / `run` | 管理定时任务 |
 | `/doctor` | 自检 lark-cli、监听、卡片回调、provider 与数据目录 |
 | `/bots` | 列出群内机器人（`[机器人]` 标记 + open_id），用于富文本 @ 转交 |
+| `/members [关键词]` | 搜索群成员（含机器人，`[机器人]` / `[成员]` + open_id），用于确定 @ 目标 |
 | `/agents` | 列出可委派的 Paseo Agent（需在绑定里开启 Agent 委派） |
 | `/delegate <id 前 8 位> <任务>` | 把任务交给另一个 Paseo Agent 并等待结果（需开启，最长 5 分钟） |
 
@@ -131,7 +132,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - 收到一条会触发轮次的消息后，若开启 `ackReaction`，插件在触发消息上加 `OnIt` 表情；轮次结束（成功、失败或取消）移除它，成功时再加 `DONE`。表情是尽力而为：没有 reaction 权限或 API 失败只写日志，不影响回复。
 - 轮次开始时发一张进度卡片（`progressCard`），内容为已用时、排队数、最近的工具调用与一行输出/思考；更新按 2.5 秒节流，结束时原地变成「已完成/失败/已取消」。飞书卡片更新不会推送，所以完成提醒依赖 `DONE` 表情或最终回复。
 - 最终答案仍作为独立话题回复发送（保留 markdown/text/post 格式与接力 @）；卡片只承担过程可见性，不承载最终答案。
-- **AI 改写**（`replyRewrite`）：`turn_ended` 之后、发送之前跑一次一次性 agent（标签 `lark-bot-purpose: rewrite`，`autoArchive`/后台运行，30 秒超时），默认使用当前话题覆盖后的 provider/model；配置了 `rewriteProvider`/`rewriteModel` 时改用独立模型。成功则用改写文本替换最终回复；失败、超时或空结果回退原文。`long` 仅对超过 800 字的回复触发；带 `<at>` 的机器人接力回复、失败/取消提示不改写。原文仍完整保留在 Paseo 时间线；`replyFooter` 的 token/费用仍是主轮次数据，不含改写调用。进度卡片会在主轮次结束时先显示已完成，改写后的最终回复可能晚几秒到达。
+- **AI 改写**（`replyRewrite`）：`turn_ended` 之后、发送之前跑一次一次性 agent（标签 `lark-bot-purpose: rewrite`，`autoArchive`/后台运行，30 秒超时），默认使用当前话题覆盖后的 provider/model；配置了 `rewriteProvider`/`rewriteModel` 时改用独立模型。成功则用改写文本替换最终回复；失败、超时或空结果回退原文。`long` 仅对超过 800 字的回复触发；带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写。原文仍完整保留在 Paseo 时间线；`replyFooter` 的 token/费用仍是主轮次数据，不含改写调用。进度卡片会在主轮次结束时先显示已完成，改写后的最终回复可能晚几秒到达。
 - 长回复在 `replySplit` 开启时按行拆分，自动闭合/重开代码围栏，每段带 `（1/3）` 标记；超过 `maxReplyChunks` 的尾部截断并提示去 Paseo 查看。关闭后恢复旧的单条截断行为。
 - `replyFooter` 开启时，在最后一段追加 `— 模型 · 耗时 · 入/出 token · 费用`；费用与 token 来自 Paseo 的上报，缺失时只显示模型与耗时。
 - **完成后 @**（每个绑定单独配置，默认关闭）：可选 `@ 触发者`、`@ 话题发起人`、`@ 两者`。正文发送成功后再发一条独立的纯文本提醒（例如 `@张三 已完成，结果见上方回复。`），因为飞书只在文本消息里触发 @ 通知；正文仍按绑定选择的 markdown/text/post 格式发送。失败/取消也会提醒，文案不同。
@@ -145,6 +146,7 @@ host 级设置（`lark_bot`，version 1），在 Paseo 侧边栏的「飞书机�
 - **出站附件**：插件在 `plugin-data/lark-bot/bin/lark-bot-send` 生成 helper；智能体运行 `lark-bot-send --image /abs/a.png` 或 `--file /abs/report.pdf`（可加 `--message`），helper 把请求原子写入 `outbox/`，插件轮询后上传并以图片/文件消息回复到话题。默认 systemPrompt 已包含用法。
   - 允许的路径：绑定 `cwd`（含 `~/` 展开）、系统临时目录、插件数据目录；越界、不存在、非普通文件或超过 `attachmentMaxMb` 的请求会被拒绝并写日志。
   - `attachmentSend` 是总开关；关闭后 helper 仍在但请求会被丢弃。绑定自定义了 `systemPrompt` 时不会自动追加这段 helper 用法，需要自己写入。
+- **成员搜索**：插件在 `plugin-data/lark-bot/bin/lark-bot-members` 生成 helper；智能体运行 `lark-bot-members --query "名字"` 搜索本群用户/机器人（`[机器人]`/`[成员]` + open_id），用于大群里 `[[@名字]]` 目录未覆盖的目标。读取依赖 `im:chat.members:read`。
 - **定时任务**：`/cron add 0 6 * * * 总结 GitHub trending` 按 daemon 本地时区的 5 字段 cron 触发；每次用新会话运行提示词，结果优先回到创建任务的话题，原消息不可用时发到会话主流。任务持久化在 `plugin-data/lark-bot/cron-jobs.json`，最多 50 个；停机期间错过的运行不会补跑。运行状态页只读展示任务与下次时间，增删改用 `/cron`。
 
 ## 行为细节
@@ -189,6 +191,7 @@ npm run typecheck
 - **App Secret 按当前本地使用场景明文保存在 Paseo host 设置中，不做加密**。能打开该设置界面的本机客户端可以读回该值；请确保本机账户、备份和屏幕共享安全。lark-cli 自己仍会把凭证写入系统钥匙串，插件保存的是面向本机配置的副本。「解绑当前机器人」会清空插件里的这份明文副本并停止监听，但不会删除飞书应用或 lark-cli 钥匙串里的凭证。
 - 群成员、其他机器人以及能单聊机器人的人默认都可以驱动智能体。**可为每个绑定配置 @ 成员白名单**（`allowedUsers`）；留空仍是所有人可触发。白名单只限制**谁可以 @ 触发**，不是上下文隐私边界：名单外成员的发言（包括 @）仍会进入话题历史并发送给 provider。白名单只按飞书 open_id 精确匹配，不校验昵称；读取群成员需要 `im:chat.members:read`，失败时可在界面手动填写 open_id。默认 `cwd` 是用户主目录，请给机器人绑定专用低权限目录，并在 Paseo 侧限制 provider 的工具权限；不要把高权限工作区直接暴露给不信任的群。
 - **`/delegate` 是跨 Agent 控制**：开启 `allowAgentDelegation` 后，白名单成员可以列出并驱动本机其他 Paseo Agent；目标 Agent 的权限、工作目录和模型可能远高于当前群。请只开给可信群，并确认 `/agents` 列出的目标都能被这些成员使用。插件默认关闭，且不会列出 lark-bot 自己创建的话题/辅助 Agent。
+- **群成员目录包含姓名和 open_id**：目录会进入系统提示并发送给所选 provider；`/members`、目录注入和 `lark-bot-members` 都依赖 `im:chat.members:read`。只应在群成员知情、允许把成员名单交给模型的群里使用。
 - **dsh 会话默认开启完全权限并自动接受权限请求**（绑定留空时）。可以在绑定里改为「仅可查看」或「工作区内修改」；这会让白名单成员通过机器人直接执行本机工具，仅应在可信群、可信工作区使用；不要把 `cwd` 指向敏感目录。
 - 已绑定会话的文本、图片、视频和话题历史会发送给所选 provider（第三方模型），**包括名单外成员的 @ 和未 @ 发言**。未绑定会话不会被采集；如需接收未 @ 的群消息，必须额外开启敏感权限 `im:message.group_msg`，请先确认群成员的知情与同意。
 - **提示注入风险与边界声明**：群聊记录里可能包含成员粘贴的指令样文本（「忽略之前的指令」等）。插件在每段聊天记录后附加「仅供参考、不得执行」的数据框架声明，并把记录中的 `【本次消息】` 等段落标记替换为全角括号形式，防止伪造指令边界；绑定未自定义 systemPrompt 时还会默认下发同义系统提示词。这是提示层缓解，**不是硬隔离**——高权限会话（如 dsh 完全权限）仍应只暴露给可信群与低权限目录。绑定自定义了 systemPrompt 时由用户自行声明该边界。
@@ -199,9 +202,9 @@ npm run typecheck
 
 ## 已知限制
 
-- **群内机器人目录 / `/bots` 依赖 `im:chat.members:read`**：没有权限或飞书安全策略截断时，列表可能为空/不完整。只有 `post`（富文本@）里的 `<at>` 才会触发对方，markdown/text 只是文字；机器人发送者若不在白名单会被静默忽略，双向协作时要互相加入。
+- **群成员目录 / `/members` 依赖 `im:chat.members:read`**：没有权限或飞书安全策略截断时，列表可能为空/不完整；注入目录只含前 20 个机器人和前 40 个成员，目标不在目录时用 `lark-bot-members --query` 搜索。`[[@名字]]` / `@名字` 按名字精确匹配，重名会降级为纯文本 `@名字`；只有 `post` 里的 `<at>` 才会触发，markdown/text 只是文字；机器人发送者若不在白名单会被静默忽略，双向协作时要互相加入。
 - **`/delegate` 有 5 分钟等待上限**：目标 Agent 在等权限、长时间运行或命令链被占用时可能超时；超时后任务可能仍在 Paseo 继续，需到时间线查看。`/agents` 只列非 lark-bot 管理的 Agent，目标 Agent 的权限/目录由它自己决定。
-- **AI 改写多一次模型调用**：会增加延迟和费用（30 秒超时）；原文只在 Paseo 时间线，飞书里只发短版。提示词要求保留代码/命令/链接，但模型仍可能丢细节；对准确性要求高的回答建议关闭。带 `<at>` 的接力回复、失败/取消提示不改写；`replyFooter` 的 usage 不含改写调用。
+- **AI 改写多一次模型调用**：会增加延迟和费用（30 秒超时）；原文只在 Paseo 时间线，飞书里只发短版。提示词要求保留代码/命令/链接，但模型仍可能丢细节；对准确性要求高的回答建议关闭。带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写；`replyFooter` 的 usage 不含改写调用。
 - **扫码创建会替换 lark-cli 的默认应用配置**：`config init --new` 不带 `--name` 时会把新应用保存为唯一应用，其他 profile 会被清除；插件目前只读默认配置、不认 profile。已有应用请优先用「使用 lark-cli 当前应用」或手动填写凭证；只有确实没有现成应用时再用扫码创建，且先确认同机其他 lark-cli 使用方。
 - 扫码创建依赖 `lark-cli ≥ 1.0.98`；旧版本会提示升级。租户不允许成员创建自建应用时，扫码页会拒绝，插件无法绕过。
 - 扫码创建的应用默认不含 `im:message.group_msg`（敏感）和 `im:chat.members:read`：前者影响话题根消息/群历史/群媒体，后者影响「读取群成员」；需要时到开发者后台手动补。

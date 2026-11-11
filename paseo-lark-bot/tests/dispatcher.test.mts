@@ -10,7 +10,7 @@ import type {
 import { questionCardToken } from "../server/question-card.ts";
 import type { RewriteReplyOptions } from "../server/rewrite.ts";
 import { DEFAULT_BOT_VALUES, type BotValues } from "../shared/settings.ts";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -455,6 +455,48 @@ describe("createDispatcher", () => {
     await flush();
     assert.match(h.replies[0]?.text ?? "", /已把任务交给/);
     assert.match(h.replies.at(-1)?.text ?? "", /已完成/);
+  });
+
+  it("resolves placeholder and plain @名字 mentions against the group directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-mentions-"));
+    const cli = join(dir, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args.includes("+chat-members-list")) {
+  console.log(JSON.stringify({
+    ok: true,
+    data: { users: [{ member_id: "ou_zhang", name: "张三" }], bots: [] },
+  }));
+  process.exit(0);
+}
+console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv" } }));
+`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const values = baseValues();
+      values.chats[0] = { ...values.chats[0], replyFormat: "post" };
+      const waitFor = async (predicate: () => boolean): Promise<void> => {
+        for (let i = 0; i < 100 && !predicate(); i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      };
+      const run = async (text: string): Promise<string> => {
+        const h = makeHarness(values, { resolveCli: () => cli });
+        await h.dispatch.handleMessageEvent(groupEvent());
+        await waitFor(() => h.created.length === 1);
+        assert.equal(h.created.length, 1);
+        h.dispatch.handleTurnEnded(turnEnded(h.agentId, text));
+        await waitFor(() => h.replies.length > 0);
+        return h.replies[0]?.text ?? "";
+      };
+      assert.match(await run("请 [[@张三]] 看一下"), /<at user_id="ou_zhang">张三<\/at>/);
+      assert.match(await run("请 @张三 看一下"), /<at user_id="ou_zhang">张三<\/at>/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("records unmatched chats and stays silent unless configured", async () => {

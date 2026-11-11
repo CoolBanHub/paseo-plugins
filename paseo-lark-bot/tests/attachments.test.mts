@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { installOutboxHelper, isInsideRoots, outboxRequestSchema } from "../server/attachments.ts";
+import { installMembersHelper, installOutboxHelper, isInsideRoots, outboxRequestSchema } from "../server/attachments.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -62,6 +62,29 @@ describe("attachment outbox helper", () => {
         execFileAsync(helper, ["--chat", "oc_chat", "--outbox", join(root, "outbox")]),
         /nothing to send/,
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("member search helper", () => {
+  it("searches users and bots through lark-cli", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lark-bot-members-"));
+    const cli = join(root, "fake-lark-cli");
+    writeFileSync(
+      cli,
+      `#!${process.execPath}\nconsole.log(JSON.stringify({ ok: true, data: { users: [{ member_id: "ou_zhang", name: "张三" }], bots: [{ member_id: "ou_bot", name: "OpsBot" }] } }));\n`,
+    );
+    chmodSync(cli, 0o755);
+    try {
+      const helper = installMembersHelper(root, process.execPath);
+      const { stdout } = await execFileAsync(helper, ["--query", "张"], {
+        env: { ...process.env, LARK_BOT_CHAT_ID: "oc_chat", LARK_BOT_CLI: cli },
+      });
+      assert.match(stdout, /\[成员\] 张三/);
+      assert.match(stdout, /ou_zhang/);
+      assert.doesNotMatch(stdout, /OpsBot/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

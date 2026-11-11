@@ -29,7 +29,7 @@ import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
 import { resolveFfmpeg } from "./server/media.ts";
-import { installOutboxHelper } from "./server/attachments.ts";
+import { installMembersHelper, installOutboxHelper } from "./server/attachments.ts";
 import { renderDoctorReport, runDoctorChecks } from "./server/doctor.ts";
 import {
   DSH_DEFAULT_PERMISSION,
@@ -123,6 +123,15 @@ function ensureDispatcher(
         error instanceof Error ? error.message : String(error),
       );
     }
+    let membersHelperPath: string | null = null;
+    try {
+      membersHelperPath = installMembersHelper(PLUGIN_DATA_ROOT, process.execPath);
+    } catch (error) {
+      console.log(
+        "[lark-bot] 群成员搜索 helper 安装失败",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     dispatcher = createDispatcher({
       dedupStorePath: join(PLUGIN_DATA_ROOT, "seen-message-ids.json"),
       topicStorePath: join(PLUGIN_DATA_ROOT, "topic-agents.json"),
@@ -131,6 +140,7 @@ function ensureDispatcher(
       pluginDataDir: PLUGIN_DATA_ROOT,
       attachmentOutboxDir: join(PLUGIN_DATA_ROOT, "outbox"),
       ...(helperPath ? { attachmentHelperPath: helperPath } : {}),
+      ...(membersHelperPath ? { membersHelperPath } : {}),
       cronStorePath: join(PLUGIN_DATA_ROOT, "cron-jobs.json"),
       paseo: api,
       readValues,

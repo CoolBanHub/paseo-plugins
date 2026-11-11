@@ -3,6 +3,7 @@ import type { LarkCardActionEvent, LarkMessageEvent } from "./lark-events.ts";
 import {
   addReaction,
   listChatBots,
+  listChatDirectory,
   readBotOpenId,
   readMessageDetail,
   readRawContent,
@@ -15,6 +16,7 @@ import {
   updateCard,
   uploadFile,
   uploadImage,
+  type LarkChatDirectoryEntry,
   type MessageDetail,
 } from "./lark.ts";
 import {
@@ -176,6 +178,8 @@ export interface DispatcherOptions {
   attachmentOutboxDir?: string;
   /** Absolute path of the generated lark-bot-send helper. */
   attachmentHelperPath?: string;
+  /** Absolute path of the generated lark-bot-members helper. */
+  membersHelperPath?: string;
   /** Persisted scheduled-task store; omitted means in-memory only. */
   cronStorePath?: string;
   now?: () => number;
@@ -262,7 +266,7 @@ export function createDispatcher(options: DispatcherOptions) {
   let cachedBotOpenId: string | null = null;
   let openIdLoaded = false;
   let warnedMissingCli = false;
-  let warnedBotDirectory = false;
+  let warnedMemberDirectory = false;
   // Latest inbound message per chat: fallback reply target for notices.
   const latestSeen = new Map<string, string>();
   /** Chat type per chat, so completion mentions stay out of p2p threads. */
@@ -426,18 +430,17 @@ export function createDispatcher(options: DispatcherOptions) {
     getWorkspacePerBinding: () => valuesCache.workspacePerBinding,
     getAttachmentHelperPath: () =>
       valuesCache.attachmentSend ? options.attachmentHelperPath ?? null : null,
-    getAttachmentEnv: (chatId, topicKey) =>
-      options.attachmentOutboxDir
-        ? {
-            LARK_BOT_CHAT_ID: chatId,
-            LARK_BOT_TOPIC: topicKey,
-            LARK_BOT_OUTBOX: options.attachmentOutboxDir,
-          }
-        : undefined,
-    getBotDirectory: (chatId, replyFormat) =>
+    getAttachmentEnv: (chatId, topicKey) => ({
+      LARK_BOT_CHAT_ID: chatId,
+      LARK_BOT_TOPIC: topicKey,
+      LARK_BOT_CLI: cliPathFor(valuesCache) ?? "",
+      ...(options.attachmentOutboxDir ? { LARK_BOT_OUTBOX: options.attachmentOutboxDir } : {}),
+    }),
+    getMemberDirectory: (chatId, replyFormat) =>
       replyFormat === "post" && chatTypes.get(chatId) === "group"
-        ? botDirectoryFor(chatId)
+        ? memberDirectoryFor(chatId).then((directory) => directory?.text ?? null)
         : Promise.resolve(null),
+    getMembersHelperPath: () => options.membersHelperPath ?? null,
     callbacks: {
       onReply: (chatId, messageId, outcome, topicKey) => {
         finishProgress(topicKey, outcome);
@@ -515,48 +518,127 @@ export function createDispatcher(options: DispatcherOptions) {
     return cliPath;
   }
 
-  const BOT_DIRECTORY_TTL_MS = 10 * 60_000;
-  const BOT_DIRECTORY_MAX = 100;
-  const botDirectoryCache = new Map<string, { text: string; at: number }>();
+  const MEMBER_DIRECTORY_TTL_MS = 10 * 60_000;
+  const MEMBER_DIRECTORY_MAX = 100;
+  const memberDirectoryCache = new Map<
+    string,
+    { entries: LarkChatDirectoryEntry[]; all: LarkChatDirectoryEntry[]; text: string; at: number }
+  >();
 
-  /** Bounded, short-lived group-bot directory for new session prompts. */
-  async function botDirectoryFor(chatId: string): Promise<string | null> {
+  function withDirectoryTimeout<T>(promise: Promise<T>, ms = 5_000): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("member directory timeout")), ms);
+        timer.unref?.();
+      }),
+    ]);
+  }
+
+  /** Bounded, short-lived user+bot directory for prompts and @ resolution. */
+  async function memberDirectoryFor(
+    chatId: string,
+  ): Promise<{
+    entries: LarkChatDirectoryEntry[];
+    all: LarkChatDirectoryEntry[];
+    text: string;
+  } | null> {
     const at = now();
-    const cached = botDirectoryCache.get(chatId);
-    if (cached && cached.at + BOT_DIRECTORY_TTL_MS > at) return cached.text || null;
+    const cached = memberDirectoryCache.get(chatId);
+    if (cached && cached.at + MEMBER_DIRECTORY_TTL_MS > at) {
+      return cached.text
+        ? { entries: cached.entries, all: cached.all, text: cached.text }
+        : null;
+    }
     const cliPath = cliPathFor(valuesCache);
     if (!cliPath) return null;
     try {
-      const bots = (await listChatBots(cliPath, chatId))
-        .filter((bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId)
-        .slice(0, 20);
-      if (bots.length === 0) {
-        botDirectoryCache.set(chatId, { text: "", at });
+      const all = (await withDirectoryTimeout(listChatDirectory(cliPath, chatId))).filter(
+        (entry) => !cachedBotOpenId || entry.openId !== cachedBotOpenId,
+      );
+      const bots = all.filter((entry) => entry.kind === "bot").slice(0, 20);
+      const users = all.filter((entry) => entry.kind === "user").slice(0, 40);
+      const entries = [...bots, ...users];
+      if (entries.length === 0) {
+        memberDirectoryCache.set(chatId, { entries: [], all: [], text: "", at });
         return null;
       }
+      const helper = options.membersHelperPath;
       const text = [
-        "### 群内机器人（不是人类）",
-        "以下成员是飞书机器人，可以用富文本 @ 转交任务：",
-        ...bots.map(
-          (bot) => `- [机器人] ${bot.name || "未命名机器人"} · open_id: \`${bot.openId}\``,
+        "### 群成员目录（仅用于 @）",
+        `以下是本群可 @ 的机器人和成员（${entries.length}${all.length > entries.length ? ` / 共 ${all.length}` : ""} 个）：`,
+        ...entries.map((entry) =>
+          entry.kind === "bot"
+            ? `- [机器人] ${entry.name || "未命名机器人"} · open_id: \`${entry.openId}\``
+            : `- [成员] ${entry.name || "未命名成员"} · open_id: \`${entry.openId}\``,
         ),
         "",
-        "需要它们处理时，在最终回复里写：`<at user_id=\"ou_xxx\">名称</at> 任务内容`。",
-        "只 @ 需要的机器人，不要 @ 自己或人类；当前绑定必须使用 post（富文本@）格式，@ 才会触发对方。",
+        "要 @ 谁时，在最终回复里写 [[@名字]]（例如 [[@OpsBot]] 或 [[@张三]]），也可以直接写 @名字（精确匹配），插件会换成真正的 @。",
+        helper
+          ? `如果这里没有目标，运行 \`${helper} --query "名字"\` 查 open_id，再用 <at user_id="ou_xxx">名字</at>。`
+          : "如果这里没有目标，请让用户提供目标成员的 open_id。",
+        "只 @ 需要的人，不要 @ 所有人；当前绑定必须是 post（富文本@）格式，@ 才会触发。",
       ].join("\n");
-      botDirectoryCache.set(chatId, { text, at });
-      if (botDirectoryCache.size > BOT_DIRECTORY_MAX) {
-        const oldest = botDirectoryCache.keys().next().value;
-        if (oldest) botDirectoryCache.delete(oldest);
+      memberDirectoryCache.set(chatId, { entries, all, text, at });
+      if (memberDirectoryCache.size > MEMBER_DIRECTORY_MAX) {
+        const oldest = memberDirectoryCache.keys().next().value;
+        if (oldest) memberDirectoryCache.delete(oldest);
       }
-      return text;
+      return { entries, all, text };
     } catch (error) {
-      if (!warnedBotDirectory) {
-        warnedBotDirectory = true;
-        log("读取群机器人目录失败", error instanceof Error ? error.message : String(error));
+      // Cache the failure for the TTL so every new session does not repeat a 5s wait.
+      memberDirectoryCache.set(chatId, { entries: [], all: [], text: "", at });
+      if (!warnedMemberDirectory) {
+        warnedMemberDirectory = true;
+        log("读取群成员目录失败", error instanceof Error ? error.message : String(error));
       }
       return null;
     }
+  }
+
+  /**
+   * Resolve [[@名字]] placeholders and exact plain @名字 into real <at> tags.
+   * The plain form is a convenience for models that ignore the placeholder;
+   * it only matches known, unique member names at a word/punctuation boundary.
+   */
+  async function resolveMemberMentions(text: string, chatId: string): Promise<string> {
+    if (!text.includes("@")) return text;
+    const directory = await memberDirectoryFor(chatId);
+    const visible = directory?.entries ?? [];
+    const all = directory?.all ?? visible;
+    let result = text.replace(/\[\[@([^\]\n]+)\]\]/g, (match, raw: string) => {
+      const name = raw.trim();
+      if (!name) return match;
+      const matches = all.filter((entry) => entry.name === name);
+      if (matches.length === 1) {
+        return `<at user_id="${matches[0]!.openId}">${escapeAtName(matches[0]!.name)}</at>`;
+      }
+      if (matches.length > 1) log(`@${name} 匹配到多个群成员，已降级为纯文本`);
+      return `@${name}`;
+    });
+    if (visible.length === 0) return result;
+    const counts = new Map<string, number>();
+    for (const entry of visible) {
+      if (entry.name) counts.set(entry.name, (counts.get(entry.name) ?? 0) + 1);
+    }
+    const names = [...counts.entries()]
+      .filter(([name, count]) => count === 1 && name.toLowerCase() !== "all")
+      .map(([name]) => name)
+      .sort((left, right) => right.length - left.length);
+    for (const name of names) {
+      const entry = visible.find((candidate) => candidate.name === name);
+      if (!entry) continue;
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(
+        `(^|[\\s（(，。！？、]|[\\u4e00-\\u9fff])@${escaped}(?=$|[\\s，。！？、）)])`,
+        "gu",
+      );
+      result = result.replace(
+        pattern,
+        `$1<at user_id="${entry.openId}">${escapeAtName(name)}</at>`,
+      );
+    }
+    return result;
   }
 
   function labelFor(senderId: string, senderType: string): string {
@@ -952,6 +1034,17 @@ export function createDispatcher(options: DispatcherOptions) {
         (await listChatBots(cliPath, event.chat_id)).filter(
           (bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId,
         ),
+      listMembers: async (query) => {
+        const needle = query.trim().toLowerCase();
+        return (await listChatDirectory(cliPath, event.chat_id))
+          .filter((entry) => !cachedBotOpenId || entry.openId !== cachedBotOpenId)
+          .filter(
+            (entry) =>
+              !needle ||
+              entry.name.toLowerCase().includes(needle) ||
+              entry.openId.toLowerCase().includes(needle),
+          );
+      },
       listAgents: async () => {
         const list = options.paseo.agents.list;
         if (!list) return [];
@@ -1926,6 +2019,9 @@ export function createDispatcher(options: DispatcherOptions) {
     const configured: ReplyFormat = binding?.replyFormat ?? "markdown";
     let format = configured;
     let body = text;
+    if (configured === "post" && body.includes("@")) {
+      body = await resolveMemberMentions(body, chatId);
+    }
     if (binding && meta && shouldRewriteReply(binding, body, meta.outcome)) {
       const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
       const rewriteProvider = binding.rewriteProvider.trim();

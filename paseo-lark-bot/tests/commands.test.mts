@@ -163,6 +163,22 @@ describe("command handlers", () => {
     assert.match(h.replies[0] ?? "", /<at user_id/);
   });
 
+  it("searches users and bots with /members", async () => {
+    const h = context({
+      command: { name: "members", args: "张" },
+      listMembers: async () => [
+        { openId: "ou_zhang", name: "张三", kind: "user" },
+        { openId: "ou_bot1", name: "OpsBot", kind: "bot", appId: "cli_ops" },
+      ],
+    });
+    await runCommand(h.value);
+    assert.match(h.replies[0] ?? "", /群成员（2）/);
+    assert.match(h.replies[0] ?? "", /\[成员\] 张三/);
+    assert.match(h.replies[0] ?? "", /\[机器人\] OpsBot/);
+    assert.match(h.replies[0] ?? "", /ou_zhang/);
+    assert.match(h.replies[0] ?? "", /\[\[@名字\]\]/);
+  });
+
   it("requires the binding toggle before listing or delegating agents", async () => {
     const h = context({ command: { name: "agents", args: "" } });
     await runCommand(h.value);
