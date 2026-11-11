@@ -203,6 +203,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               rewriteModel: "",
               replyFormat: "markdown",
               mentionOnReply: "off",
+              allowAgentDelegation: false,
             },
           ],
         };

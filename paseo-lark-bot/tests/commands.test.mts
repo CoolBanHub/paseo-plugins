@@ -21,6 +21,7 @@ const binding: ChatBinding = {
   rewriteModel: "",
   replyFormat: "markdown",
   mentionOnReply: "off",
+  allowAgentDelegation: false,
 };
 
 function context(overrides: Partial<CommandContext> = {}) {
@@ -148,5 +149,69 @@ describe("command handlers", () => {
     const h = context({ command: { name: "doctor", args: "" } });
     await runCommand(h.value);
     assert.equal(h.replies[0], "doctor ok");
+  });
+
+  it("lists group bots with an explicit bot marker and open_id", async () => {
+    const h = context({
+      command: { name: "bots", args: "" },
+      listBots: async () => [{ openId: "ou_bot1", name: "OpsBot", appId: "cli_ops" }],
+    });
+    await runCommand(h.value);
+    assert.match(h.replies[0] ?? "", /群内机器人（1）/);
+    assert.match(h.replies[0] ?? "", /\[机器人\] OpsBot/);
+    assert.match(h.replies[0] ?? "", /ou_bot1/);
+    assert.match(h.replies[0] ?? "", /<at user_id/);
+  });
+
+  it("requires the binding toggle before listing or delegating agents", async () => {
+    const h = context({ command: { name: "agents", args: "" } });
+    await runCommand(h.value);
+    assert.match(h.replies[0] ?? "", /未开启 Agent 委派/);
+
+    const delegate = context({ command: { name: "delegate", args: "agent-2 做点事" } });
+    await runCommand(delegate.value);
+    assert.match(delegate.replies[0] ?? "", /未开启 Agent 委派/);
+  });
+
+  it("lists delegatable Paseo agents and resolves a short id", async () => {
+    const agents = [
+      { id: "aaaaaaaa-1111-2222", title: "修复登录", provider: "dsh", model: "m", status: "idle" },
+      { id: "bbbbbbbb-3333-4444", title: "代码审查", provider: "codex", status: "running" },
+    ];
+    const h = context({
+      command: { name: "agents", args: "" },
+      binding: { ...binding, allowAgentDelegation: true },
+      listAgents: async () => agents,
+    });
+    await runCommand(h.value);
+    assert.match(h.replies[0] ?? "", /可委派的 Paseo Agent（2）/);
+    assert.match(h.replies[0] ?? "", /aaaaaaaa/);
+    assert.match(h.replies[0] ?? "", /修复登录/);
+
+    let seen: { id: string; task: string } | null = null;
+    const delegate = context({
+      command: { name: "delegate", args: "aaaaaaaa 帮我跑测试" },
+      binding: { ...binding, allowAgentDelegation: true },
+      listAgents: async () => agents,
+      delegateAgent: async (id, task) => {
+        seen = { id, task };
+        return { status: "idle", error: null, lastMessage: "测试全部通过" };
+      },
+    });
+    await runCommand(delegate.value);
+    assert.deepEqual(seen, { id: "aaaaaaaa-1111-2222", task: "帮我跑测试" });
+    assert.match(delegate.replies[0] ?? "", /已把任务交给/);
+    assert.match(delegate.replies.at(-1) ?? "", /测试全部通过/);
+  });
+
+  it("reports a delegated agent waiting for permission", async () => {
+    const h = context({
+      command: { name: "delegate", args: "agent-2 跑一下" },
+      binding: { ...binding, allowAgentDelegation: true },
+      listAgents: async () => [{ id: "agent-2", title: "Ops", provider: "dsh", status: "idle" }],
+      delegateAgent: async () => ({ status: "permission", error: null, lastMessage: null }),
+    });
+    await runCommand(h.value);
+    assert.match(h.replies.at(-1) ?? "", /等待权限确认/);
   });
 });

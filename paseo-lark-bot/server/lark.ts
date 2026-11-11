@@ -381,6 +381,52 @@ export async function listChatMembers(cliPath: string, chatId: string): Promise<
   return members;
 }
 
+export interface LarkChatBot {
+  openId: string;
+  name: string;
+  /** App id (`cli_…`) when the member payload carries one. */
+  appId?: string;
+}
+
+/** Bots in a chat, for agent-to-agent @ handoff discovery. */
+export async function listChatBots(cliPath: string, chatId: string): Promise<LarkChatBot[]> {
+  const payload = await runCli(
+    cliPath,
+    [
+      "im",
+      "+chat-members-list",
+      "--chat-id",
+      chatId,
+      "--member-types",
+      "bot",
+      "--page-all",
+      "--format",
+      "json",
+    ],
+    "拉取群机器人",
+  );
+  // The shortcut returns separate users[] / bots[] buckets; bots also expose
+  // an open_id suitable for <at user_id="…"> mentions.
+  const items = (payload.data as { bots?: unknown } | undefined)?.bots;
+  if (!Array.isArray(items)) return [];
+  const bots: LarkChatBot[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const openId = record.member_id;
+    const name = record.name;
+    const appId = record.app_id ?? record.bot_id;
+    if (typeof openId === "string" && openId.startsWith("ou_")) {
+      bots.push({
+        openId,
+        name: typeof name === "string" ? name : "",
+        ...(typeof appId === "string" && appId ? { appId } : {}),
+      });
+    }
+  }
+  return bots;
+}
+
 export interface ReplyOptions {
   /** Stable per logical reply; lets a retry never duplicate a send. */
   idempotencyKey?: string;

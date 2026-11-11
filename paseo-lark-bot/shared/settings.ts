@@ -201,6 +201,8 @@ export const chatBindingSchema = z.object({
   replyFormat: replyFormatSchema.default("markdown"),
   /** Who to @ in the group after the turn finishes. */
   mentionOnReply: mentionOnReplySchema.default("off"),
+  /** Allow whitelisted members to use /agents and /delegate. */
+  allowAgentDelegation: z.boolean().default(false),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;

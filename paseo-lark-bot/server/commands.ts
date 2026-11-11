@@ -1,5 +1,11 @@
 import { DSH_DEFAULT_PERMISSION, DSH_PERMISSION_OPTIONS, isDshProvider, type BotValues, type ChatBinding } from "../shared/settings.ts";
-import type { SessionProviderSnapshot, TopicOverrides } from "./sessions.ts";
+import type {
+  SessionAgentSummary,
+  SessionProviderSnapshot,
+  SessionRunResult,
+  TopicOverrides,
+} from "./sessions.ts";
+import type { LarkChatBot } from "./lark.ts";
 import { formatCronTime, nextCronTime } from "./cron.ts";
 import type { CronScheduler, CronJob } from "./cron.ts";
 
@@ -40,6 +46,12 @@ const ALIASES: Record<string, string> = {
   定时: "cron",
   doctor: "doctor",
   诊断: "doctor",
+  bots: "bots",
+  机器人: "bots",
+  agents: "agents",
+  智能体: "agents",
+  delegate: "delegate",
+  委派: "delegate",
 };
 
 /** Parse `/name args`; returns null for non-command messages. */
@@ -65,6 +77,9 @@ export function commandHelp(): string {
     "`/stop` 清空本话题的排队消息（不会中断 Paseo 中已开始的轮次）",
     "`/cron list` 查看定时任务；`/cron add 0 6 * * * 总结 GitHub trending` 新建",
     "`/cron remove|on|off|run <id>` 管理定时任务",
+    "`/bots` 查看群内机器人及其 open_id（用富文本 @ 转交任务）",
+    "`/agents` 列出可委派的 Paseo Agent（需在绑定里开启 Agent 委派）",
+    "`/delegate <id|前缀> <任务>` 把任务交给其他 Paseo Agent 并等待结果（需开启）",
     "`/doctor` 自检 lark-cli、监听、卡片回调与 provider",
     "`/help` 显示这份帮助",
   ].join("\n");
@@ -97,6 +112,11 @@ export interface CommandContext {
   helperPath: string | null;
   attachmentMaxMb: number;
   doctor: () => Promise<string>;
+  /** Group bots for /bots; omitted when the host cannot list members. */
+  listBots?: () => Promise<LarkChatBot[]>;
+  /** Paseo agents for /agents and /delegate; omitted on older hosts. */
+  listAgents?: () => Promise<SessionAgentSummary[]>;
+  delegateAgent?: (agentId: string, task: string) => Promise<SessionRunResult>;
   resetSession: (options: { clearOverrides: boolean }) => void;
   stopQueue: () => number;
   setOverrides: (patch: TopicOverrides) => void;
@@ -303,6 +323,15 @@ export async function runCommand(context: CommandContext): Promise<void> {
       await reply(`已切换思考深度为 \`${args}\`，下一条消息在新会话中生效。发送 \`/reset\` 恢复绑定默认。`);
       return;
     }
+    case "bots":
+      await runBotsCommand(context);
+      return;
+    case "agents":
+      await runAgentsCommand(context);
+      return;
+    case "delegate":
+      await runDelegateCommand(context, args);
+      return;
     case "cron":
       await runCronCommand(context, args);
       return;
@@ -312,6 +341,152 @@ export async function runCommand(context: CommandContext): Promise<void> {
     default:
       await reply(`未知命令 \`/${command.name}\`。\n\n` + commandHelp());
   }
+}
+
+async function runBotsCommand(context: CommandContext): Promise<void> {
+  const { reply } = context;
+  if (!context.listBots) {
+    await reply("当前宿主不支持读取群机器人。");
+    return;
+  }
+  try {
+    const bots = await context.listBots();
+    if (bots.length === 0) {
+      await reply("没有读到其他机器人；可能需要 `im:chat.members:read` 权限，或群里只有我自己。");
+      return;
+    }
+    const lines = bots.slice(0, 20).map((bot, index) => {
+      const name = bot.name || `机器人${index + 1}`;
+      return `- [机器人] ${name} · \`${bot.openId}\`${bot.appId ? ` · app \`${bot.appId}\`` : ""}`;
+    });
+    if (bots.length > 20) lines.push(`…还有 ${bots.length - 20} 个未列出。`);
+    await reply(
+      [
+        `**群内机器人（${bots.length}）**`,
+        ...lines,
+        "",
+        "要让它们干活：绑定「回复格式」选 `post`（富文本@），在回复里写 `<at user_id=\"ou_xxx\">名称</at> 任务内容`。",
+      ].join("\n"),
+    );
+  } catch (error) {
+    await reply(`读取群机器人失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function runAgentsCommand(context: CommandContext): Promise<void> {
+  const { reply } = context;
+  if (!context.binding.allowAgentDelegation) {
+    await reply("本会话未开启 Agent 委派。可在绑定的「会话设置」里打开「允许 /delegate 调用其他 Paseo Agent」。");
+    return;
+  }
+  if (!context.listAgents) {
+    await reply("当前宿主不支持列出 Paseo Agent。");
+    return;
+  }
+  try {
+    const agents = (await context.listAgents()).filter((agent) => agent.id !== context.session.agentId);
+    if (agents.length === 0) {
+      await reply("没有可委派的 Paseo Agent（本插件的话题会话和辅助会话已排除）。");
+      return;
+    }
+    const lines = agents.slice(0, 20).map((agent, index) => {
+      const title = agent.title || `Agent ${index + 1}`;
+      const provider = agent.provider || "unknown";
+      const model = agent.model && !provider.includes("/") ? `/${agent.model}` : "";
+      const status = agent.status || "unknown";
+      return `- \`${agent.id.slice(0, 8)}\` · ${title} · ${provider}${model} · ${status}`;
+    });
+    if (agents.length > 20) lines.push(`…还有 ${agents.length - 20} 个未列出。`);
+    await reply(
+      [
+        `**可委派的 Paseo Agent（${agents.length}）**`,
+        ...lines,
+        "",
+        "用 `/delegate <id 前 8 位> <任务>` 派活；目标 Agent 的权限和工作目录由它自己决定。",
+      ].join("\n"),
+    );
+  } catch (error) {
+    await reply(`读取 Agent 列表失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function runDelegateCommand(context: CommandContext, args: string): Promise<void> {
+  const { reply } = context;
+  if (!context.binding.allowAgentDelegation) {
+    await reply("本会话未开启 Agent 委派。可在绑定的「会话设置」里打开「允许 /delegate 调用其他 Paseo Agent」。");
+    return;
+  }
+  if (!context.listAgents || !context.delegateAgent) {
+    await reply("当前宿主不支持把任务委派给 Paseo Agent。");
+    return;
+  }
+  const [targetArg, ...rest] = args.split(/\s+/).filter(Boolean);
+  const task = rest.join(" ");
+  if (!targetArg || !task) {
+    await reply("用法：`/delegate <id 或前 8 位> <任务>`。先发 `/agents` 查看可委派的 Agent。");
+    return;
+  }
+
+  let agents: SessionAgentSummary[];
+  try {
+    agents = (await context.listAgents()).filter((agent) => agent.id !== context.session.agentId);
+  } catch (error) {
+    await reply(`读取 Agent 列表失败：${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const normalized = targetArg.toLowerCase();
+  const exact = agents.find((agent) => agent.id === targetArg);
+  const matches = exact
+    ? [exact]
+    : agents.filter(
+        (agent) =>
+          agent.id.startsWith(targetArg) || (agent.title ?? "").toLowerCase() === normalized,
+      );
+  if (matches.length === 0) {
+    await reply(`没有找到 Agent \`${targetArg}\`。发送 \`/agents\` 查看可用列表。`);
+    return;
+  }
+  if (matches.length > 1) {
+    const lines = matches.slice(0, 10).map((agent) => `- \`${agent.id.slice(0, 8)}\` · ${agent.title || "未命名"}`);
+    await reply([`\`${targetArg}\` 匹配到多个 Agent，请用更长的 id：`, ...lines].join("\n"));
+    return;
+  }
+  const target = matches[0]!;
+  if (target.id === context.session.agentId) {
+    await reply("不能把任务委派给当前正在处理这条消息的 Agent。");
+    return;
+  }
+
+  const title = target.title || target.id.slice(0, 8);
+  await reply(
+    `已把任务交给 **${title}**（\`${target.id.slice(0, 8)}\`）${target.status === "running" ? "，它当前在忙，任务会排队" : ""}，等待完成…`,
+  );
+  let result: SessionRunResult;
+  try {
+    result = await context.delegateAgent(target.id, task);
+  } catch (error) {
+    await reply(`委派失败：${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (result.status === "idle") {
+    await reply(
+      result.lastMessage
+        ? `**${title} 已完成**\n\n${result.lastMessage}`
+        : `**${title} 已完成**，但没有返回文本；可到 Paseo 查看它的时间线。`,
+    );
+    return;
+  }
+  if (result.status === "permission") {
+    await reply(
+      `**${title}** 正在等待权限确认，请到 Paseo 处理；本次没有拿到最终回复，处理后可重新发送 /delegate 或查看它的时间线。`,
+    );
+    return;
+  }
+  if (result.status === "timeout") {
+    await reply(`等待 **${title}** 超时；任务可能仍在运行，可到 Paseo 查看时间线。`);
+    return;
+  }
+  await reply(`**${title}** 执行失败：${result.error || "未知错误"}`);
 }
 
 async function runCronCommand(context: CommandContext, args: string): Promise<void> {

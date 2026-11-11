@@ -6,6 +6,7 @@ import {
   isDshProvider,
   replyStyleInstruction,
   type ChatBinding,
+  type ReplyFormat,
 } from "../shared/settings.ts";
 import { isMissingAgentError, isTransientTurnError, sanitizeTopicText } from "./format.ts";
 import { generateTopicTitle } from "./title.ts";
@@ -107,6 +108,7 @@ function providerCreateConfig(
   overrides: TopicOverrides,
   helperPath: string | null,
   attachmentContext?: { chatId: string; topicKey: string },
+  botDirectory?: string | null,
 ): {
   provider: string;
   systemPrompt?: string;
@@ -118,6 +120,9 @@ function providerCreateConfig(
   const permission = overrides.permission ?? binding.permission;
   const basePrompt = binding.systemPrompt?.trim() || defaultSystemPrompt(helperPath, attachmentContext);
   const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
+  const promptParts = [basePrompt];
+  if (styleInstruction) promptParts.push(`### 回复风格\n${styleInstruction}`);
+  if (botDirectory) promptParts.push(botDirectory);
   const config: {
     provider: string;
     systemPrompt?: string;
@@ -126,7 +131,7 @@ function providerCreateConfig(
     featureValues?: Record<string, unknown>;
   } = {
     provider,
-    systemPrompt: styleInstruction ? `${basePrompt}\n\n### 回复风格\n${styleInstruction}` : basePrompt,
+    systemPrompt: promptParts.join("\n\n"),
   };
 
   if (isDshProvider(provider)) {
@@ -213,8 +218,20 @@ export interface SessionTimelineHandle {
   subscribe?(handler: (event: unknown) => void): { unsubscribe?: () => void };
 }
 
+/** Narrow agent snapshot used by the `/agents` and `/delegate` commands. */
+export interface SessionAgentSummary {
+  id: string;
+  title?: string | null;
+  provider?: string;
+  model?: string | null;
+  status?: string;
+  labels?: Record<string, string>;
+}
+
 export interface SessionPaseoApi {
   agents: {
+    /** Optional: older hosts/test fakes may not expose agent enumeration. */
+    list?(): Promise<{ entries: Array<{ agent: SessionAgentSummary }> }>;
     create(options: {
       config: {
         provider: string;
@@ -533,6 +550,11 @@ export function createSessionRegistry(options: {
   getAttachmentHelperPath?: () => string | null;
   /** Per-agent env for the attachment helper (chat/topic/outbox). */
   getAttachmentEnv?: (chatId: string, topicKey: string) => Record<string, string> | undefined;
+  /**
+   * Optional group-bot directory (names + open_ids) appended to a new
+   * session's system prompt so the agent can @ other bots by open_id.
+   */
+  getBotDirectory?: (chatId: string, replyFormat: ReplyFormat) => Promise<string | null>;
 }) {
   const resolveProvider =
     options.resolveProvider ??
@@ -1214,6 +1236,14 @@ export function createSessionRegistry(options: {
     // daemon / failure), fall back to a standalone create() with the cwd.
     const workspace = await workspaceForAgent(item, cwd);
     const attachmentEnv = options.getAttachmentEnv?.(state.chatId, topicKey);
+    let botDirectory: string | null = null;
+    if (effective.replyFormat === "post") {
+      try {
+        botDirectory = (await options.getBotDirectory?.(state.chatId, effective.replyFormat)) ?? null;
+      } catch {
+        botDirectory = null;
+      }
+    }
     const agentOptions = {
       config: providerCreateConfig(
         provider,
@@ -1221,6 +1251,7 @@ export function createSessionRegistry(options: {
         state.overrides,
         options.getAttachmentHelperPath?.() ?? null,
         { chatId: state.chatId, topicKey },
+        botDirectory,
       ),
       title: await resolveTitle(topicKey, item, provider, cwd),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },

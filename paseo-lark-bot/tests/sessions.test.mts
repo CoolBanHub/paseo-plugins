@@ -78,6 +78,7 @@ const binding: ChatBinding = {
   rewriteModel: "",
   replyFormat: "markdown",
   mentionOnReply: "off",
+  allowAgentDelegation: false,
 };
 
 function makeHarness(
@@ -88,6 +89,7 @@ function makeHarness(
     turnRetryDelaysMs?: number[];
     stuckBusyMs?: number;
     workspacePerBinding?: boolean;
+    getBotDirectory?: (chatId: string, replyFormat: string) => Promise<string | null>;
   },
 ): Harness {
   const replies: ReplyCall[] = [];
@@ -189,6 +191,7 @@ function makeHarness(
     getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
     getWorkspacePerBinding: () => options?.workspacePerBinding ?? false,
+    getBotDirectory: options?.getBotDirectory,
     turnRetryDelaysMs: options?.turnRetryDelaysMs,
     stuckBusyMs: options?.stuckBusyMs,
     callbacks: {
@@ -1353,6 +1356,21 @@ describe("default system prompt", () => {
     });
     await flush();
     assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);
+  });
+
+  it("appends the group bot directory to new post sessions", async () => {
+    const h = makeHarness({
+      getBotDirectory: async () => "### 群内机器人（不是人类）\n- [机器人] OpsBot · open_id: `ou_bot`",
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      replyFormat: "post",
+    });
+    await flush();
+    const prompt = h.created[0].config.systemPrompt ?? "";
+    assert.match(prompt, /群内机器人/);
+    assert.match(prompt, /OpsBot/);
+    assert.match(prompt, /ou_bot/);
   });
 });
 

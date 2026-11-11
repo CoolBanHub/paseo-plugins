@@ -50,6 +50,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         rewriteModel: "",
         replyFormat: "markdown",
         mentionOnReply: "off",
+        allowAgentDelegation: false,
       },
     ],
     ...overrides,
@@ -418,6 +419,42 @@ describe("createDispatcher", () => {
     h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始回答"));
     await flush();
     assert.equal(h.replies[0].text, "原始回答");
+  });
+
+  it("wires /agents and /delegate to the Paseo agent API", async () => {
+    const values = baseValues();
+    values.chats[0] = { ...values.chats[0], allowAgentDelegation: true };
+    const h = makeHarness(values);
+    h.paseoRef.agents.list = async () => ({
+      entries: [
+        {
+          agent: {
+            id: "aaaaaaaa-1111-2222",
+            title: "修复登录",
+            provider: "dsh",
+            model: "m",
+            status: "idle",
+          },
+        },
+      ],
+    });
+    h.paseoRef.agents.ref = (id) => ({
+      id,
+      send: async () => {},
+      run: async () => ({ status: "idle", error: null, lastMessage: "已完成" }),
+    });
+
+    await h.dispatch.handleMessageEvent(groupEvent({ content: "@_user_1 /agents" }));
+    await flush();
+    assert.match(h.replies[0]?.text ?? "", /修复登录/);
+
+    h.replies.length = 0;
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_2", content: "@_user_1 /delegate aaaaaaaa 跑测试" }),
+    );
+    await flush();
+    assert.match(h.replies[0]?.text ?? "", /已把任务交给/);
+    assert.match(h.replies.at(-1)?.text ?? "", /已完成/);
   });
 
   it("records unmatched chats and stays silent unless configured", async () => {
@@ -1352,6 +1389,7 @@ describe("p2p and delivery hygiene", () => {
         rewriteModel: "",
         replyFormat: "markdown",
         mentionOnReply: "off",
+        allowAgentDelegation: false,
       },
     ],
   });
@@ -2208,6 +2246,7 @@ describe("completion mentions", () => {
       chatId: "oc_p2p",
       chatName: "私聊",
       mentionOnReply: "sender",
+      allowAgentDelegation: false,
     };
     const h = makeHarness(values, {
       readThreadRootDetail: async () => ({ text: null, senderOpenId: "ou_user", senderName: "张三" }),

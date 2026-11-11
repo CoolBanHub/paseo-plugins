@@ -2,6 +2,7 @@ import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { LarkCardActionEvent, LarkMessageEvent } from "./lark-events.ts";
 import {
   addReaction,
+  listChatBots,
   readBotOpenId,
   readMessageDetail,
   readRawContent,
@@ -261,6 +262,7 @@ export function createDispatcher(options: DispatcherOptions) {
   let cachedBotOpenId: string | null = null;
   let openIdLoaded = false;
   let warnedMissingCli = false;
+  let warnedBotDirectory = false;
   // Latest inbound message per chat: fallback reply target for notices.
   const latestSeen = new Map<string, string>();
   /** Chat type per chat, so completion mentions stay out of p2p threads. */
@@ -432,6 +434,10 @@ export function createDispatcher(options: DispatcherOptions) {
             LARK_BOT_OUTBOX: options.attachmentOutboxDir,
           }
         : undefined,
+    getBotDirectory: (chatId, replyFormat) =>
+      replyFormat === "post" && chatTypes.get(chatId) === "group"
+        ? botDirectoryFor(chatId)
+        : Promise.resolve(null),
     callbacks: {
       onReply: (chatId, messageId, outcome, topicKey) => {
         finishProgress(topicKey, outcome);
@@ -507,6 +513,50 @@ export function createDispatcher(options: DispatcherOptions) {
       log("找不到 lark-cli（可在设置里填写 larkCliPath）");
     }
     return cliPath;
+  }
+
+  const BOT_DIRECTORY_TTL_MS = 10 * 60_000;
+  const BOT_DIRECTORY_MAX = 100;
+  const botDirectoryCache = new Map<string, { text: string; at: number }>();
+
+  /** Bounded, short-lived group-bot directory for new session prompts. */
+  async function botDirectoryFor(chatId: string): Promise<string | null> {
+    const at = now();
+    const cached = botDirectoryCache.get(chatId);
+    if (cached && cached.at + BOT_DIRECTORY_TTL_MS > at) return cached.text || null;
+    const cliPath = cliPathFor(valuesCache);
+    if (!cliPath) return null;
+    try {
+      const bots = (await listChatBots(cliPath, chatId))
+        .filter((bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId)
+        .slice(0, 20);
+      if (bots.length === 0) {
+        botDirectoryCache.set(chatId, { text: "", at });
+        return null;
+      }
+      const text = [
+        "### 群内机器人（不是人类）",
+        "以下成员是飞书机器人，可以用富文本 @ 转交任务：",
+        ...bots.map(
+          (bot) => `- [机器人] ${bot.name || "未命名机器人"} · open_id: \`${bot.openId}\``,
+        ),
+        "",
+        "需要它们处理时，在最终回复里写：`<at user_id=\"ou_xxx\">名称</at> 任务内容`。",
+        "只 @ 需要的机器人，不要 @ 自己或人类；当前绑定必须使用 post（富文本@）格式，@ 才会触发对方。",
+      ].join("\n");
+      botDirectoryCache.set(chatId, { text, at });
+      if (botDirectoryCache.size > BOT_DIRECTORY_MAX) {
+        const oldest = botDirectoryCache.keys().next().value;
+        if (oldest) botDirectoryCache.delete(oldest);
+      }
+      return text;
+    } catch (error) {
+      if (!warnedBotDirectory) {
+        warnedBotDirectory = true;
+        log("读取群机器人目录失败", error instanceof Error ? error.message : String(error));
+      }
+      return null;
+    }
   }
 
   function labelFor(senderId: string, senderType: string): string {
@@ -898,6 +948,25 @@ export function createDispatcher(options: DispatcherOptions) {
       helperPath: options.attachmentHelperPath ?? null,
       attachmentMaxMb: values.attachmentMaxMb,
       doctor,
+      listBots: async () =>
+        (await listChatBots(cliPath, event.chat_id)).filter(
+          (bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId,
+        ),
+      listAgents: async () => {
+        const list = options.paseo.agents.list;
+        if (!list) return [];
+        const result = await list();
+        return result.entries
+          .map((entry) => entry.agent)
+          .filter(
+            (agent) =>
+              !agent.labels?.["lark-bot-purpose"] && !agent.labels?.["lark-bot-chat"],
+          );
+      },
+      delegateAgent: async (agentId, task) => {
+        const handle = options.paseo.agents.ref(agentId);
+        return handle.run(task, { timeoutMs: 5 * 60_000 });
+      },
       resetSession: ({ clearOverrides }) => {
         const tracker = progressByTopic.get(topicKey);
         if (tracker) {

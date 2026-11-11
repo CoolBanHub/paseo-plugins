@@ -13,6 +13,7 @@ import {
   ChoicePill,
   FieldLabel,
   PrimaryButton,
+  ToggleRow,
   colors,
   inputStyle,
 } from "./widgets.tsx";
@@ -443,6 +444,9 @@ export function BindingEditor({
             />
           ))}
         </View>
+        <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
+          {"post 会保留 `<at>`，并在新会话提示里附带群内机器人目录；markdown/text 不会触发 @。"}
+        </Text>
         <FieldLabel text="完成后 @ 谁（仅群聊）" />
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {MENTION_ON_REPLY_OPTIONS.map((option) => (
@@ -458,6 +462,12 @@ export function BindingEditor({
           {MENTION_ON_REPLY_OPTIONS.find((option) => option.value === binding.mentionOnReply)?.hint ?? ""}
           完成提醒以独立的纯文本消息发送（飞书只在文本消息里触发 @ 通知），不会影响正文格式；读取不到发送者姓名时会跳过 @。
         </Text>
+        <ToggleRow
+          label="允许 /delegate 调用其他 Paseo Agent"
+          hint="白名单成员可把任务转给本机其他 agent；目标 agent 的权限和目录由它自己决定，请只开给可信群"
+          value={binding.allowAgentDelegation}
+          onChange={(value) => onPatch({ allowAgentDelegation: value })}
+        />
       </Card>
     </ScrollView>
   );

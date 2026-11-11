@@ -21,6 +21,7 @@ describe("chat binding schema", () => {
     assert.equal(binding.replyRewrite, "off");
     assert.equal(binding.rewriteProvider, "");
     assert.equal(binding.rewriteModel, "");
+    assert.equal(binding.allowAgentDelegation, false);
     assert.equal(binding.replyFormat, "markdown");
   });
 
