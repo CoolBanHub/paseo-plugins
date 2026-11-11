@@ -1089,7 +1089,7 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!record) {
       return "本话题还没有登记到问题跟踪表。确认是问题或需求后，管理员可在设置里开启采集，或直接到跟踪表补录。";
     }
-    const config = await options.issueTracker?.config(values);
+    const config = await options.issueTracker?.config(record.chatId, values);
     const link = config ? issueRecordUrl(config, record.recordId) : "";
     return [
       `**${record.title || "未命名话题"}**`,

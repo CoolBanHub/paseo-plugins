@@ -103,6 +103,12 @@ export const issueBaseConfigSchema = z.object({
 });
 export type IssueBaseConfig = z.output<typeof issueBaseConfigSchema>;
 
+/** Per-chat auto-created Base coordinates; explicit binding fields win. */
+const baseStoreSchema = z.object({
+  version: z.number().default(1),
+  bases: z.record(z.string(), issueBaseConfigSchema).default({}),
+});
+
 const issueRecordSchema = z.object({
   recordId: z.string().min(1),
   chatId: z.string().min(1),
@@ -111,6 +117,9 @@ const issueRecordSchema = z.object({
   requesterOpenId: z.string().nullable().default(null),
   title: z.string().default(""),
   status: z.enum(ISSUE_STATUSES).default("待处理"),
+  /** Base that owns this record; survives a later binding re-point. */
+  baseToken: z.string().default(""),
+  tableId: z.string().default(""),
   lastActiveAt: z.number().default(0),
   messageCount: z.number().default(1),
   updatedAt: z.number().default(0),
@@ -142,7 +151,11 @@ export interface IssueTrackerOptions {
   readValues: () => Promise<BotValues>;
   /** Topic → record mapping; omitted keeps the mapping in memory only. */
   storePath?: string;
-  /** Auto-created Base coordinates; settings values take precedence. */
+  /**
+   * Per-chat auto-created Base coordinates (`{ bases: { chatId: config } }`).
+   * Explicit binding fields win; this file keeps auto-created tables usable
+   * before the settings screen saves them.
+   */
   baseStorePath?: string;
   now?: () => number;
   log?: (message: string, detail?: unknown) => void;
@@ -188,11 +201,12 @@ export interface IssueTracker {
   ): Promise<IssueQueryResult>;
   recordFor(recordId: string): IssueRecord | null;
   recordForTopic(chatId: string, topicKey: string): IssueRecord | null;
-  config(values?: BotValues): Promise<IssueBaseConfig | null>;
+  /** The one ledger for this chat (binding config first, auto-created next). */
+  config(chatId: string, values?: BotValues): Promise<IssueBaseConfig | null>;
   /** Create the fixed ledger with the bot identity and grant chat access. */
   createBase(values: BotValues, chatIds?: string[]): Promise<IssueBaseConfig>;
-  /** Validate that an existing table has every required field. */
-  verifyBase(values: BotValues): Promise<{ ok: boolean; missing: string[] }>;
+  /** Validate that a chat's table has every required field. */
+  verifyBase(values: BotValues, chatId: string): Promise<{ ok: boolean; missing: string[] }>;
   flush(): void;
 }
 
@@ -354,8 +368,6 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   const byRecord = new Map<string, IssueRecord>();
   const creating = new Set<string>();
   const lastActivityWrite = new Map<string, number>();
-  let baseConfig: IssueBaseConfig | null | undefined;
-  let baseLoadedAt = 0;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let warnedMissingBase = false;
 
@@ -432,42 +444,40 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     return run(await cliPath(values), args, label);
   }
 
-  function configFromValues(values: BotValues): IssueBaseConfig | null {
-    const baseToken = values.issueBaseToken.trim();
-    const tableId = values.issueTableId.trim();
+  function configFromBinding(binding: ChatBinding): IssueBaseConfig | null {
+    const baseToken = (binding.issueBaseToken ?? "").trim();
+    const tableId = (binding.issueTableId ?? "").trim();
     if (!baseToken || !tableId) return null;
     return {
       version: 1,
       baseToken,
       tableId,
-      baseUrl: values.issueBaseUrl.trim(),
-      name: values.issueBaseName.trim() || DEFAULT_BASE_NAME,
+      baseUrl: (binding.issueBaseUrl ?? "").trim(),
+      name: DEFAULT_BASE_NAME,
       createdAt: 0,
     };
   }
 
-  function localConfig(): IssueBaseConfig | null {
-    return readJson(options.baseStorePath, issueBaseConfigSchema);
+  function baseStore(): { version: number; bases: Record<string, IssueBaseConfig> } {
+    return readJson(options.baseStorePath, baseStoreSchema) ?? { version: 1, bases: {} };
   }
 
-  async function loadConfig(values?: BotValues, refresh = false): Promise<IssueBaseConfig | null> {
+  async function loadConfig(values?: BotValues, chatId = ""): Promise<IssueBaseConfig | null> {
     const current = await valuesFor(values);
-    const fromSettings = configFromValues(current);
-    if (fromSettings) return fromSettings;
-    if (!refresh && baseConfig !== undefined && now() - baseLoadedAt < 5_000) return baseConfig;
-    baseConfig = localConfig();
-    baseLoadedAt = now();
-    return baseConfig;
+    const binding = current.chats.find((chat) => chat.chatId === chatId);
+    const fromBinding = binding ? configFromBinding(binding) : null;
+    if (fromBinding) return fromBinding;
+    return baseStore().bases[chatId] ?? null;
   }
 
-  function saveLocalConfig(config: IssueBaseConfig): void {
-    baseConfig = config;
-    baseLoadedAt = now();
-    writeJsonAtomic(options.baseStorePath, config);
+  function saveLocalConfig(config: IssueBaseConfig, chatId: string): void {
+    const store = baseStore();
+    store.bases[chatId] = config;
+    writeJsonAtomic(options.baseStorePath, store);
   }
 
   async function ensureBase(values: BotValues, chatId: string): Promise<IssueBaseConfig | null> {
-    const existing = await loadConfig(values, true);
+    const existing = await loadConfig(values, chatId);
     if (existing) return existing;
     if (!values.issueAutoCreate) return null;
     try {
@@ -600,6 +610,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       requesterOpenId: input.senderOpenId,
       title: input.title,
       status: "待处理",
+      baseToken: config.baseToken,
+      tableId: config.tableId,
       lastActiveAt: input.at,
       messageCount: 1,
       updatedAt: now(),
@@ -634,6 +646,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
           requesterOpenId: event.sender_id.startsWith("ou_") ? event.sender_id : null,
           title: found.title,
           status: found.status,
+          baseToken: config.baseToken,
+          tableId: config.tableId,
           lastActiveAt: now(),
           messageCount: 1,
           updatedAt: now(),
@@ -684,6 +698,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
           requesterOpenId: detail?.senderOpenId ?? null,
           title: found.title,
           status: found.status,
+          baseToken: config.baseToken,
+          tableId: config.tableId,
           lastActiveAt: now(),
           messageCount: 1,
           updatedAt: now(),
@@ -738,10 +754,13 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
 
   async function updateRecord(
     values: BotValues,
-    record: IssueRecord | { recordId: string },
+    record: IssueRecord,
     fields: Record<string, unknown>,
   ): Promise<void> {
-    const config = await loadConfig(values, true);
+    const config =
+      record.baseToken && record.tableId
+        ? { baseToken: record.baseToken, tableId: record.tableId }
+        : await loadConfig(values, record.chatId);
     if (!config) throw new Error("问题跟踪表未配置");
     await call(
       values,
@@ -865,11 +884,11 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       name,
       createdAt: now(),
     };
-    saveLocalConfig(config);
     const targets = chatIds.length > 0
       ? chatIds
       : values.chats.filter((chat) => chat.issueTracking === "auto").map((chat) => chat.chatId);
     for (const chatId of [...new Set(targets)]) {
+      saveLocalConfig(config, chatId);
       if (!chatId.startsWith("oc_")) continue;
       try {
         await call(
@@ -901,8 +920,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     return config;
   }
 
-  async function verifyBase(values: BotValues): Promise<{ ok: boolean; missing: string[] }> {
-    const config = await loadConfig(values, true);
+  async function verifyBase(values: BotValues, chatId: string): Promise<{ ok: boolean; missing: string[] }> {
+    const config = await loadConfig(values, chatId);
     if (!config) return { ok: false, missing: [...ISSUE_FIELD_NAMES] };
     const payload = await call(
       values,
@@ -1103,8 +1122,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     values?: BotValues,
   ): Promise<IssueQueryResult> {
     const current = await valuesFor(values);
-    const config = await loadConfig(current, true);
-    if (!config) return { items: [], total: 0, error: "问题跟踪表未配置" };
+    const config = await loadConfig(current, chatId);
+    if (!config) return { items: [], total: 0, error: "本会话还没有配置问题跟踪表" };
     const conditions: unknown[][] = [["群ID", "==", chatId]];
     if (filter === "pending") conditions.push(["状态", "intersects", ["待验收"]]);
     if (filter === "open") conditions.push(["状态", "intersects", OPEN_STATUSES]);
@@ -1176,7 +1195,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     query,
     recordFor,
     recordForTopic,
-    config: (values?: BotValues) => loadConfig(values),
+    config: (chatId: string, values?: BotValues) => loadConfig(values, chatId),
     createBase,
     verifyBase,
     flush,

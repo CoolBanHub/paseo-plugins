@@ -81,6 +81,9 @@ const binding: ChatBinding = {
   mentionOnReply: "off",
   allowAgentDelegation: false,
   issueTracking: "off",
+  issueBaseToken: "",
+  issueTableId: "",
+  issueBaseUrl: "",
   rewriteIgnoreStyle: false,
 };
 

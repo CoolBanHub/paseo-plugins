@@ -257,8 +257,16 @@ export const chatBindingSchema = z.object({
   mentionOnReply: mentionOnReplySchema.default("off"),
   /** Allow whitelisted members to use /agents and /delegate. */
   allowAgentDelegation: z.boolean().default(false),
-  /** Capture every new topic in this chat into the shared issue Base. */
+  /** Capture every new topic in this chat into its issue Base. */
   issueTracking: issueTrackingSchema.default("off"),
+  /**
+   * The one ledger this chat may use. Empty means "not configured"; the
+   * plugin can create one with the bot identity and store the coordinates in
+   * plugin-data. Several chats may point at the same token/table.
+   */
+  issueBaseToken: z.string().default(""),
+  issueTableId: z.string().default(""),
+  issueBaseUrl: z.string().default(""),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;
@@ -350,15 +358,7 @@ export const botValuesSchema = z.object({
    * without the card the user has to answer in the Paseo client.
    */
   questionCards: z.boolean().default(true),
-  /**
-   * Shared Bitable used as the issue/requirement ledger. Empty means "not
-   * configured"; the plugin can create one with the bot identity and store
-   * it in plugin-data, so no lark-cli user login is required.
-   */
-  issueBaseToken: z.string().default(""),
-  issueTableId: z.string().default(""),
-  issueBaseUrl: z.string().default(""),
-  /** Create the ledger automatically when tracking is on but none is set. */
+  /** Create a chat's ledger automatically when tracking is on but unset. */
   issueAutoCreate: z.boolean().default(true),
   /** Display name for a bot-created ledger. */
   issueBaseName: z.string().default("问题跟踪"),

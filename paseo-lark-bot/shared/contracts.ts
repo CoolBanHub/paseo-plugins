@@ -94,8 +94,8 @@ export const larkBotIssueBaseRpc = defineRpc({
   input: z
     .object({
       action: z.enum(["status", "create", "test"]),
-      /** Chats to grant edit access; empty uses the saved auto-tracking chats. */
-      chatIds: z.array(z.string()).optional(),
+      /** The chat binding that owns this one ledger. */
+      chatId: z.string().min(1),
     })
     .strict(),
   output: z.object({

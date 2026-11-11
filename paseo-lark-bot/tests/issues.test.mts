@@ -41,6 +41,9 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     allowAgentDelegation: false,
     rewriteIgnoreStyle: false,
     issueTracking: "auto",
+    issueBaseToken: "bascnTest",
+    issueTableId: "tblTest",
+    issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
     ...overrides,
   };
 }
@@ -48,9 +51,6 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
 function values(overrides: Partial<BotValues> = {}): BotValues {
   return {
     ...DEFAULT_BOT_VALUES,
-    issueBaseToken: "bascnTest",
-    issueTableId: "tblTest",
-    issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
     chats: [binding()],
     ...overrides,
   };
@@ -313,7 +313,10 @@ describe("issue tracker", () => {
         return { ok: true, data: {} };
       });
       const tracker = createIssueTracker({
-        readValues: async () => values({ issueBaseToken: "", issueTableId: "", issueBaseUrl: "" }),
+        readValues: async () =>
+          values({
+            chats: [binding({ issueBaseToken: "", issueTableId: "", issueBaseUrl: "" })],
+          }),
         storePath: join(dir, "records.json"),
         baseStorePath: join(dir, "base.json"),
         run: fake.run,
@@ -331,6 +334,53 @@ describe("issue tracker", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it("uses each chat's own Base and keeps old records on their original Base", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "bases.json"),
+        run: fake.run,
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+
+      const other = values({
+        chats: [
+          binding({
+            issueBaseToken: "bascnOther",
+            issueTableId: "tblOther",
+            issueBaseUrl: "https://example.feishu.cn/base/bascnOther",
+          }),
+        ],
+      });
+      const config = await tracker.config(CHAT, other);
+      assert.equal(config?.baseToken, "bascnOther");
+
+      await tracker.markDone({
+        chatId: CHAT,
+        topicKey: THREAD,
+        summary: "已改完",
+        values: other,
+      });
+      const update = fake.calls.find((args) => args.includes("+record-batch-update"));
+      assert.ok(update);
+      assert.ok(update.includes("bascnTest"));
+      assert.ok(!update.includes("bascnOther"));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("issue card", () => {
@@ -343,6 +393,8 @@ describe("issue card", () => {
       requesterOpenId: USER,
       title: "登录后偶发闪退",
       status: "待验收" as const,
+      baseToken: "bascnTest",
+      tableId: "tblTest",
       lastActiveAt: 1,
       messageCount: 1,
       updatedAt: 1,

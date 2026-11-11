@@ -56,18 +56,17 @@ import {
 let paseo: SessionPaseoApi | null = null;
 let dispatcher: Dispatcher | null = null;
 let issueTracker: IssueTracker | null = null;
-/** Last explicit "create ledger" job, polled by the settings screen. */
-let issueBaseJob:
-  | {
-      state: "idle" | "creating" | "ready" | "error";
-      baseUrl: string | null;
-      baseToken: string | null;
-      tableId: string | null;
-      error: string | null;
-      missingFields: string[];
-    }
-  | null = null;
-let issueBaseJobRunning = false;
+interface IssueBaseJob {
+  state: "idle" | "creating" | "ready" | "error";
+  baseUrl: string | null;
+  baseToken: string | null;
+  tableId: string | null;
+  error: string | null;
+  missingFields: string[];
+}
+/** Explicit "create ledger" job per chat, polled by the settings screen. */
+const issueBaseJobs = new Map<string, IssueBaseJob>();
+const issueBaseJobsRunning = new Set<string>();
 let consumer: EventConsumer | null = null;
 let consumerCli: string | null = null;
 let cardConsumer: EventConsumer | null = null;
@@ -163,7 +162,7 @@ function ensureDispatcher(
     issueTracker = createIssueTracker({
       readValues,
       storePath: join(PLUGIN_DATA_ROOT, "issue-records.json"),
-      baseStorePath: join(PLUGIN_DATA_ROOT, "issue-base.json"),
+      baseStorePath: join(PLUGIN_DATA_ROOT, "issue-bases.json"),
       log: (message, detail) =>
         console.log("[lark-bot] " + message, detail === undefined ? "" : detail),
     });
@@ -446,7 +445,7 @@ export default function contribute(server: PluginServerContext) {
   const offSettings = settings.subscribe(() => {
     // A saved Base/table change invalidates the last creation result; status
     // must be recomputed from the new values.
-    issueBaseJob = null;
+    issueBaseJobs.clear();
     requestSync();
   });
 
@@ -591,20 +590,14 @@ export default function contribute(server: PluginServerContext) {
     };
   }
 
-  async function issueBaseStatus(values: BotValues): Promise<{
-    state: "idle" | "creating" | "ready" | "error";
-    baseUrl: string | null;
-    baseToken: string | null;
-    tableId: string | null;
-    error: string | null;
-    missingFields: string[];
-  }> {
-    if (issueBaseJob && issueBaseJob.state !== "idle") return issueBaseJob;
+  async function issueBaseStatus(values: BotValues, chatId: string): Promise<IssueBaseJob> {
+    const job = issueBaseJobs.get(chatId);
+    if (job && job.state !== "idle") return job;
     if (!issueTracker) return emptyIssueBaseState();
-    const config = await issueTracker.config(values);
+    const config = await issueTracker.config(chatId, values);
     if (!config) return emptyIssueBaseState();
     try {
-      const check = await issueTracker.verifyBase(values);
+      const check = await issueTracker.verifyBase(values, chatId);
       return {
         state: check.ok ? "ready" : "error",
         baseUrl: config.baseUrl || null,
@@ -625,40 +618,40 @@ export default function contribute(server: PluginServerContext) {
     }
   }
 
-  function startIssueBaseJob(values: BotValues, chatIds: string[]): void {
-    if (!issueTracker || issueBaseJobRunning) return;
-    issueBaseJobRunning = true;
-    issueBaseJob = {
+  function startIssueBaseJob(values: BotValues, chatId: string): void {
+    if (!issueTracker || issueBaseJobsRunning.has(chatId)) return;
+    issueBaseJobsRunning.add(chatId);
+    issueBaseJobs.set(chatId, {
       state: "creating",
       baseUrl: null,
       baseToken: null,
       tableId: null,
       error: null,
       missingFields: [],
-    };
+    });
     void (async () => {
       try {
-        const config = await issueTracker!.createBase(values, chatIds);
-        const check = await issueTracker!.verifyBase(values);
-        issueBaseJob = {
+        const config = await issueTracker!.createBase(values, [chatId]);
+        const check = await issueTracker!.verifyBase(values, chatId);
+        issueBaseJobs.set(chatId, {
           state: check.ok ? "ready" : "error",
           baseUrl: config.baseUrl || null,
           baseToken: config.baseToken,
           tableId: config.tableId,
           error: check.ok ? null : `跟踪表缺少字段：${check.missing.join("、")}`,
           missingFields: check.missing,
-        };
+        });
       } catch (error) {
-        issueBaseJob = {
+        issueBaseJobs.set(chatId, {
           state: "error",
           baseUrl: null,
           baseToken: null,
           tableId: null,
           error: error instanceof Error ? error.message : String(error),
           missingFields: [],
-        };
+        });
       } finally {
-        issueBaseJobRunning = false;
+        issueBaseJobsRunning.delete(chatId);
       }
     })();
   }
@@ -668,13 +661,13 @@ export default function contribute(server: PluginServerContext) {
     const values = await readValues();
     try {
       if (input.action === "create") {
-        const current = await issueTracker?.config(values);
-        if (current) return await issueBaseStatus(values);
-        startIssueBaseJob(values, input.chatIds ?? []);
-        return issueBaseJob ?? emptyIssueBaseState();
+        const current = await issueTracker?.config(input.chatId, values);
+        if (current) return await issueBaseStatus(values, input.chatId);
+        startIssueBaseJob(values, input.chatId);
+        return issueBaseJobs.get(input.chatId) ?? emptyIssueBaseState();
       }
-      if (input.action === "test") issueBaseJob = null;
-      return await issueBaseStatus(values);
+      if (input.action === "test") issueBaseJobs.delete(input.chatId);
+      return await issueBaseStatus(values, input.chatId);
     } catch (error) {
       return {
         state: "error" as const,
@@ -720,7 +713,8 @@ export default function contribute(server: PluginServerContext) {
     dispatcher?.dispose();
     dispatcher = null;
     issueTracker = null;
-    issueBaseJob = null;
+    issueBaseJobs.clear();
+    issueBaseJobsRunning.clear();
     paseo = null;
     await consumer?.stop();
     consumer = null;
