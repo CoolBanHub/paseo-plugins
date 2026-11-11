@@ -1,11 +1,14 @@
 import { DEFAULT_REWRITE_INSTRUCTION } from "../shared/settings.ts";
-import type { SessionPaseoApi } from "./sessions.ts";
+import type { SessionPaseoApi, SessionWorkspaceHandle } from "./sessions.ts";
+import { createHelperAgent } from "./workspace.ts";
 
 /** Hard stop for the one-shot rewrite; the caller falls back to the original. */
 const REWRITE_TIMEOUT_MS = 30_000;
 
 export interface RewriteReplyOptions {
   paseo: SessionPaseoApi;
+  /** Topic workspace; helpers never create a standalone workspace. */
+  workspace?: SessionWorkspaceHandle | null;
   /** Resolved provider id in `provider/model` form. */
   provider: string;
   cwd: string;
@@ -23,8 +26,9 @@ export interface RewriteReplyOptions {
  * One-shot model turn that rewrites the final answer into a shorter Feishu
  * reply. It runs on the chat's bound provider/model (same as the main turn),
  * carries the `lark-bot-purpose: rewrite` label so companion plugins can skip
- * its lifecycle notifications, and is auto-archived/backgrounded so it never
- * appears as an interactive workspace session.
+ * its lifecycle notifications, and is auto-archived inside the topic's
+ * existing workspace. A standalone create would mint a new workspace on
+ * Paseo 0.15+ and leave an empty entry behind.
  *
  * Any failure — provider error, timeout, empty answer — resolves to null so
  * the caller sends the original text instead of losing the reply.
@@ -49,9 +53,8 @@ export async function rewriteReplyWithModel(options: RewriteReplyOptions): Promi
   ].join("\n");
 
   try {
-    const handle = await options.paseo.agents.create({
+    const agentOptions = {
       config: { provider: options.provider },
-      cwd: options.cwd,
       title: "飞书回复改写",
       labels: {
         "lark-bot-purpose": "rewrite",
@@ -59,8 +62,17 @@ export async function rewriteReplyWithModel(options: RewriteReplyOptions): Promi
         ...(options.topicKey ? { "lark-bot-topic": options.topicKey } : {}),
       },
       autoArchive: true,
-      background: true,
+    };
+    const handle = await createHelperAgent({
+      paseo: options.paseo,
+      workspace: options.workspace,
+      cwd: options.cwd,
+      agent: agentOptions,
     });
+    if (!handle) {
+      options.log?.("workspace 不可用，跳过回复改写以复用现有 workspace");
+      return null;
+    }
     const result = await handle.run(prompt, { timeoutMs: options.timeoutMs ?? REWRITE_TIMEOUT_MS });
     const rewritten = (result.lastMessage ?? "").trim();
     return rewritten || null;

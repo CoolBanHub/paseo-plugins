@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { SessionPaseoApi } from "../server/sessions.ts";
+import type { SessionPaseoApi, SessionWorkspaceHandle } from "../server/sessions.ts";
 import { rewriteReplyWithModel } from "../server/rewrite.ts";
 
 interface Captured {
@@ -35,6 +35,30 @@ function fakePaseo(
   } as unknown as SessionPaseoApi;
 }
 
+function fakeWorkspace(
+  captured: Captured,
+  run: () => Promise<{ lastMessage: string | null }>,
+): SessionWorkspaceHandle {
+  return {
+    id: "ws-shared",
+    agents: {
+      create: async (request: Record<string, unknown>) => {
+        captured.create = request;
+        return {
+          id: "agent-rewrite",
+          send: async () => {},
+          run: async (prompt: string, options?: { timeoutMs?: number }) => {
+            captured.prompt = prompt;
+            captured.runOptions = options;
+            return { status: "idle", error: null, ...(await run()) };
+          },
+          respondToPermission: async () => {},
+        };
+      },
+    },
+  } as unknown as SessionWorkspaceHandle;
+}
+
 const baseOptions = {
   provider: "claude/claude-sonnet-4",
   cwd: "/tmp/project",
@@ -62,6 +86,54 @@ describe("rewriteReplyWithModel", () => {
     assert.equal(create.background, true);
     assert.equal(create.cwd, "/tmp/project");
     assert.equal(captured.runOptions?.timeoutMs, 30_000);
+  });
+
+  it("rides in the provided workspace instead of creating a standalone agent", async () => {
+    const captured: Captured = {};
+    const paseo = fakePaseo({}, async () => {
+      throw new Error("standalone create must not run");
+    });
+    const result = await rewriteReplyWithModel({
+      ...baseOptions,
+      paseo,
+      workspace: fakeWorkspace(captured, async () => ({ lastMessage: " 短版 " })),
+    });
+    assert.equal(result, "短版");
+    const create = captured.create!;
+    assert.equal((create.config as { provider?: string }).provider, "claude/claude-sonnet-4");
+    assert.equal((create.labels as Record<string, string>)["lark-bot-purpose"], "rewrite");
+    assert.equal(create.autoArchive, true);
+    // Workspace-targeted creates reject background/cwd; the host takes them
+    // from the workspace itself.
+    assert.equal(create.background, undefined);
+    assert.equal(create.cwd, undefined);
+  });
+
+  it("skips the rewrite instead of minting a workspace when none is available", async () => {
+    const logs: string[] = [];
+    const captured: Captured = {};
+    const paseo = {
+      ...fakePaseo({}, async () => {
+        throw new Error("standalone create must not run");
+      }),
+      workspaces: {
+        list: async () => ({ entries: [] }),
+        ref: () => {
+          throw new Error("unexpected ref");
+        },
+        create: async () => {
+          throw new Error("unexpected workspace create");
+        },
+      },
+    } as unknown as SessionPaseoApi;
+    const result = await rewriteReplyWithModel({
+      ...baseOptions,
+      paseo,
+      log: (message) => logs.push(message),
+    });
+    assert.equal(result, null);
+    assert.equal(captured.create, undefined);
+    assert.ok(logs.some((line) => line.includes("workspace 不可用")), logs.join("\n"));
   });
 
   it("falls back to the default instruction for a blank style prompt", async () => {

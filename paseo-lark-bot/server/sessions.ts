@@ -10,7 +10,7 @@ import {
 } from "../shared/settings.ts";
 import { isMissingAgentError, isTransientTurnError, sanitizeTopicText } from "./format.ts";
 import { generateTopicTitle } from "./title.ts";
-import { ensureWorkspace, SHARED_WORKSPACE_TITLE } from "./workspace.ts";
+import { ensureWorkspace, workspaceTitleFor } from "./workspace.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
 export function resolveCwd(cwd: string): string {
@@ -230,6 +230,8 @@ export interface SessionPermissionResponse {
 
 export interface SessionAgentHandle {
   readonly id: string;
+  /** Owning workspace, when the host reports it on creation/refetch. */
+  readonly workspaceId?: string | null;
   send(text: string): Promise<void>;
   run(text: string, options?: { timeoutMs?: number; images?: SessionImage[] }): Promise<SessionRunResult>;
   /**
@@ -310,7 +312,11 @@ export interface SessionPaseoApi {
       images?: SessionImage[];
       /** One-shot sessions (topic naming) archive themselves when done. */
       autoArchive?: boolean;
-      /** Keep helper sessions out of the interactive workspace focus. */
+      /**
+       * Visibility intent for a NEW workspace. Paseo 0.15+ creates a fresh
+       * workspace for every standalone create, so helpers must pass a
+       * workspaceId/handle instead of relying on this flag for isolation.
+       */
       background?: boolean;
       /** Environment for the agent process and its tool shells. */
       env?: Record<string, string>;
@@ -355,6 +361,8 @@ export interface SessionWorkspaceHandle {
       labels?: Record<string, string>;
       prompt?: string;
       images?: SessionImage[];
+      /** One-shot helper sessions archive themselves when done. */
+      autoArchive?: boolean;
       env?: Record<string, string>;
     }): Promise<SessionAgentHandle>;
   };
@@ -413,6 +421,11 @@ interface TopicState {
   chatId: string;
   agentId: string | null;
   handle: SessionAgentHandle | null;
+  /**
+   * Workspace backing the current agent. Helpers (title/rewrite) ride in it
+   * instead of creating a standalone workspace per one-shot turn.
+   */
+  workspace: SessionWorkspaceHandle | null;
   /** FIFO of trigger message ids awaiting a thread reply. */
   pendingTargets: string[];
   queue: QueueItem[];
@@ -657,12 +670,7 @@ export function createSessionRegistry(options: {
     const key = perBinding ? `chat:${item.binding.chatId}` : "shared";
     const cached = workspaceCache.get(key);
     if (cached) return Promise.resolve(cached);
-    const title = perBinding
-      ? "飞书 · " +
-        (item.binding.chatName || item.binding.chatId).slice(0, 32) +
-        " · " +
-        item.binding.chatId.slice(-4)
-      : SHARED_WORKSPACE_TITLE;
+    const title = workspaceTitleFor(item.binding.chatId, item.binding.chatName, perBinding);
     return ensureWorkspace({
       paseo: options.paseo,
       title,
@@ -673,6 +681,22 @@ export function createSessionRegistry(options: {
       return workspace;
     });
   }
+
+  /** Recover the workspace handle from a restored agent's reported workspaceId. */
+  function workspaceFromAgent(handle: SessionAgentHandle): SessionWorkspaceHandle | null {
+    const workspaceId = handle.workspaceId;
+    if (!workspaceId || !options.paseo.workspaces) return null;
+    try {
+      return options.paseo.workspaces.ref(workspaceId);
+    } catch (error) {
+      options.callbacks.log?.(
+        `agent ${handle.id} workspace ${workspaceId} could not be referenced: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
+      return null;
+    }
+  }
+
   const topics = new Map<string, TopicState>();
   const agentToTopic = new Map<string, string>();
   /** turn_ended can arrive before agents.create() resolves and maps the id. */
@@ -683,6 +707,7 @@ export function createSessionRegistry(options: {
       chatId,
       agentId: null,
       handle: null,
+      workspace: null,
       pendingTargets: [],
       queue: [],
       busy: false,
@@ -957,6 +982,7 @@ export function createSessionRegistry(options: {
     if (state.agentId) agentToTopic.delete(state.agentId);
     state.agentId = null;
     state.handle = null;
+    state.workspace = null;
     // The old turn is abandoned: its pending targets must not be consumed by
     // the next turn. Keep the queue itself so newly arrived messages survive.
     state.pendingTargets = [];
@@ -1078,6 +1104,7 @@ export function createSessionRegistry(options: {
       if (state.agentId) agentToTopic.delete(state.agentId);
       state.agentId = null;
       state.handle = null;
+      state.workspace = null;
       // The new agent gets a fresh retry budget.
       state.turnRetries = 0;
       state.queue.unshift(item);
@@ -1224,11 +1251,13 @@ export function createSessionRegistry(options: {
     item: QueueItem,
     provider: string,
     cwd: string,
+    workspace: SessionWorkspaceHandle | null,
   ): Promise<string> {
     const state = stateFor(topicKey, "");
     if (getAiTitle()) {
       const generated = await generateTopicTitle({
         paseo: options.paseo,
+        workspace,
         provider,
         cwd,
         chatId: state.chatId,
@@ -1279,10 +1308,13 @@ export function createSessionRegistry(options: {
       }
       if (alive && restored) {
         state.handle = restored;
+        state.workspace = workspaceFromAgent(restored);
       } else {
         options.callbacks.log?.(`topic ${topicKey} stored agent ${storedId} no longer exists; creating a new session`);
         agentToTopic.delete(storedId);
         state.agentId = null;
+        state.handle = null;
+        state.workspace = null;
       }
     }
     if (state.handle && !expired) {
@@ -1323,7 +1355,7 @@ export function createSessionRegistry(options: {
         options.getMembersHelperPath?.() ?? null,
         options.getLarkCliPath?.() ?? null,
       ),
-      title: await resolveTitle(topicKey, item, provider, cwd),
+      title: await resolveTitle(topicKey, item, provider, cwd, workspace),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
       prompt: item.prompt,
       images: item.images,
@@ -1334,6 +1366,7 @@ export function createSessionRegistry(options: {
       : await options.paseo.agents.create({ ...agentOptions, cwd });
     state.agentId = handle.id;
     state.handle = handle;
+    state.workspace = workspace;
     attachTimeline(topicKey, state, handle);
     scheduleTopicStoreSave();
     return { handle, created: true };
@@ -1474,6 +1507,11 @@ export function createSessionRegistry(options: {
     return { ...(topics.get(topicKey)?.overrides ?? {}) };
   }
 
+  /** Workspace backing a topic, for helpers that must not mint a new one. */
+  function workspaceForTopic(topicKey: string): SessionWorkspaceHandle | null {
+    return topics.get(topicKey)?.workspace ?? null;
+  }
+
   function setOverrides(topicKey: string, chatId: string, patch: TopicOverrides): void {
     const state = stateFor(topicKey, chatId);
     state.overrides = sanitizeOverrides({ ...state.overrides, ...patch });
@@ -1564,6 +1602,7 @@ export function createSessionRegistry(options: {
     needsRebuild,
     latestTopicKey,
     overridesFor,
+    workspaceForTopic,
     setOverrides,
     sessionInfo,
     resetTopicForCommand,

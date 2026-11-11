@@ -2162,6 +2162,63 @@ describe("scheduled prompts", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("runs a scheduled prompt inside the shared workspace", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lark-bot-cron-ws-"));
+    try {
+      let now = new Date(2026, 0, 1, 5, 0, 0).getTime();
+      const h = makeHarness(baseValues(), {
+        cronStorePath: join(root, "cron.json"),
+        now: () => now,
+      });
+      const workspaceCreates: { title?: string }[] = [];
+      const workspaceAgentCreates: { title?: string; autoArchive?: boolean; background?: boolean }[] = [];
+      h.paseoRef.workspaces = {
+        list: async () => ({ entries: [] }),
+        ref: () => {
+          throw new Error("unexpected ref");
+        },
+        create: async (request) => {
+          workspaceCreates.push(request);
+          return {
+            id: "ws-cron",
+            agents: {
+              create: async (agentRequest) => {
+                workspaceAgentCreates.push(agentRequest);
+                return {
+                  id: "agent-cron",
+                  send: async () => {},
+                  run: async (text: string) => {
+                    h.runCalls.push({ agentId: "agent-cron", text });
+                    return { status: "idle", error: null, lastMessage: "ok" };
+                  },
+                  respondToPermission: async () => {},
+                };
+              },
+            },
+          };
+        },
+      };
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ message_id: "om_cron_ws", content: "@_user_1 /cron add 0 6 * * * 总结 今天的进展" }),
+      );
+      await flush();
+      now = new Date(2026, 0, 1, 6, 0, 0).getTime();
+      await h.dispatch.runCronTick();
+      await flush();
+      assert.equal(workspaceCreates.length, 1);
+      assert.equal(workspaceCreates[0]?.title, "飞书任务");
+      assert.equal(workspaceAgentCreates.length, 1);
+      assert.equal(workspaceAgentCreates[0]?.autoArchive, true);
+      assert.equal(workspaceAgentCreates[0]?.background, undefined);
+      // The helper rode the workspace handle; no standalone create was needed.
+      assert.equal(h.created.length, 0);
+      assert.equal(h.runCalls[0]?.text, "总结 今天的进展");
+      assert.equal(h.chatMessages[0]?.text, "ok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("main-stream commands", () => {

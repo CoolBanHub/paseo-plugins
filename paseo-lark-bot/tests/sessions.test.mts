@@ -42,6 +42,7 @@ interface Harness {
     prompt?: string;
     title?: string;
     labels?: Record<string, string>;
+    autoArchive?: boolean;
     provider: string;
   }[];
   /** workspaces.create requests issued by ensureSharedWorkspace. */
@@ -135,12 +136,14 @@ function makeHarness(
         prompt?: string;
         title?: string;
         labels?: Record<string, string>;
+        autoArchive?: boolean;
         config: { provider: string };
       }) => {
         wsAgentCreates.push({
           prompt: request.prompt,
           title: request.title,
           labels: request.labels,
+          autoArchive: request.autoArchive,
           provider: request.config.provider,
         });
         return spawnAgent();
@@ -706,6 +709,58 @@ describe("session titles", () => {
     assert.equal(h.created.length, 2);
     assert.equal(h.created[1].title, "分析图片内容");
     assert.equal(h.created[1].prompt, "【话题主题】看图\n\n【本次消息】帮我分析");
+  });
+
+  it("runs the naming turn inside the topic workspace instead of minting one", async () => {
+    const h = makeHarness({ aiTitle: true, workspaces: { entries: [] } });
+    h.registry.enqueue(
+      "om_1",
+      "oc_group",
+      "om_1",
+      "【话题主题】看图\n\n【本次消息】帮我分析",
+      binding,
+      undefined,
+      "看图",
+    );
+    await flush();
+    // Only the shared 飞书任务 workspace exists; the naming session rides in it.
+    assert.equal(h.wsCreated.length, 1);
+    assert.equal(h.wsCreated[0].title, "飞书任务");
+    assert.equal(h.wsAgentCreates.length, 1);
+    assert.equal(h.wsAgentCreates[0].title, "飞书话题命名");
+    assert.equal(h.wsAgentCreates[0].autoArchive, true);
+    assert.deepEqual(h.wsAgentCreates[0].labels, {
+      "lark-bot-purpose": "title",
+      "lark-bot-chat": "oc_group",
+      "lark-bot-topic": "om_1",
+    });
+    assert.equal(h.created.length, 0);
+
+    h.finishRun({ status: "idle", error: null, lastMessage: "“分析图片内容”" });
+    await flush();
+    assert.equal(h.wsAgentCreates.length, 2);
+    assert.equal(h.wsAgentCreates[1].title, "分析图片内容");
+    assert.equal(h.wsAgentCreates[1].prompt, "【话题主题】看图\n\n【本次消息】帮我分析");
+    assert.equal(h.registry.workspaceForTopic("om_1")?.id, "ws-new");
+  });
+
+  it("skips the naming helper when its workspace is unavailable", async () => {
+    const h = makeHarness({ aiTitle: true, workspaces: { entries: [], failCreate: true } });
+    h.registry.enqueue(
+      "om_1",
+      "oc_group",
+      "om_1",
+      "【话题主题】看图\n\n【本次消息】帮我分析",
+      binding,
+      undefined,
+      "看图",
+    );
+    await flush();
+    // No standalone naming create: that would mint an extra workspace on 0.15+.
+    assert.equal(h.wsAgentCreates.length, 0);
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].title, "看图");
+    assert.equal(h.created[0].background, undefined);
   });
 
   it("falls back to the sanitized topic text when the naming turn fails", async () => {

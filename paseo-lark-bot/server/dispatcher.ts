@@ -44,6 +44,7 @@ import {
   type AgentActivity,
   type SessionImage,
   type SessionProviderSnapshot,
+  type SessionWorkspaceHandle,
   type TurnOutcome,
 } from "./sessions.ts";
 import {
@@ -70,6 +71,7 @@ import {
   type PendingQuestion,
 } from "./question-store.ts";
 import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
+import { createHelperAgent, ensureWorkspace, workspaceTitleFor } from "./workspace.ts";
 import {
   DEFAULT_BOT_VALUES,
   REPLY_REWRITE_LONG_CHARS,
@@ -468,6 +470,28 @@ export function createDispatcher(options: DispatcherOptions) {
     valuesCache = await options.readValues();
     limiter.setLimit(valuesCache.rateLimitPerHour);
     return valuesCache;
+  }
+
+  /**
+   * Workspace a one-shot helper should ride in. Null on legacy hosts without
+   * a workspaces API; callers keep the old standalone create path there. On
+   * 0.15+ a null result means "skip the helper" instead of letting
+   * agents.create mint an extra workspace.
+   */
+  function helperWorkspace(
+    chatId: string,
+    chatName: string,
+    cwd: string,
+    purpose: string,
+  ): Promise<SessionWorkspaceHandle | null> {
+    if (!options.paseo.workspaces) return Promise.resolve(null);
+    return ensureWorkspace({
+      paseo: options.paseo,
+      title: workspaceTitleFor(chatId, chatName, valuesCache.workspacePerBinding),
+      directory: cwd,
+      failureMessage: `workspace 不可用，跳过${purpose}：`,
+      log,
+    });
   }
 
   /** Returns false when this message was already delivered. Bounded LRU. */
@@ -2028,14 +2052,19 @@ export function createDispatcher(options: DispatcherOptions) {
       const rewriteProvider = binding.rewriteProvider.trim();
       const provider = rewriteProvider || overrides.provider || binding.provider;
       const model = rewriteProvider ? binding.rewriteModel.trim() : (overrides.model ?? binding.model);
+      const cwd = resolveCwd(overrides.cwd ?? binding.cwd);
       try {
         const resolvedProvider = options.resolveProvider
           ? await options.resolveProvider(provider, model)
           : provider;
+        const workspace =
+          (meta.topicKey ? sessions.workspaceForTopic(meta.topicKey) : null) ??
+          (await helperWorkspace(chatId, binding.chatName, cwd, "回复改写"));
         const rewritten = await rewrite({
           paseo: options.paseo,
+          workspace,
           provider: resolvedProvider,
-          cwd: resolveCwd(overrides.cwd ?? binding.cwd),
+          cwd,
           chatId,
           topicKey: meta.topicKey ?? topicKey ?? "",
           text: body,
@@ -2278,14 +2307,23 @@ export function createDispatcher(options: DispatcherOptions) {
     const provider = options.resolveProvider
       ? await options.resolveProvider(binding.provider, binding.model)
       : binding.provider;
-    const handle = await options.paseo.agents.create({
+    const cwd = resolveCwd(binding.cwd);
+    const workspace = await helperWorkspace(binding.chatId, binding.chatName, cwd, "定时任务");
+    const agentOptions = {
       config: { provider },
-      cwd: resolveCwd(binding.cwd),
       title: "定时 · " + job.prompt.replace(/\s+/g, " ").slice(0, 24),
       labels: { "lark-bot-cron": job.id, "lark-bot-chat": job.chatId },
       autoArchive: true,
-      background: true,
+    };
+    const handle = await createHelperAgent({
+      paseo: options.paseo,
+      workspace,
+      cwd,
+      agent: agentOptions,
     });
+    if (!handle) {
+      throw new Error("共享 workspace 不可用，已跳过本次定时任务（避免创建空 workspace）");
+    }
     const result = await handle.run(job.prompt, { timeoutMs: 10 * 60_000 });
     const output =
       result.lastMessage?.trim() ||

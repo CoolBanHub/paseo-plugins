@@ -1,5 +1,6 @@
-import type { SessionPaseoApi } from "./sessions.ts";
+import type { SessionPaseoApi, SessionWorkspaceHandle } from "./sessions.ts";
 import { sanitizeTopicText } from "./format.ts";
+import { createHelperAgent } from "./workspace.ts";
 
 /** Hard stop for the one-shot naming turn; the caller falls back on timeout. */
 const TITLE_TIMEOUT_MS = 45_000;
@@ -19,10 +20,14 @@ const TITLE_MAX_CHARS = 60;
  *
  * The naming session carries the "lark-bot-purpose": "title" label (and
  * autoArchive) so companion plugins such as paseo-lark-notify can skip its
- * lifecycle notifications.
+ * lifecycle notifications. It rides in the topic's existing workspace: a
+ * standalone agents.create() would make Paseo mint a fresh workspace for
+ * every naming turn (0.15+) and leave an empty "main" entry behind.
  */
 export async function generateTopicTitle(options: {
   paseo: SessionPaseoApi;
+  /** Topic workspace; helpers never create a standalone workspace. */
+  workspace?: SessionWorkspaceHandle | null;
   /** Resolved provider id in `provider/model` form. */
   provider: string;
   cwd: string;
@@ -41,9 +46,8 @@ export async function generateTopicTitle(options: {
     `\n\n要求：不超过 ${TITLE_TARGET_CHARS} 个字；标题要直接描述用户想让智能体完成的具体任务（做什么、对象是什么），保留请求中的关键名词与数字，` +
     "让只看到标题的人也能明白这轮任务；不要用「计算」「处理」「任务」这类空泛词单独成题；直接输出标题文字本身，不要引号、序号或任何解释；不要使用任何工具。";
   try {
-    const handle = await options.paseo.agents.create({
+    const agentOptions = {
       config: { provider: options.provider },
-      cwd: options.cwd,
       title: "飞书话题命名",
       labels: {
         "lark-bot-purpose": "title",
@@ -51,8 +55,14 @@ export async function generateTopicTitle(options: {
         "lark-bot-topic": options.topicKey,
       },
       autoArchive: true,
-      background: true,
+    };
+    const handle = await createHelperAgent({
+      paseo: options.paseo,
+      workspace: options.workspace,
+      cwd: options.cwd,
+      agent: agentOptions,
     });
+    if (!handle) return null;
     const result = await handle.run(prompt, { timeoutMs: TITLE_TIMEOUT_MS });
     return cleanTitle(result.lastMessage);
   } catch {
