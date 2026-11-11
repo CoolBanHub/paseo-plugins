@@ -81,11 +81,45 @@ export interface TurnUsage {
   totalCostUsd?: number;
 }
 
+/**
+ * Short capability pointer for the installed lark-cli. The skill texts are
+ * embedded in the CLI and can be large (the whole index is ~12KB, lark-im
+ * alone ~25KB), so the prompt only teaches the agent how to discover them
+ * and gives the read-only history commands it needs most often.
+ */
+function larkCliGuide(
+  cliPath: string | null | undefined,
+  context?: { chatId: string; topicKey: string },
+): string | null {
+  if (!cliPath) return null;
+  const lines = [
+    "\n\n### 飞书能力（lark-cli）",
+    `本机已安装 lark-cli：${cliPath}`,
+    "需要飞书操作时，按需读取技能文档，不要一次读全部：",
+    `  ${cliPath} skills list`,
+    `  ${cliPath} skills read lark-im    # 群聊/消息；文档、表格分别用 lark-doc、lark-sheets`,
+  ];
+  if (context) {
+    lines.push(`当前会话 chat_id：${context.chatId}。读取本群最近消息（只读）：`);
+    lines.push(
+      `  ${cliPath} im +chat-messages-list --chat-id ${context.chatId} --as bot --page-size 20 --order desc --concise`,
+    );
+    if (context.topicKey.startsWith("om_") || context.topicKey.startsWith("omt_")) {
+      lines.push("读取当前话题回复（只读）：");
+      lines.push(`  ${cliPath} im +threads-messages-list --thread ${context.topicKey} --as bot --concise`);
+    }
+  }
+  lines.push("飞书客户端消息链接（applink）无法直接解析；需要看链接内容时，先读会话历史或让用户粘贴原文。");
+  lines.push("只读查询可直接执行；发消息、改文档、建表、删除等写操作必须先向用户确认。");
+  return lines.join("\n");
+}
+
 /** Default prompt plus the optional attachment-return and @ instructions. */
 function defaultSystemPrompt(
   helperPath: string | null | undefined,
-  context?: { chatId: string; topicKey: string },
-  membersHelperPath?: string | null,
+  context: { chatId: string; topicKey: string } | undefined,
+  membersHelperPath: string | null | undefined,
+  larkCliPath: string | null | undefined,
 ): string {
   const parts = [DEFAULT_TOPIC_SYSTEM_PROMPT];
   if (helperPath) {
@@ -102,6 +136,8 @@ function defaultSystemPrompt(
         fallback,
     );
   }
+  const cliGuide = larkCliGuide(larkCliPath, context);
+  if (cliGuide) parts.push(cliGuide);
   if (membersHelperPath) {
     parts.push(
       "\n\n### @ 群成员\n" +
@@ -123,6 +159,7 @@ function providerCreateConfig(
   attachmentContext?: { chatId: string; topicKey: string },
   memberDirectory?: string | null,
   membersHelperPath?: string | null,
+  larkCliPath?: string | null,
 ): {
   provider: string;
   systemPrompt?: string;
@@ -135,7 +172,7 @@ function providerCreateConfig(
   const mentionHelper = binding.replyFormat === "post" ? membersHelperPath : null;
   const basePrompt =
     binding.systemPrompt?.trim() ||
-    defaultSystemPrompt(helperPath, attachmentContext, mentionHelper);
+    defaultSystemPrompt(helperPath, attachmentContext, mentionHelper, larkCliPath);
   const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
   const promptParts = [basePrompt];
   if (styleInstruction) promptParts.push(`### 回复风格\n${styleInstruction}`);
@@ -574,6 +611,8 @@ export function createSessionRegistry(options: {
   getWorkspacePerBinding?: () => boolean;
   /** Absolute path of the attachment helper, injected into the default prompt. */
   getAttachmentHelperPath?: () => string | null;
+  /** Absolute lark-cli path for the default prompt's capability pointer. */
+  getLarkCliPath?: () => string | null;
   /** Per-agent env for the attachment helper (chat/topic/outbox). */
   getAttachmentEnv?: (chatId: string, topicKey: string) => Record<string, string> | undefined;
   /**
@@ -1282,6 +1321,7 @@ export function createSessionRegistry(options: {
         { chatId: state.chatId, topicKey },
         memberDirectory,
         options.getMembersHelperPath?.() ?? null,
+        options.getLarkCliPath?.() ?? null,
       ),
       title: await resolveTitle(topicKey, item, provider, cwd),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },

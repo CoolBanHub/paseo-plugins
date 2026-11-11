@@ -430,6 +430,7 @@ export function createDispatcher(options: DispatcherOptions) {
     getWorkspacePerBinding: () => valuesCache.workspacePerBinding,
     getAttachmentHelperPath: () =>
       valuesCache.attachmentSend ? options.attachmentHelperPath ?? null : null,
+    getLarkCliPath: () => cliPathFor(valuesCache),
     getAttachmentEnv: (chatId, topicKey) => ({
       LARK_BOT_CHAT_ID: chatId,
       LARK_BOT_TOPIC: topicKey,

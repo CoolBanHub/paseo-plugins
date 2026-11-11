@@ -90,6 +90,7 @@ function makeHarness(
     stuckBusyMs?: number;
     workspacePerBinding?: boolean;
     getMemberDirectory?: (chatId: string, replyFormat: string) => Promise<string | null>;
+    getLarkCliPath?: () => string | null;
   },
 ): Harness {
   const replies: ReplyCall[] = [];
@@ -192,6 +193,7 @@ function makeHarness(
     getAiTitle: () => options?.aiTitle ?? false,
     getWorkspacePerBinding: () => options?.workspacePerBinding ?? false,
     getMemberDirectory: options?.getMemberDirectory,
+    getLarkCliPath: options?.getLarkCliPath,
     turnRetryDelaysMs: options?.turnRetryDelaysMs,
     stuckBusyMs: options?.stuckBusyMs,
     callbacks: {
@@ -1324,8 +1326,38 @@ describe("default system prompt", () => {
     assert.match(h.created[0].config.systemPrompt ?? "", /【本次消息】/);
   });
 
-  it("keeps the binding's own system prompt verbatim", async () => {
+  it("appends the lark-cli capability pointer to the default prompt", async () => {
+    const h = makeHarness({ getLarkCliPath: () => "/opt/homebrew/bin/lark-cli" });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, systemPrompt: "" });
+    await flush();
+    const prompt = h.created[0].config.systemPrompt ?? "";
+    assert.match(prompt, /### 飞书能力（lark-cli）/);
+    assert.match(prompt, /\/opt\/homebrew\/bin\/lark-cli skills list/);
+    assert.match(prompt, /skills read lark-im/);
+    assert.match(prompt, /chat-id oc_group/);
+    assert.match(prompt, /\+chat-messages-list/);
+    assert.match(prompt, /\+threads-messages-list --thread om_1/);
+    assert.match(prompt, /写操作必须先向用户确认/);
+  });
+
+  it("omits the lark-cli pointer when lark-cli is unavailable", async () => {
     const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", { ...binding, systemPrompt: "" });
+    await flush();
+    assert.doesNotMatch(h.created[0].config.systemPrompt ?? "", /### 飞书能力/);
+  });
+
+  it("skips the thread command for p2p chats", async () => {
+    const h = makeHarness({ getLarkCliPath: () => "/opt/homebrew/bin/lark-cli" });
+    h.registry.enqueue("oc_dm", "oc_dm", "om_1", "第一条", { ...binding, systemPrompt: "" });
+    await flush();
+    const prompt = h.created[0].config.systemPrompt ?? "";
+    assert.match(prompt, /\+chat-messages-list/);
+    assert.doesNotMatch(prompt, /\+threads-messages-list/);
+  });
+
+  it("keeps the binding's own system prompt verbatim", async () => {
+    const h = makeHarness({ getLarkCliPath: () => "/opt/homebrew/bin/lark-cli" });
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     assert.equal(h.created[0].config.systemPrompt, "用中文回答");
