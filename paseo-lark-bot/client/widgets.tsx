@@ -91,15 +91,6 @@ export function FieldLabel({ text }: { text: string }) {
   return <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>{text}</Text>;
 }
 
-/** Small in-card heading that groups related fields inside one card. */
-export function SectionLabel({ text }: { text: string }) {
-  return (
-    <Text style={{ fontSize: 11, fontWeight: "700", color: colors().foregroundMuted }}>
-      {text}
-    </Text>
-  );
-}
-
 /** Hairline separating sections inside one card. */
 export function Divider() {
   return <View style={{ height: 1, backgroundColor: colors().border }} />;
@@ -153,6 +144,61 @@ export function inputStyle(extra?: object): object {
     backgroundColor: colors().surface0,
     ...extra,
   };
+}
+
+/**
+ * Settings-style choice row: label on the left, current value on the right,
+ * chevron at the end. The pill picker and hint render below the row only
+ * while expanded, keeping the card a scannable list when collapsed.
+ */
+export function SelectRow({
+  label,
+  value,
+  tone = "default",
+  expanded,
+  onPress,
+  children,
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "muted" | "warning";
+  expanded: boolean;
+  onPress(): void;
+  children?: ReactNode;
+}) {
+  const c = colors();
+  const valueColor =
+    tone === "warning" ? c.statusWarning : tone === "muted" ? c.foregroundMuted : c.foreground;
+  return (
+    <View style={{ gap: 8 }}>
+      <HoverPressable
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        onPress={onPress}
+        style={({ hovered }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 8,
+          paddingVertical: 4,
+          paddingHorizontal: 4,
+          borderRadius: 6,
+          backgroundColor: hovered ? c.surface2 : "transparent",
+        })}
+      >
+        <Text style={{ fontSize: 13, fontWeight: "500", color: c.foreground }}>{label}</Text>
+        <Text
+          numberOfLines={1}
+          style={{ fontSize: 12, color: valueColor, flex: 1, textAlign: "right" }}
+        >
+          {value}
+        </Text>
+        <Text style={{ fontSize: 11, color: c.foregroundMuted, width: 12, textAlign: "center" }}>
+          {expanded ? "▾" : "▸"}
+        </Text>
+      </HoverPressable>
+      {expanded && children ? <View style={{ gap: 8 }}>{children}</View> : null}
+    </View>
+  );
 }
 
 export function ToggleRow({
