@@ -6,6 +6,7 @@ import {
   larkBotAppCreationRpc,
   larkBotChatMembersRpc,
   larkBotChatsRpc,
+  larkBotIssueBaseRpc,
   larkBotProvidersRpc,
   larkBotStatusRpc,
 } from "./shared/contracts.ts";
@@ -26,6 +27,11 @@ import {
 } from "./server/lark.ts";
 import { createAppCreationController } from "./server/app-creation.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
+import {
+  createIssueTracker,
+  installIssueHelper,
+  type IssueTracker,
+} from "./server/issues.ts";
 import type { SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
 import { resolveFfmpeg } from "./server/media.ts";
@@ -49,6 +55,19 @@ import {
  */
 let paseo: SessionPaseoApi | null = null;
 let dispatcher: Dispatcher | null = null;
+let issueTracker: IssueTracker | null = null;
+/** Last explicit "create ledger" job, polled by the settings screen. */
+let issueBaseJob:
+  | {
+      state: "idle" | "creating" | "ready" | "error";
+      baseUrl: string | null;
+      baseToken: string | null;
+      tableId: string | null;
+      error: string | null;
+      missingFields: string[];
+    }
+  | null = null;
+let issueBaseJobRunning = false;
 let consumer: EventConsumer | null = null;
 let consumerCli: string | null = null;
 let cardConsumer: EventConsumer | null = null;
@@ -132,6 +151,22 @@ function ensureDispatcher(
         error instanceof Error ? error.message : String(error),
       );
     }
+    let issueHelperPath: string | null = null;
+    try {
+      issueHelperPath = installIssueHelper(PLUGIN_DATA_ROOT, process.execPath);
+    } catch (error) {
+      console.log(
+        "[lark-bot] 问题跟踪 helper 安装失败",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    issueTracker = createIssueTracker({
+      readValues,
+      storePath: join(PLUGIN_DATA_ROOT, "issue-records.json"),
+      baseStorePath: join(PLUGIN_DATA_ROOT, "issue-base.json"),
+      log: (message, detail) =>
+        console.log("[lark-bot] " + message, detail === undefined ? "" : detail),
+    });
     dispatcher = createDispatcher({
       dedupStorePath: join(PLUGIN_DATA_ROOT, "seen-message-ids.json"),
       topicStorePath: join(PLUGIN_DATA_ROOT, "topic-agents.json"),
@@ -141,6 +176,9 @@ function ensureDispatcher(
       attachmentOutboxDir: join(PLUGIN_DATA_ROOT, "outbox"),
       ...(helperPath ? { attachmentHelperPath: helperPath } : {}),
       ...(membersHelperPath ? { membersHelperPath } : {}),
+      ...(issueHelperPath ? { issueHelperPath } : {}),
+      issueTracker,
+      issueOutboxDir: join(PLUGIN_DATA_ROOT, "outbox", "issues"),
       cronStorePath: join(PLUGIN_DATA_ROOT, "cron-jobs.json"),
       paseo: api,
       readValues,
@@ -406,6 +444,9 @@ export default function contribute(server: PluginServerContext) {
 
   requestSync();
   const offSettings = settings.subscribe(() => {
+    // A saved Base/table change invalidates the last creation result; status
+    // must be recomputed from the new values.
+    issueBaseJob = null;
     requestSync();
   });
 
@@ -530,6 +571,122 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
+  // ── Issue-tracking Base ─────────────────────────────────────────
+
+  function emptyIssueBaseState(): {
+    state: "idle";
+    baseUrl: null;
+    baseToken: null;
+    tableId: null;
+    error: null;
+    missingFields: string[];
+  } {
+    return {
+      state: "idle",
+      baseUrl: null,
+      baseToken: null,
+      tableId: null,
+      error: null,
+      missingFields: [],
+    };
+  }
+
+  async function issueBaseStatus(values: BotValues): Promise<{
+    state: "idle" | "creating" | "ready" | "error";
+    baseUrl: string | null;
+    baseToken: string | null;
+    tableId: string | null;
+    error: string | null;
+    missingFields: string[];
+  }> {
+    if (issueBaseJob && issueBaseJob.state !== "idle") return issueBaseJob;
+    if (!issueTracker) return emptyIssueBaseState();
+    const config = await issueTracker.config(values);
+    if (!config) return emptyIssueBaseState();
+    try {
+      const check = await issueTracker.verifyBase(values);
+      return {
+        state: check.ok ? "ready" : "error",
+        baseUrl: config.baseUrl || null,
+        baseToken: config.baseToken,
+        tableId: config.tableId,
+        error: check.ok ? null : `跟踪表缺少字段：${check.missing.join("、")}`,
+        missingFields: check.missing,
+      };
+    } catch (error) {
+      return {
+        state: "error",
+        baseUrl: config.baseUrl || null,
+        baseToken: config.baseToken,
+        tableId: config.tableId,
+        error: error instanceof Error ? error.message : String(error),
+        missingFields: [],
+      };
+    }
+  }
+
+  function startIssueBaseJob(values: BotValues, chatIds: string[]): void {
+    if (!issueTracker || issueBaseJobRunning) return;
+    issueBaseJobRunning = true;
+    issueBaseJob = {
+      state: "creating",
+      baseUrl: null,
+      baseToken: null,
+      tableId: null,
+      error: null,
+      missingFields: [],
+    };
+    void (async () => {
+      try {
+        const config = await issueTracker!.createBase(values, chatIds);
+        const check = await issueTracker!.verifyBase(values);
+        issueBaseJob = {
+          state: check.ok ? "ready" : "error",
+          baseUrl: config.baseUrl || null,
+          baseToken: config.baseToken,
+          tableId: config.tableId,
+          error: check.ok ? null : `跟踪表缺少字段：${check.missing.join("、")}`,
+          missingFields: check.missing,
+        };
+      } catch (error) {
+        issueBaseJob = {
+          state: "error",
+          baseUrl: null,
+          baseToken: null,
+          tableId: null,
+          error: error instanceof Error ? error.message : String(error),
+          missingFields: [],
+        };
+      } finally {
+        issueBaseJobRunning = false;
+      }
+    })();
+  }
+
+  server.handle(larkBotIssueBaseRpc, async (input, context) => {
+    capture(context.paseo);
+    const values = await readValues();
+    try {
+      if (input.action === "create") {
+        const current = await issueTracker?.config(values);
+        if (current) return await issueBaseStatus(values);
+        startIssueBaseJob(values, input.chatIds ?? []);
+        return issueBaseJob ?? emptyIssueBaseState();
+      }
+      if (input.action === "test") issueBaseJob = null;
+      return await issueBaseStatus(values);
+    } catch (error) {
+      return {
+        state: "error" as const,
+        baseUrl: null,
+        baseToken: null,
+        tableId: null,
+        error: error instanceof Error ? error.message : String(error),
+        missingFields: [],
+      };
+    }
+  });
+
   const offTurnEnded = server.on("agent.turn_ended", (event, context) => {
     capture(context.paseo);
     dispatcher?.handleTurnEnded(event);
@@ -562,6 +719,8 @@ export default function contribute(server: PluginServerContext) {
     // into an already unloaded plugin.
     dispatcher?.dispose();
     dispatcher = null;
+    issueTracker = null;
+    issueBaseJob = null;
     paseo = null;
     await consumer?.stop();
     consumer = null;

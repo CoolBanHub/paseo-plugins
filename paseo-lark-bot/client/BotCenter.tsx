@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ScrollView, Text, TextInput, View, useWindowDimensions } from "react-native";
+import { Linking, ScrollView, Text, TextInput, View, useWindowDimensions } from "react-native";
 import { useRpc, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/react-native";
 import {
   larkBotChatMembersRpc,
   larkBotChatsRpc,
+  larkBotIssueBaseRpc,
   larkBotProvidersRpc,
   larkBotStatusRpc,
   type LarkBotChatMember,
+  type LarkBotIssueBase,
   type LarkBotProviderInfo,
 } from "../shared/contracts.ts";
 import {
@@ -91,6 +93,7 @@ type Selection =
   | { kind: "binding"; chatId: string }
   | { kind: "status" }
   | { kind: "credentials" }
+  | { kind: "issues" }
   | { kind: "global" };
 
 /** Below this window width the panes stack and navigate instead of splitting. */
@@ -105,6 +108,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const providersRpc = useRpc(larkBotProvidersRpc);
   const chatMembersRpc = useRpc(larkBotChatMembersRpc);
   const statusRpc = useRpc(larkBotStatusRpc);
+  const issueBaseRpc = useRpc(larkBotIssueBaseRpc);
 
   const [revision, setRevision] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<BotValues | null>(null);
@@ -117,6 +121,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
   const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<StatusState | null>(null);
+  const [issueBase, setIssueBase] = useState<LarkBotIssueBase | null>(null);
+  const [issueBusy, setIssueBusy] = useState(false);
+  const [issueError, setIssueError] = useState<string | null>(null);
   const [selection, setSelection] = useState<Selection>({ kind: "none" });
   const wide = useWindowDimensions().width >= WIDE_MIN_WIDTH;
 
@@ -163,9 +170,54 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     void refreshStatus();
   }, [refreshStatus]);
 
+  const loadIssueBase = useCallback(
+    async (action: "status" | "create" | "test" = "status", chatIds: string[] = []) => {
+      setIssueBusy(true);
+      setIssueError(null);
+      try {
+        let current = await issueBaseRpc({ action, chatIds });
+        setIssueBase(current);
+        // Creation runs as a background job in the plugin; poll until it
+        // settles so the button can show a real result instead of a spinner.
+        for (let attempt = 0; current.state === "creating" && attempt < 60; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+          current = await issueBaseRpc({ action: "status" });
+          setIssueBase(current);
+        }
+        if (current.state === "error") setIssueError(current.error);
+        return current;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setIssueError(message);
+        toast.error(message);
+        return null;
+      } finally {
+        setIssueBusy(false);
+      }
+    },
+    [issueBaseRpc, toast],
+  );
+
+  useEffect(() => {
+    if (selection.kind === "issues") void loadIssueBase("status");
+  }, [loadIssueBase, selection.kind]);
+
   const patchDraft = useCallback((patch: Partial<BotValues>) => {
     setDraft((current) => (current ? { ...current, ...patch } : current));
   }, []);
+
+  // A bot-created ledger lives in plugin-data first; mirror its coordinates
+  // into the draft so saving the settings makes the UI the source of truth.
+  useEffect(() => {
+    if (selection.kind !== "issues" || !issueBase || issueBase.state !== "ready") return;
+    if (!issueBase.baseToken || !issueBase.tableId) return;
+    if (!draft || draft.issueBaseToken.trim()) return;
+    patchDraft({
+      issueBaseToken: issueBase.baseToken,
+      issueTableId: issueBase.tableId,
+      issueBaseUrl: issueBase.baseUrl ?? "",
+    });
+  }, [draft, issueBase, patchDraft, selection.kind]);
 
   const patchBinding = useCallback((chatId: string, patch: Partial<ChatBinding>) => {
     setDraft((current) => {
@@ -208,6 +260,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               mentionOnReply: "off",
               allowAgentDelegation: false,
               rewriteIgnoreStyle: false,
+              issueTracking: "off",
             },
           ],
         };
@@ -569,6 +622,17 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           () => setSelection({ kind: "credentials" }),
         )}
         {navRow("global", "全局设置", "回复、通知、会话与限制", selection.kind === "global", () => setSelection({ kind: "global" }))}
+        {navRow(
+          "issues",
+          "问题跟踪",
+          draft.issueBaseToken.trim()
+            ? "已配置跟踪表"
+            : draft.chats.some((chat) => chat.issueTracking === "auto")
+              ? "待创建跟踪表"
+              : "未启用",
+          selection.kind === "issues",
+          () => setSelection({ kind: "issues" }),
+        )}
       </ScrollView>
     </View>
   );
@@ -578,6 +642,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
     : selection.kind === "add" ? "添加会话绑定"
     : selection.kind === "status" ? "运行状态"
     : selection.kind === "credentials" ? "飞书应用凭证"
+    : selection.kind === "issues" ? "问题跟踪"
     : selection.kind === "global" ? "全局设置"
     : "飞书机器人";
 
@@ -807,6 +872,183 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             )}
           </Card>
         </ScrollView>
+      ) : selection.kind === "issues" ? (
+        <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
+          <Card>
+            <CardTitle
+              text="问题跟踪表"
+              hint="每个新话题一条记录；没 @ 机器人也会进表。机器人只在被 @ 时处理，不自动跑所有话题"
+            />
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {issueBase?.state === "ready" ? (
+                <Pill text="已就绪" tone="success" />
+              ) : issueBase?.state === "creating" ? (
+                <Pill text="创建中…" tone="warning" />
+              ) : issueBase?.state === "error" ? (
+                <Pill text="需要处理" tone="danger" />
+              ) : (
+                <Pill text="未配置" tone="muted" />
+              )}
+              {draft.issueBaseToken.trim() ? (
+                <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
+                  当前表：{draft.issueTableId || "未填写 table id"}
+                </Text>
+              ) : null}
+            </View>
+            {issueBase?.error || issueError ? (
+              <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
+                {issueBase?.error ?? issueError}
+              </Text>
+            ) : null}
+            {issueBase?.missingFields?.length ? (
+              <Text style={{ color: colors().statusWarning, fontSize: 12 }}>
+                缺少字段：{issueBase.missingFields.join("、")}。可到 Base 里补齐，或删掉重建。
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+              <PrimaryButton
+                label={issueBase?.state === "creating" || issueBusy ? "创建中…" : "创建跟踪表"}
+                onPress={() => {
+                  if (!draft) return;
+                  const chatIds = draft.chats
+                    .filter((chat) => chat.issueTracking === "auto")
+                    .map((chat) => chat.chatId);
+                  void (async () => {
+                    const result = await loadIssueBase("create", chatIds);
+                    if (result?.state === "ready" && result.baseToken && result.tableId) {
+                      const next = {
+                        ...draft,
+                        issueBaseToken: result.baseToken,
+                        issueTableId: result.tableId,
+                        issueBaseUrl: result.baseUrl ?? "",
+                      };
+                      patchDraft(next);
+                      void persistDraft(next, "跟踪表已创建并保存");
+                    }
+                  })();
+                }}
+                disabled={
+                  issueBusy ||
+                  issueBase?.state === "creating" ||
+                  !draft.chats.some((chat) => chat.issueTracking === "auto")
+                }
+              />
+              <PrimaryButton
+                label="测试连接"
+                subtle
+                onPress={() => void loadIssueBase("test")}
+                disabled={issueBusy || !draft.issueBaseToken.trim() || !draft.issueTableId.trim()}
+              />
+              {draft.issueBaseUrl ? (
+                <PrimaryButton
+                  label="打开表"
+                  subtle
+                  onPress={() => {
+                    if (draft.issueBaseUrl) void Linking.openURL(draft.issueBaseUrl);
+                  }}
+                />
+              ) : null}
+            </View>
+            {!draft.chats.some((chat) => chat.issueTracking === "auto") ? (
+              <Text style={{ color: colors().statusWarning, fontSize: 12 }}>
+                先在下方“采集哪些群”里勾选至少一个话题群，创建后机器人才能把该群加为协作者。
+              </Text>
+            ) : null}
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              创建会用机器人身份建 Base + 首表 + 全部字段，并把勾选采集的群加为可编辑协作者；不需要登录 lark-cli user。
+              已修复不等于已发布：状态里单独有「已发布」，看板旁有「已修复待发布」视图。
+            </Text>
+            <ToggleRow
+              label="未配置时自动创建"
+              hint="开启采集的群出现第一个话题时，机器人自动建表并授权当前群；已配置时不会重复创建"
+              value={draft.issueAutoCreate}
+              onChange={(value) => patchDraft({ issueAutoCreate: value })}
+            />
+          </Card>
+          <Card>
+            <CardTitle text="使用已有表" hint="已经有跟踪表时，粘贴 Base 链接和 table id；保存后立即生效" />
+            <FieldLabel text="Base 链接" />
+            <TextInput
+              value={draft.issueBaseUrl}
+              placeholder="https://xxx.feishu.cn/base/bascn..."
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => {
+                const match = /\/base\/([A-Za-z0-9]+)/u.exec(text);
+                patchDraft({
+                  issueBaseUrl: text,
+                  ...(match?.[1] ? { issueBaseToken: match[1] } : {}),
+                });
+              }}
+              style={inputStyle()}
+            />
+            <FieldLabel text="Base token" />
+            <TextInput
+              value={draft.issueBaseToken}
+              placeholder="bascn..."
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => patchDraft({ issueBaseToken: text })}
+              style={inputStyle()}
+            />
+            <FieldLabel text="Table ID（tbl 开头）" />
+            <TextInput
+              value={draft.issueTableId}
+              placeholder="tbl..."
+              placeholderTextColor={colors().foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => patchDraft({ issueTableId: text })}
+              style={inputStyle()}
+            />
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              机器人必须被加为该 Base 的可编辑协作者；“创建跟踪表”会自动授权勾选的群。已有表不会自动补字段，先点“测试连接”检查。
+            </Text>
+          </Card>
+          <Card>
+            <CardTitle text="采集哪些群" hint="只有开启采集的话题群会写台账；普通群不要开，否则每条消息都会被当成新话题" />
+            {draft.chats.length === 0 ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>还没有会话绑定。</Text>
+            ) : (
+              draft.chats.map((chat) => (
+                <View
+                  key={chat.chatId}
+                  style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+                >
+                  <Text numberOfLines={1} style={{ color: colors().foreground, fontSize: 13, flex: 1, flexShrink: 1 }}>
+                    {chat.chatName || chat.chatId}
+                  </Text>
+                  <ChoicePill
+                    label="关闭"
+                    active={chat.issueTracking !== "auto"}
+                    onPress={() => patchBinding(chat.chatId, { issueTracking: "off" })}
+                  />
+                  <ChoicePill
+                    label="采集话题"
+                    active={chat.issueTracking === "auto"}
+                    onPress={() => patchBinding(chat.chatId, { issueTracking: "auto" })}
+                  />
+                </View>
+              ))
+            )}
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              采集依赖飞书敏感权限 im:message.group_msg（或 readonly），否则机器人收不到未 @ 的消息。
+            </Text>
+          </Card>
+          <Card>
+            <CardTitle text="状态说明" hint="机器人只推进到待验收；已修复和已发布由人确认" />
+            <Text style={{ fontSize: 13, color: colors().foreground, lineHeight: 20 }}>
+              待处理 → 处理中 → 待验收 → 已修复 → 已发布；任意状态可关闭。
+              {"\n"}· 待处理：新话题已登记，还没人 @ 机器人处理。
+              {"\n"}· 处理中：机器人或人正在处理。
+              {"\n"}· 待验收：机器人认为改完了，已发验收卡片。
+              {"\n"}· 已修复：提出人验收通过，但不代表已发布。
+              {"\n"}· 已发布：已上线，可在话题里发 /issue release 标记。
+            </Text>
+          </Card>
+        </ScrollView>
       ) : selection.kind === "global" ? (
         <ScrollView contentContainerStyle={{ padding: 16, gap: 12, maxWidth: 880, width: "100%", alignSelf: "center" }}>
           <Card>
@@ -1030,6 +1272,10 @@ function normalize(values: BotValues): BotValues {
     appId: values.appId.trim(),
     appSecret: values.appSecret.trim(),
     larkCliPath: values.larkCliPath.trim(),
+    issueBaseToken: values.issueBaseToken.trim(),
+    issueTableId: values.issueTableId.trim(),
+    issueBaseUrl: values.issueBaseUrl.trim(),
+    issueBaseName: values.issueBaseName.trim(),
     chats: values.chats.map((chat) => ({
       ...chat,
       chatName: chat.chatName.trim(),

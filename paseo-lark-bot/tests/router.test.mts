@@ -43,6 +43,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyFormat: "markdown" as const,
         mentionOnReply: "off" as const,
         allowAgentDelegation: false,
+        issueTracking: "off" as const,
         rewriteIgnoreStyle: false,
       },
       {
@@ -63,6 +64,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyFormat: "text" as const,
         mentionOnReply: "off" as const,
         allowAgentDelegation: false,
+        issueTracking: "off" as const,
         rewriteIgnoreStyle: false,
       },
     ],

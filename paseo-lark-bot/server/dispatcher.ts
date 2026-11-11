@@ -89,6 +89,20 @@ import { parseCommand, runCommand } from "./commands.ts";
 import { createProgressTracker, type ProgressTracker } from "./progress.ts";
 import { createCronScheduler, type CronJob } from "./cron.ts";
 import { createOutboxWatcher, isInsideRoots, type OutboxRequest } from "./attachments.ts";
+import {
+  buildIssueCard,
+  buildIssueResolvedCard,
+  parseIssueAction,
+  type IssueCardPayload,
+} from "./issue-card.ts";
+import {
+  createIssueOutboxWatcher,
+  formatIssueList,
+  issueRecordUrl,
+  type IssueHelperRequest,
+  type IssueRecord,
+  type IssueTracker,
+} from "./issues.ts";
 
 export type TurnEndedEvent = PluginLifecycleEvents["agent.turn_ended"];
 export type PermissionEvent = PluginLifecycleEvents["agent.permission_requested"];
@@ -184,6 +198,12 @@ export interface DispatcherOptions {
   attachmentHelperPath?: string;
   /** Absolute path of the generated lark-bot-members helper. */
   membersHelperPath?: string;
+  /** Optional topic → Bitable ledger. */
+  issueTracker?: IssueTracker;
+  /** Absolute path of the generated lark-bot-issue helper. */
+  issueHelperPath?: string;
+  /** Directory the issue-done helper writes into. */
+  issueOutboxDir?: string;
   /** Persisted scheduled-task store; omitted means in-memory only. */
   cronStorePath?: string;
   now?: () => number;
@@ -446,6 +466,7 @@ export function createDispatcher(options: DispatcherOptions) {
         ? memberDirectoryFor(chatId).then((directory) => directory?.text ?? null)
         : Promise.resolve(null),
     getMembersHelperPath: () => options.membersHelperPath ?? null,
+    getIssueHelperPath: () => options.issueHelperPath ?? null,
     callbacks: {
       onReply: (chatId, messageId, outcome, topicKey) => {
         finishProgress(topicKey, outcome);
@@ -1024,6 +1045,61 @@ export function createDispatcher(options: DispatcherOptions) {
   }
 
   /** Run a chat command under the same allowlist as a normal turn. */
+  /**
+   * Send the acceptance card back into the topic. The card callback carries
+   * the record id and topic key; the click handler re-reads the record, so a
+   * stale card cannot move an item that was already closed elsewhere.
+   */
+  async function sendIssueAcceptanceCard(
+    cliPath: string,
+    values: BotValues,
+    record: IssueRecord,
+    topicKey: string,
+    summary: string | null,
+  ): Promise<boolean> {
+    const target = lastTriggerMessage.get(topicKey) ?? record.rootMessageId;
+    if (!target) return false;
+    try {
+      const messageId = await sendCard({
+        cliPath,
+        messageId: target,
+        card: buildIssueCard({ record, summary, topicKey }),
+        replyInThread: values.replyInThread,
+        idempotencyKey: `li-${createHash("sha256")
+          .update(`${record.recordId}:${topicKey}:review`)
+          .digest("hex")
+          .slice(0, 40)}`,
+      });
+      if (messageId) return true;
+    } catch (error) {
+      log("发送问题验收卡片失败，改发文本", error instanceof Error ? error.message : String(error));
+    }
+    return send(
+      cliPath,
+      target,
+      `**问题待验收：${record.title}**\n` +
+        (summary ? summary + "\n" : "") +
+        "请在本话题回复是否已修好；也可以用 `/issue` 查看记录。",
+      values,
+      "markdown",
+    );
+  }
+
+  async function issueStatusText(record: IssueRecord | null, values: BotValues): Promise<string> {
+    if (!record) {
+      return "本话题还没有登记到问题跟踪表。确认是问题或需求后，管理员可在设置里开启采集，或直接到跟踪表补录。";
+    }
+    const config = await options.issueTracker?.config(values);
+    const link = config ? issueRecordUrl(config, record.recordId) : "";
+    return [
+      `**${record.title || "未命名话题"}**`,
+      `状态：${record.status}`,
+      link ? `记录：${link}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   async function handleCommand(
     cliPath: string,
     values: BotValues,
@@ -1074,6 +1150,69 @@ export function createDispatcher(options: DispatcherOptions) {
       helperPath: options.attachmentHelperPath ?? null,
       attachmentMaxMb: values.attachmentMaxMb,
       doctor,
+      issue: options.issueTracker
+        ? {
+            query: async (filter, senderId) =>
+              formatIssueList(
+                await options.issueTracker!.query(
+                  event.chat_id,
+                  filter as "open" | "mine" | "pending" | "all",
+                  senderId,
+                  values,
+                ),
+                filter,
+              ),
+            status: async () =>
+              issueStatusText(options.issueTracker!.recordForTopic(event.chat_id, topicKey), values),
+            done: async (summary) => {
+              const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
+              if (!current) return "本话题还没有登记到问题跟踪表，无法标记待验收。";
+              const updated = await options.issueTracker!.markDone({
+                chatId: event.chat_id,
+                topicKey,
+                summary: summary || null,
+                values,
+              });
+              if (!updated) return "当前记录状态不允许标记为待验收。";
+              if (updated.status !== "待验收") {
+                return `当前状态是「${updated.status}」，不能标记为待验收。`;
+              }
+              const sent = await sendIssueAcceptanceCard(
+                cliPath,
+                values,
+                updated,
+                topicKey,
+                summary || null,
+              );
+              return sent
+                ? "已标记为「待验收」，验收卡片已发到本话题。"
+                : "已标记为「待验收」，但验收卡片发送失败，请到跟踪表查看。";
+            },
+            release: async () => {
+              const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
+              if (!current) return "本话题还没有登记到问题跟踪表。";
+              const updated = await options.issueTracker!.release(
+                current.recordId,
+                event.sender_id,
+                values,
+              );
+              return updated
+                ? "已标记为「已发布」。"
+                : "只有「待验收」或「已修复」的记录可以标记为已发布。";
+            },
+            close: async (reason) => {
+              const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
+              if (!current) return "本话题还没有登记到问题跟踪表。";
+              const updated = await options.issueTracker!.close(
+                current.recordId,
+                event.sender_id,
+                reason || null,
+                values,
+              );
+              return updated ? "已关闭这条问题记录。" : "关闭失败：记录不存在。";
+            },
+          }
+        : undefined,
       listBots: async () =>
         (await listChatBots(cliPath, event.chat_id)).filter(
           (bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId,
@@ -1162,6 +1301,12 @@ export function createDispatcher(options: DispatcherOptions) {
       // as context, whatever its sender; awaiting the download keeps a fast
       // follow-up @ from reading an empty image cache.
       //
+      // The optional issue ledger mirrors the same principle: every topic
+      // root is recorded even when nobody @-mentions the bot. It never starts
+      // an agent; markWorking() below only advances an existing record when an
+      // @ actually queues a turn.
+      options.issueTracker?.observe(event, binding, values);
+
       // allowedUsers only gates who may *trigger* a turn. A disallowed
       // member's @ is still recorded (text and media) for an allowed member's
       // later @ — otherwise the bot loses the discussion around the request.
@@ -1277,6 +1422,7 @@ export function createDispatcher(options: DispatcherOptions) {
           topicRootText,
         )
       ) {
+        if (triggered) options.issueTracker?.markWorking(event, binding, values);
         lastTriggerMessage.set(topicKey, event.message_id);
         pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, topicKey);
         triggerSenders.set(event.message_id, {
@@ -1474,6 +1620,18 @@ export function createDispatcher(options: DispatcherOptions) {
         break;
       }
     }
+    if (event.outcome.kind === "completed") {
+      const topicKey = sessions.topicKeyForAgent(event.agent.id);
+      const chatId = sessions.chatIdForAgent(event.agent.id);
+      if (topicKey && chatId) {
+        options.issueTracker?.updateProgress({
+          chatId,
+          topicKey,
+          summary: lastText,
+          agentId: event.agent.id,
+        });
+      }
+    }
     void sessions.handleTurnEnded(event.agent.id, {
       outcome: event.outcome.kind,
       lastText,
@@ -1604,6 +1762,11 @@ export function createDispatcher(options: DispatcherOptions) {
 
   async function processCardAction(event: LarkCardActionEvent): Promise<void> {
     try {
+      const issueAction = parseIssueAction(event.action_value);
+      if (issueAction) {
+        await processIssueCardAction(event, issueAction);
+        return;
+      }
       const action = parseQuestionAction(event.action_value);
       const formAction = parseFormActionName(event.action_name);
       const requestId =
@@ -1734,6 +1897,90 @@ export function createDispatcher(options: DispatcherOptions) {
       );
     } catch (error) {
       log("处理问题卡片回调失败", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function processIssueCardAction(
+    event: LarkCardActionEvent,
+    action: IssueCardPayload,
+  ): Promise<void> {
+    const tracker = options.issueTracker;
+    if (!tracker) return;
+    const values = await currentValues();
+    const cliPath = cliPathFor(values);
+    if (!cliPath) return;
+    const binding = values.chats.find((chat) => chat.chatId === action.chatId);
+    if (!binding) return;
+    const record = tracker.recordFor(action.recordId);
+    if (!record) {
+      await send(cliPath, event.message_id, "这条问题记录已不存在，可能已被删除；请到跟踪表查看。", values, "text");
+      return;
+    }
+    const authorized =
+      event.operator_id === record.requesterOpenId || isSenderAllowed(binding, event.operator_id);
+    if (!authorized) {
+      await send(cliPath, event.message_id, "只有提出人或该会话白名单内的成员可以验收这个问题。", values, "text");
+      return;
+    }
+    if (action.action === "accept") {
+      const updated = await tracker.accept(action.recordId, event.operator_id, values);
+      if (!updated) {
+        await send(cliPath, event.message_id, "当前状态不是「待验收」，不能重复验收。", values, "text");
+        return;
+      }
+      await patchIssueCard(cliPath, event.message_id, {
+        title: updated.title,
+        status: updated.status,
+        action: "accept",
+        operatorOpenId: event.operator_id,
+      });
+      await send(
+        cliPath,
+        event.message_id,
+        "✅ 已验收，状态改为「已修复」。发布上线后发送 `/issue release` 标记为「已发布」。",
+        values,
+        "text",
+      );
+      return;
+    }
+    const updated = await tracker.reject(action.recordId, event.operator_id, null, values);
+    if (!updated) {
+      await send(cliPath, event.message_id, "当前状态不是「待验收」，不能重复操作。", values, "text");
+      return;
+    }
+    await patchIssueCard(cliPath, event.message_id, {
+      title: updated.title,
+      status: updated.status,
+      action: "reject",
+      operatorOpenId: event.operator_id,
+    });
+    await send(
+      cliPath,
+      event.message_id,
+      "已打回「处理中」。请在本话题补充还没修好的地方，或 @ 机器人继续处理。",
+      values,
+      "text",
+    );
+  }
+
+  async function patchIssueCard(
+    cliPath: string,
+    messageId: string,
+    options: {
+      title: string;
+      status: "处理中" | "已修复" | "已发布" | "已关闭" | "待验收" | "待处理";
+      action: "accept" | "reject" | "release";
+      operatorOpenId: string;
+    },
+  ): Promise<void> {
+    try {
+      await patchCard({
+        cliPath,
+        messageId,
+        card: buildIssueResolvedCard(options),
+      });
+    } catch (error) {
+      log("更新问题卡片失败", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -2336,6 +2583,48 @@ export function createDispatcher(options: DispatcherOptions) {
     : null;
   outboxWatcher?.start();
 
+  // ── Issue ledger helper ────────────────────────────────────────
+
+  async function processIssueHelperRequest(request: IssueHelperRequest): Promise<void> {
+    const tracker = options.issueTracker;
+    if (!tracker) return;
+    const values = await currentValues();
+    const binding = values.chats.find((chat) => chat.chatId === request.chatId);
+    if (!binding || binding.issueTracking !== "auto") {
+      log("问题跟踪未启用，忽略 helper 请求");
+      return;
+    }
+    const cliPath = cliPathFor(values);
+    if (!cliPath) return;
+    const current = tracker.recordForTopic(request.chatId, request.topicKey);
+    if (!current) {
+      log("问题 helper 找不到对应记录，忽略");
+      return;
+    }
+    // Repeated helper calls must not resend the acceptance card; the first
+    // transition is the one that matters.
+    if (current.status !== "处理中" && current.status !== "待处理") return;
+    const updated = await tracker.markDone({
+      chatId: request.chatId,
+      topicKey: request.topicKey,
+      summary: request.summary,
+      values,
+    });
+    if (updated) {
+      await sendIssueAcceptanceCard(cliPath, values, updated, request.topicKey, request.summary);
+      log(`问题已转待验收：${updated.title}`);
+    }
+  }
+
+  const issueOutboxWatcher = options.issueOutboxDir
+    ? createIssueOutboxWatcher({
+        dir: options.issueOutboxDir,
+        onRequest: processIssueHelperRequest,
+        log,
+      })
+    : null;
+  issueOutboxWatcher?.start();
+
   // ── Scheduled prompts ──────────────────────────────────────────
 
   async function runScheduledJob(job: CronJob): Promise<void> {
@@ -2401,10 +2690,13 @@ export function createDispatcher(options: DispatcherOptions) {
     resetIdentity,
     /** Test hooks: drive the outbox and cron schedulers deterministically. */
     drainOutbox: () => outboxWatcher?.tick() ?? Promise.resolve(),
+    drainIssueOutbox: () => issueOutboxWatcher?.tick() ?? Promise.resolve(),
     runCronTick: () => cron.tick(),
     dispose: () => {
       persistPendingNow();
       outboxWatcher?.stop();
+      issueOutboxWatcher?.stop();
+      options.issueTracker?.flush();
       cron.stop();
       for (const tracker of progressByTopic.values()) tracker.dispose();
       progressByTopic.clear();

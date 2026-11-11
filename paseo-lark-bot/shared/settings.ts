@@ -17,6 +17,14 @@ export const replyFormatSchema = z.enum(["markdown", "text", "post"]);
 export type ReplyFormat = z.output<typeof replyFormatSchema>;
 
 /**
+ * Per-binding switch for the topic ledger. `auto` only makes sense for a
+ * topic-style chat: every new topic root is recorded, while no agent runs
+ * until someone @-mentions the bot.
+ */
+export const issueTrackingSchema = z.enum(["off", "auto"]);
+export type IssueTracking = z.output<typeof issueTrackingSchema>;
+
+/**
  * Who to @ after a turn finishes. Mentions are sent as a separate plain-text
  * message because Feishu only fires mention notifications for `text` messages
  * (not post/card), and doing so keeps the answer's markdown intact.
@@ -249,6 +257,8 @@ export const chatBindingSchema = z.object({
   mentionOnReply: mentionOnReplySchema.default("off"),
   /** Allow whitelisted members to use /agents and /delegate. */
   allowAgentDelegation: z.boolean().default(false),
+  /** Capture every new topic in this chat into the shared issue Base. */
+  issueTracking: issueTrackingSchema.default("off"),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;
@@ -340,6 +350,18 @@ export const botValuesSchema = z.object({
    * without the card the user has to answer in the Paseo client.
    */
   questionCards: z.boolean().default(true),
+  /**
+   * Shared Bitable used as the issue/requirement ledger. Empty means "not
+   * configured"; the plugin can create one with the bot identity and store
+   * it in plugin-data, so no lark-cli user login is required.
+   */
+  issueBaseToken: z.string().default(""),
+  issueTableId: z.string().default(""),
+  issueBaseUrl: z.string().default(""),
+  /** Create the ledger automatically when tracking is on but none is set. */
+  issueAutoCreate: z.boolean().default(true),
+  /** Display name for a bot-created ledger. */
+  issueBaseName: z.string().default("问题跟踪"),
   chats: z.array(chatBindingSchema).default([]),
 });
 

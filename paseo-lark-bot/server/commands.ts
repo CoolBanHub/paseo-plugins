@@ -54,6 +54,10 @@ const ALIASES: Record<string, string> = {
   智能体: "agents",
   delegate: "delegate",
   委派: "delegate",
+  issues: "issues",
+  问题列表: "issues",
+  issue: "issue",
+  问题: "issue",
 };
 
 /** Parse `/name args`; returns null for non-command messages. */
@@ -83,6 +87,9 @@ export function commandHelp(): string {
     "`/members [关键词]` 搜索群成员（含机器人），返回 open_id 用于 @",
     "`/agents` 列出可委派的 Paseo Agent（需在绑定里开启 Agent 委派）",
     "`/delegate <id|前缀> <任务>` 把任务交给其他 Paseo Agent 并等待结果（需开启）",
+    "`/issues [mine|pending|all]` 查看本群的问题/需求台账（默认未关闭）",
+    "`/issue done [说明]` 把当前话题标记为待验收；`/issue release` 标记已发布",
+    "`/issue close [原因]` 关闭当前话题的问题记录",
     "`/doctor` 自检 lark-cli、监听、卡片回调与 provider",
     "`/help` 显示这份帮助",
   ].join("\n");
@@ -100,6 +107,16 @@ export interface CommandSessionInfo {
   remaining: number;
 }
 
+export interface CommandIssueActions {
+  /** Formatted list for `/issues`; filter is open|mine|pending|all. */
+  query: (filter: string, senderId: string) => Promise<string>;
+  /** Current topic's ledger status/URL. */
+  status: () => Promise<string>;
+  done: (summary: string) => Promise<string>;
+  release: () => Promise<string>;
+  close: (reason: string) => Promise<string>;
+}
+
 export interface CommandContext {
   command: ParsedCommand;
   values: BotValues;
@@ -115,6 +132,8 @@ export interface CommandContext {
   helperPath: string | null;
   attachmentMaxMb: number;
   doctor: () => Promise<string>;
+  /** Optional issue-ledger actions; omitted when tracking is not configured. */
+  issue?: CommandIssueActions;
   /** Group bots for /bots; omitted when the host cannot list members. */
   listBots?: () => Promise<LarkChatBot[]>;
   /** Users + bots for /members; omitted when the host cannot list members. */
@@ -340,6 +359,42 @@ export async function runCommand(context: CommandContext): Promise<void> {
     case "delegate":
       await runDelegateCommand(context, args);
       return;
+    case "issues": {
+      if (!context.issue) {
+        await reply("本会话还没有启用问题跟踪；请让管理员在「飞书机器人 → 问题跟踪」里创建或配置跟踪表。");
+        return;
+      }
+      const filter = (args.split(/\s+/)[0] || "open").toLowerCase();
+      const normalized = ["open", "mine", "pending", "all"].includes(filter) ? filter : "open";
+      await reply(await context.issue.query(normalized, context.senderId));
+      return;
+    }
+    case "issue": {
+      if (!context.issue) {
+        await reply("本会话还没有启用问题跟踪；请让管理员在「飞书机器人 → 问题跟踪」里创建或配置跟踪表。");
+        return;
+      }
+      const [sub, ...rest] = args.split(/\s+/).filter(Boolean);
+      const tail = rest.join(" ");
+      if (!sub || sub === "status") {
+        await reply(await context.issue.status());
+        return;
+      }
+      if (sub === "done") {
+        await reply(await context.issue.done(tail));
+        return;
+      }
+      if (sub === "release") {
+        await reply(await context.issue.release());
+        return;
+      }
+      if (sub === "close") {
+        await reply(await context.issue.close(tail));
+        return;
+      }
+      await reply("用法：`/issue` 查看状态，`/issue done [说明]` 待验收，`/issue release` 已发布，`/issue close [原因]` 关闭。");
+      return;
+    }
     case "cron":
       await runCronCommand(context, args);
       return;

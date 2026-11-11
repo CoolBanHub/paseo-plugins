@@ -84,6 +84,33 @@ export const larkBotAppCreationRpc = defineRpc({
 
 export type LarkBotAppCreation = z.output<typeof larkBotAppCreationRpc.output>;
 
+/**
+ * Issue-tracking Bitable lifecycle. `create` runs `lark-cli base +base-create`
+ * with the fixed ledger schema, grants the selected group chats edit access,
+ * and returns the coordinates so the settings screen can persist them.
+ */
+export const larkBotIssueBaseRpc = defineRpc({
+  name: "lark-bot.issue-base",
+  input: z
+    .object({
+      action: z.enum(["status", "create", "test"]),
+      /** Chats to grant edit access; empty uses the saved auto-tracking chats. */
+      chatIds: z.array(z.string()).optional(),
+    })
+    .strict(),
+  output: z.object({
+    state: z.enum(["idle", "creating", "ready", "error"]),
+    baseUrl: z.string().nullable(),
+    baseToken: z.string().nullable(),
+    tableId: z.string().nullable(),
+    error: z.string().nullable(),
+    /** Required ledger fields that are missing from an existing table. */
+    missingFields: z.array(z.string()),
+  }),
+});
+
+export type LarkBotIssueBase = z.output<typeof larkBotIssueBaseRpc.output>;
+
 /** Runtime status for the settings screen. */
 export const larkBotStatusRpc = defineRpc({
   name: "lark-bot.status",

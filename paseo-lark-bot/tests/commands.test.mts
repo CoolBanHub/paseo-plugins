@@ -22,6 +22,7 @@ const binding: ChatBinding = {
   replyFormat: "markdown",
   mentionOnReply: "off",
   allowAgentDelegation: false,
+  issueTracking: "off",
   rewriteIgnoreStyle: false,
 };
 
@@ -230,5 +231,41 @@ describe("command handlers", () => {
     });
     await runCommand(h.value);
     assert.match(h.replies.at(-1) ?? "", /等待权限确认/);
+  });
+
+  it("routes /issues filters and /issue actions to the ledger", async () => {
+    const calls: string[] = [];
+    const issue = {
+      query: async (filter: string) => {
+        calls.push(`query:${filter}`);
+        return `list:${filter}`;
+      },
+      status: async () => "status",
+      done: async (summary: string) => {
+        calls.push(`done:${summary}`);
+        return "done";
+      },
+      release: async () => "release",
+      close: async (reason: string) => {
+        calls.push(`close:${reason}`);
+        return "close";
+      },
+    };
+    const issues = context({ command: { name: "issues", args: "pending" }, issue });
+    await runCommand(issues.value);
+    assert.equal(issues.replies[0], "list:pending");
+
+    const done = context({ command: { name: "issue", args: "done 已改完" }, issue });
+    await runCommand(done.value);
+    assert.equal(done.replies[0], "done");
+
+    const close = context({ command: { name: "issue", args: "close 重复问题" }, issue });
+    await runCommand(close.value);
+    assert.equal(close.replies[0], "close");
+    assert.deepEqual(calls, ["query:pending", "done:已改完", "close:重复问题"]);
+
+    const missing = context({ command: { name: "issues", args: "" } });
+    await runCommand(missing.value);
+    assert.match(missing.replies[0] ?? "", /还没有启用问题跟踪/);
   });
 });

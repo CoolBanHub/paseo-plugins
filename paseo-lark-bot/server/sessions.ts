@@ -120,8 +120,19 @@ function defaultSystemPrompt(
   context: { chatId: string; topicKey: string } | undefined,
   membersHelperPath: string | null | undefined,
   larkCliPath: string | null | undefined,
+  issueHelperPath: string | null | undefined,
+  issueTracking: boolean,
 ): string {
   const parts = [DEFAULT_TOPIC_SYSTEM_PROMPT];
+  if (issueHelperPath && issueTracking) {
+    parts.push(
+      "\n\n### 问题跟踪\n" +
+        "本会话已开启问题跟踪。**只有在你确认代码/配置已改完，并完成必要的验证之后**，才运行：\n" +
+        `  ${issueHelperPath} done --summary "一句话说明改了什么"\n` +
+        "这只会把记录推进到「待验收」，不会标记「已修复」；提出人会在卡片上确认。\n" +
+        "只是回答问题、给建议或还没有实际修改时，不要调用。",
+    );
+  }
   if (helperPath) {
     const fallback = context
       ? `\n如果提示缺少会话信息，可显式追加 --chat ${context.chatId} --topic ${context.topicKey}。`
@@ -160,6 +171,7 @@ function providerCreateConfig(
   memberDirectory?: string | null,
   membersHelperPath?: string | null,
   larkCliPath?: string | null,
+  issueHelperPath?: string | null,
 ): {
   provider: string;
   systemPrompt?: string;
@@ -172,7 +184,14 @@ function providerCreateConfig(
   const mentionHelper = binding.replyFormat === "post" ? membersHelperPath : null;
   const basePrompt =
     binding.systemPrompt?.trim() ||
-    defaultSystemPrompt(helperPath, attachmentContext, mentionHelper, larkCliPath);
+    defaultSystemPrompt(
+      helperPath,
+      attachmentContext,
+      mentionHelper,
+      larkCliPath,
+      issueHelperPath,
+      binding.issueTracking === "auto",
+    );
   const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
   const promptParts = [basePrompt];
   if (styleInstruction) promptParts.push(`### 回复风格\n${styleInstruction}`);
@@ -692,6 +711,8 @@ export function createSessionRegistry(options: {
   getMemberDirectory?: (chatId: string, replyFormat: ReplyFormat) => Promise<string | null>;
   /** Absolute path of the member-search helper, quoted in @ instructions. */
   getMembersHelperPath?: () => string | null;
+  /** Absolute path of the issue-done helper, quoted when tracking is on. */
+  getIssueHelperPath?: () => string | null;
 }) {
   const resolveProvider =
     options.resolveProvider ??
@@ -1437,6 +1458,7 @@ export function createSessionRegistry(options: {
         memberDirectory,
         options.getMembersHelperPath?.() ?? null,
         options.getLarkCliPath?.() ?? null,
+        options.getIssueHelperPath?.() ?? null,
       ),
       title: await resolveTitle(topicKey, item, provider, cwd, workspace),
       labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },

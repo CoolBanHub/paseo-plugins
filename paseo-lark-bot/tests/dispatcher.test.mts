@@ -50,6 +50,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         replyFormat: "markdown",
         mentionOnReply: "off",
         allowAgentDelegation: false,
+        issueTracking: "off",
         rewriteIgnoreStyle: false,
       },
     ],
@@ -1500,6 +1501,7 @@ describe("p2p and delivery hygiene", () => {
         replyFormat: "markdown",
         mentionOnReply: "off",
         allowAgentDelegation: false,
+        issueTracking: "off",
         rewriteIgnoreStyle: false,
       },
     ],
@@ -2416,6 +2418,7 @@ describe("completion mentions", () => {
       chatName: "私聊",
       mentionOnReply: "sender",
       allowAgentDelegation: false,
+      issueTracking: "off",
       rewriteIgnoreStyle: false,
     };
     const h = makeHarness(values, {
