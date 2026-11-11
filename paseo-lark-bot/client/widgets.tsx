@@ -161,14 +161,20 @@ export function SelectRow({
 }: {
   label: string;
   value: string;
-  tone?: "default" | "muted" | "warning";
+  tone?: "default" | "muted" | "warning" | "danger";
   expanded: boolean;
   onPress(): void;
   children?: ReactNode;
 }) {
   const c = colors();
   const valueColor =
-    tone === "warning" ? c.statusWarning : tone === "muted" ? c.foregroundMuted : c.foreground;
+    tone === "warning"
+      ? c.statusWarning
+      : tone === "danger"
+        ? c.statusDanger
+        : tone === "muted"
+          ? c.foregroundMuted
+          : c.foreground;
   return (
     <View style={{ gap: 8 }}>
       <HoverPressable
