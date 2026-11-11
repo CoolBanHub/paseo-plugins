@@ -11,6 +11,7 @@ import {
   type LarkBotProviderInfo,
 } from "../shared/contracts.ts";
 import {
+  ACK_MODE_OPTIONS,
   botValuesSchema,
   larkBotSettingsRpc,
   type BotValues,
@@ -26,6 +27,7 @@ import { AppCreationSection } from "./AppCreation.tsx";
 import {
   Card,
   CardTitle,
+  ChoicePill,
   FieldLabel,
   HoverPressable,
   InfoRow,
@@ -862,18 +864,20 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
           </Card>
           <Card>
             <CardTitle text="回执与通知" hint="处理过程中的可见性与提醒，只影响过程提示，不影响答案内容" />
-            <ToggleRow
-              label="表情回执"
-              hint="收到 @ 后在被 @ 的消息上加「处理中」表情，完成后换成完成表情；不额外发消息"
-              value={draft.ackReaction}
-              onChange={(value) => patchDraft({ ackReaction: value })}
-            />
-            <ToggleRow
-              label="文字确认"
-              hint="额外回复一条「收到，正在处理」；默认关闭，群聊里会显得吵"
-              value={draft.ackOnReceive}
-              onChange={(value) => patchDraft({ ackOnReceive: value })}
-            />
+            <FieldLabel text="收到 @ 后的回执方式（表情与文字二选一）" />
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+              {ACK_MODE_OPTIONS.map((option) => (
+                <ChoicePill
+                  key={option.value}
+                  label={option.label}
+                  active={draft.ackMode === option.value}
+                  onPress={() => patchDraft({ ackMode: option.value })}
+                />
+              ))}
+            </View>
+            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+              {ACK_MODE_OPTIONS.find((option) => option.value === draft.ackMode)?.hint ?? ""}
+            </Text>
             <ToggleRow
               label="处理进度卡片"
               hint="处理中原地更新一张卡片（用时、排队、当前工具）；需要机器人能发交互卡片"

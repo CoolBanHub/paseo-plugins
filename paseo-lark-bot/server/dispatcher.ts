@@ -1259,7 +1259,7 @@ export function createDispatcher(options: DispatcherOptions) {
         );
         return;
       }
-      if (values.ackOnReceive) {
+      if (values.ackMode === "text") {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
       const { text: prompt, topicRootText } = await withThreadContext(cliPath, event, instruction);
@@ -2224,7 +2224,7 @@ export function createDispatcher(options: DispatcherOptions) {
   // ── Emoji receipts ─────────────────────────────────────────────
 
   async function addReceipt(cliPath: string, messageId: string): Promise<void> {
-    if (!valuesCache.ackReaction) return;
+    if (valuesCache.ackMode !== "reaction") return;
     try {
       const reactionId = await reactAdd({ cliPath, messageId, emojiType: "OnIt" });
       if (reactionId) {

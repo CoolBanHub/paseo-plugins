@@ -119,6 +119,36 @@ export const REPLY_REWRITE_OPTIONS: ReadonlyArray<{
   },
 ];
 
+/**
+ * How a triggering message is acknowledged. Reaction and text are mutually
+ * exclusive by design: the emoji already tells the room the bot is working,
+ * so an extra text ack is duplicate noise. `off` keeps a quiet channel.
+ */
+export const ackModeSchema = z.enum(["reaction", "text", "off"]);
+export type AckMode = z.output<typeof ackModeSchema>;
+
+export const ACK_MODE_OPTIONS: ReadonlyArray<{
+  value: AckMode;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: "reaction",
+    label: "表情回执",
+    hint: "在被 @ 的消息上加「处理中」表情，完成后换成完成表情；不额外发消息。",
+  },
+  {
+    value: "text",
+    label: "文字确认",
+    hint: "额外回复一条「收到，正在处理」；话题里会多一条消息。",
+  },
+  {
+    value: "off",
+    label: "不发送",
+    hint: "不加表情也不回复收到；处理完成后仍会回复结果。",
+  },
+];
+
 /** Fallback rewrite instruction when the binding has no reply-style prompt. */
 export const DEFAULT_REWRITE_INSTRUCTION =
   "把回答改写成 3-5 句：先给结论，再给关键下一步或注意事项；面向非技术同事，少用术语；代码块、命令、文件路径、链接和数字原样保留。";
@@ -240,13 +270,12 @@ export const botValuesSchema = z.object({
   /** Reply with a hint when an unconfigured chat @-mentions the bot. */
   notifyUnmatched: z.boolean().default(false),
   /**
-   * Emoji receipt on the triggering message (OnIt while queued/running,
-   * DONE when the answer is delivered). Silent and dismissible, unlike a
-   * text ack in an active group.
+   * Single visible receipt style for a triggering message: an OnIt/DONE
+   * reaction, an explicit "received, working on it" text reply, or nothing.
+   * The two visible styles are mutually exclusive so a reaction never comes
+   * with a duplicate text ack.
    */
-  ackReaction: z.boolean().default(true),
-  /** Post an explicit "received, working on it" text reply. Off by default. */
-  ackOnReceive: z.boolean().default(false),
+  ackMode: ackModeSchema.default("reaction"),
   /**
    * Keep one live progress card per topic while a turn runs: elapsed time,
    * queue depth, current tool and the latest output line. Requires the
@@ -305,8 +334,20 @@ export const DEFAULT_BOT_VALUES: BotValues = botValuesSchema.parse({});
 export const larkBotSettings = defineSettings({
   id: "lark_bot",
   scope: "host",
-  version: 1,
+  version: 2,
   schema: botValuesSchema,
+  /**
+   * v1 had independent `ackReaction` / `ackOnReceive` flags, so both could be
+   * on at once. Collapse them into one mode; when both were enabled the emoji
+   * wins, because the duplicate text ack was the reason for this change.
+   */
+  migrate: (values, fromVersion) => {
+    if (fromVersion !== 1 || !values || typeof values !== "object") return values;
+    const { ackReaction, ackOnReceive, ...rest } = values as Record<string, unknown>;
+    const reaction = ackReaction !== false;
+    const text = ackOnReceive === true;
+    return { ...rest, ackMode: text && !reaction ? "text" : reaction ? "reaction" : "off" };
+  },
 });
 
 /** read/write contracts handled host-side once registerSettings ran. */

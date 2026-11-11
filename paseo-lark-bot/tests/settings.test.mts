@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { botValuesSchema, isDshProvider, replyStyleInstruction } from "../shared/settings.ts";
+import { botValuesSchema, isDshProvider, larkBotSettings, replyStyleInstruction } from "../shared/settings.ts";
 
 describe("chat binding schema", () => {
   it("fills the new model/thinking/permission/allowlist fields for old settings", () => {
@@ -84,10 +84,9 @@ describe("chat binding schema", () => {
     assert.equal(botValuesSchema.parse({ enabled: false }).enabled, false);
   });
 
-  it("defaults to quiet receipts, progress cards and split replies", () => {
+  it("defaults to reaction receipts, progress cards and split replies", () => {
     const parsed = botValuesSchema.parse({});
-    assert.equal(parsed.ackReaction, true);
-    assert.equal(parsed.ackOnReceive, false);
+    assert.equal(parsed.ackMode, "reaction");
     assert.equal(parsed.progressCard, true);
     assert.equal(parsed.replySplit, true);
     assert.equal(parsed.maxReplyChunks, 4);
@@ -96,6 +95,34 @@ describe("chat binding schema", () => {
     assert.equal(parsed.attachmentMaxMb, 50);
     assert.equal(parsed.rateLimitPerHour, 20);
     assert.equal(parsed.workspacePerBinding, false);
+  });
+
+  it("accepts one ack mode at a time and rejects combinations", () => {
+    for (const mode of ["reaction", "text", "off"] as const) {
+      assert.equal(botValuesSchema.parse({ ackMode: mode }).ackMode, mode);
+    }
+    assert.equal(botValuesSchema.safeParse({ ackMode: "both" }).success, false);
+  });
+
+  it("migrates v1 ack flags into one mutually exclusive mode", async () => {
+    assert.equal(larkBotSettings.version, 2);
+    const migrate = larkBotSettings.migrate;
+    assert.ok(migrate);
+    const at = async (values: Record<string, unknown>) =>
+      (await migrate(values, 1)) as Record<string, unknown>;
+
+    assert.equal((await at({ ackReaction: true, ackOnReceive: false })).ackMode, "reaction");
+    // Both on in v1 produced the duplicate text ack; the emoji wins.
+    assert.equal((await at({ ackReaction: true, ackOnReceive: true })).ackMode, "reaction");
+    assert.equal((await at({ ackReaction: false, ackOnReceive: true })).ackMode, "text");
+    assert.equal((await at({ ackReaction: false, ackOnReceive: false })).ackMode, "off");
+    // Missing flags use the v1 defaults: reaction on, text off.
+    assert.equal((await at({})).ackMode, "reaction");
+
+    const migrated = await at({ ackReaction: false, ackOnReceive: true, enabled: false });
+    assert.equal(migrated.enabled, false);
+    assert.equal("ackReaction" in migrated, false);
+    assert.equal("ackOnReceive" in migrated, false);
   });
 
   it("defaults completion mentions off and preserves a per-chat choice", () => {

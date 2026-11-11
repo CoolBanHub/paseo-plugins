@@ -27,8 +27,7 @@ interface ReplyCall {
 function baseValues(overrides: Partial<BotValues> = {}): BotValues {
   return {
     ...DEFAULT_BOT_VALUES,
-    ackOnReceive: false,
-    ackReaction: false,
+    ackMode: "off",
     progressCard: false,
     aiTitle: false,
     questionCards: false,
@@ -526,13 +525,14 @@ console.log(JSON.stringify({ ok: false, error: { message: "unexpected argv" } })
     assert.ok(h.replies[0].text.includes("没有读到文字内容"));
   });
 
-  it("acks received messages when ackOnReceive is enabled", async () => {
-    const h = makeHarness(baseValues({ ackOnReceive: true }));
+  it("sends a text ack but no reaction when ackMode is text", async () => {
+    const h = makeHarness(baseValues({ ackMode: "text" }));
     await h.dispatch.handleMessageEvent(groupEvent());
     await flush();
     assert.equal(h.replies.length >= 1, true);
     assert.ok(h.replies[0].text.includes("收到"), "first reply must be the ack");
     assert.equal(h.replies[0].messageId, "om_1");
+    assert.equal(h.reactions.length, 0, "text mode must not add a reaction");
     h.dispatch.handleTurnEnded(turnEnded(h.agentId, "处理结果答复"));
     await flush();
     const last = h.replies[h.replies.length - 1];
@@ -1406,10 +1406,10 @@ describe("question cards", () => {
 
 describe("bare mentions", () => {
   it("processes the thread context when the mention carries no text", async () => {
-    const h = makeHarness(baseValues({ ackOnReceive: true }));
+    const h = makeHarness(baseValues({ ackMode: "text" }));
     const dispatch = createDispatcher({
       paseo: h.paseoRef,
-      readValues: async () => baseValues({ ackOnReceive: true }),
+      readValues: async () => baseValues({ ackMode: "text" }),
       resolveCli: () => "/fake/lark-cli",
       readOpenId: async () => BOT,
       readRaw: async (_cli, id) => (id === "om_img" ? { image_key: "img_v3_abc" } : null),
@@ -1442,7 +1442,7 @@ describe("bare mentions", () => {
   });
 
   it("still asks for text when a fresh topic has nothing to work on", async () => {
-    const h = makeHarness(baseValues({ ackOnReceive: true }));
+    const h = makeHarness(baseValues({ ackMode: "text" }));
     await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_solo", content: "@测试机器人" }));
     await flush();
     assert.equal(h.created.length, 0);
@@ -2093,12 +2093,13 @@ describe("reply splitting and receipts", () => {
     assert.match(h.replies[h.replies.length - 1]?.text ?? "", /\/\d+）/);
   });
 
-  it("adds OnIt and DONE reactions around a turn", async () => {
-    const values = baseValues({ ackReaction: true, ackOnReceive: false });
+  it("adds OnIt and DONE reactions around a turn in reaction mode", async () => {
+    const values = baseValues({ ackMode: "reaction" });
     const h = makeHarness(values);
     await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_react", content: "@_user_1 处理" }));
     await flush();
     assert.deepEqual(h.reactions[0], { messageId: "om_react", emojiType: "OnIt" });
+    assert.equal(h.replies.length, 0, "reaction mode must not send a text ack");
     h.dispatch.handleTurnEnded(turnEnded("agent-1", "完成"));
     await flush();
     assert.equal(h.removedReactions.length, 1);
