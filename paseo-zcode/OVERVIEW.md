@@ -54,20 +54,22 @@ local ZCode sessions are listed in Paseo's session picker.
 ## Capabilities and limits
 
 - Prompting, interrupting, model / mode / thinking-level switching, permission
-  prompts, usage accounting per turn. When the turn completes, a compact
-  `Token 用量` notification appends the turn's generation speed
-  (`速度 186 tok/s`) alongside input / cache-read / output counts. The speed is
-  output tokens over the summed generated-content time of the turn's model
-  requests, the same decode-only definition ZCode's own `tokensPerSecond`
-  uses; the app-server forwards only delta frames, so a tool call or the turn
-  completion closes each segment, and a turn without content timing omits the
-  notice. Each emitted row is also appended to
-  `~/.paseo/plugin-data/zcode/turn-usage/<zcodeSessionId>.jsonl` (newest 400
-  entries kept), so a reopened session replays the rows with the same ids and
-  placement — before the next visible user message — instead of losing them
-  with the live stream. Sessions predating that log (or without rows) get one
-  `Token 用量（本会话累计）` fallback row plus a `session.usage` event built
-  from ZCode's `session/usage` totals when the session reopens.
+  prompts, usage accounting per model request. As each main-turn model request
+  commits, a compact `Token 用量` notification reports that request's input /
+  cache-read / cache-write / output counts and its generation speed
+  (`速度 186 tok/s`). ZCode pushes the per-request usage snapshot on
+  `session.updated`, so a multi-step turn shows accounting while it is still
+  running and the context meter advances with it; compact, title and subagent
+  requests are not counted. The speed is output tokens over that request's
+  generated-content time, the same decode-only definition ZCode's own
+  `tokensPerSecond` uses. Because the app-server forwards only delta frames, a
+  tool call, the model commit or the turn completion closes each segment, and a
+  request without content timing omits only the speed. Older app-server
+  versions that never push per-request usage fall back to one row at turn
+  completion. Usage rows are live-only: Paseo persists them with the agent
+  timeline, while replaying notifications on every reopen would duplicate
+  them; `session/usage` totals still seed the context meter when a session
+  opens.
 - ZCode's generic `AskUserQuestion` flow uses Paseo's native question form.
   The plugin answers `interaction/requestUserInput` as a `question`
   permission, maps Paseo's form answers back to ZCode's

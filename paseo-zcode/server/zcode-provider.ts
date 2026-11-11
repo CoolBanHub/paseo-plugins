@@ -38,7 +38,6 @@ import {
 import { resolveAccountRequestAuth } from "./zcode-account-oauth";
 import { ZcodeTaskIndex } from "./zcode-task-index";
 import { zcodeCatalogCacheKey } from "./zcode-catalog-key";
-import { recordTurnUsage, readTurnUsages, type TurnUsageEntry } from "./turn-usage-store";
 
 const SUPPORTED_CAPABILITIES = [
   "prompt.message",
@@ -298,6 +297,10 @@ interface TurnState {
   firstContentAt?: number;
   /** Summed generated-content time across this turn's model requests. */
   decodeMs: number;
+  /** Generated-content time of the model request that is currently streaming. */
+  stepDecodeMs: number;
+  /** Number of live usage rows emitted for this turn's model requests. */
+  usageRows: number;
   tools: Map<string, {
     name: string;
     input?: Record<string, unknown>;
@@ -822,19 +825,13 @@ function formatTokenCount(value: number): string {
 }
 
 /**
- * Generation throughput for one turn: ZCode reports aggregate output tokens in
- * `turn.completed`, while the plugin accumulates each generated segment's
- * first-content → boundary time. This is the same decode-only definition
- * ZCode's own `tokensPerSecond` debug figure uses (`durationMs -
- * timeToFirstContentMs`); because the app-server forwards only delta frames,
- * a tool call or the turn completion closes the segment.
+ * Generation throughput for one model request: ZCode reports output tokens when
+ * the request commits, while the plugin accumulates the request's
+ * first-content → commit time. This is the same decode-only definition ZCode's
+ * own `tokensPerSecond` debug figure uses (`durationMs - timeToFirstContentMs`);
+ * because the app-server forwards only delta frames, a tool call, a model
+ * commit or the turn completion closes the segment.
  */
-function formatGenerationSpeed(outputTokens: number | undefined, decodeMs: number): string | undefined {
-  const tps = decodeTokPerSec(outputTokens, decodeMs);
-  return tps === undefined ? undefined : formatTokPerSec(tps);
-}
-
-/** Numeric core of the decode figure, persisted for replay reconstruction. */
 function decodeTokPerSec(outputTokens: number | undefined, decodeMs: number): number | undefined {
   if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
   const tps = outputTokens / (decodeMs / 1000);
@@ -852,57 +849,128 @@ function openDecodeWindow(turn: TurnState, at: number): void {
 
 function closeDecodeWindow(turn: TurnState, at: number): void {
   if (turn.firstContentAt === undefined) return;
-  turn.decodeMs += Math.max(0, at - turn.firstContentAt);
+  const elapsed = Math.max(0, at - turn.firstContentAt);
+  turn.decodeMs += elapsed;
+  turn.stepDecodeMs += elapsed;
   turn.firstContentAt = undefined;
 }
 
-/** One compact per-turn token accounting row, shared by live emission and replay. */
-function turnUsageNoticeItem(paseoSessionId: string, entry: TurnUsageEntry): ProviderTimelineItem | undefined {
+interface UsageFields {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+function usageCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Normalize one model request's usage; older frames use cachedInputTokens. */
+function readUsageFields(usage: Record<string, unknown>): UsageFields {
+  const inputTokens = usageCount(usage.inputTokens);
+  const outputTokens = usageCount(usage.outputTokens);
+  const cacheReadTokens = usageCount(usage.cacheReadTokens) ?? usageCount(usage.cachedInputTokens);
+  const cacheWriteTokens = usageCount(usage.cacheWriteTokens) ?? usageCount(usage.cachedWriteInputTokens);
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+  };
+}
+
+function hasUsageTokens(fields: UsageFields): boolean {
+  return [fields.inputTokens, fields.outputTokens, fields.cacheReadTokens, fields.cacheWriteTokens]
+    .some((value) => value !== undefined && value > 0);
+}
+
+/** The context window a completed request occupies, matching ZCode's `T0e`. */
+function contextTokensFromUsage(fields: UsageFields): number | undefined {
+  const input = fields.inputTokens ?? (
+    fields.cacheReadTokens !== undefined || fields.cacheWriteTokens !== undefined
+      ? (fields.cacheReadTokens ?? 0) + (fields.cacheWriteTokens ?? 0)
+      : undefined
+  );
+  if (input === undefined) return undefined;
+  const total = input + (fields.outputTokens ?? 0);
+  return total > 0 ? total : undefined;
+}
+
+/**
+ * Only main-turn model requests count as the turn's steps. Compact, title and
+ * subagent requests also carry the same `usage` payload on `session.updated`.
+ */
+function isMainTurnModelUsage(payload: Record<string, unknown>): boolean {
+  const source = payload.querySource;
+  return source === undefined || source === "main_turn";
+}
+
+/** One compact token accounting row for a model request (or a legacy turn). */
+function usageNoticeItem(
+  paseoSessionId: string,
+  turnId: string,
+  step: number | undefined,
+  fields: UsageFields,
+  speedTokPerSec: number | undefined,
+): ProviderTimelineItem | undefined {
   const parts: string[] = [];
-  if (typeof entry.inputTokens === "number") parts.push(`输入 ${formatTokenCount(entry.inputTokens)}`);
-  if (typeof entry.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(entry.cacheReadTokens)}`);
-  if (typeof entry.cacheWriteTokens === "number" && entry.cacheWriteTokens > 0) {
-    parts.push(`缓存写 ${formatTokenCount(entry.cacheWriteTokens)}`);
+  if (fields.inputTokens !== undefined) parts.push(`输入 ${formatTokenCount(fields.inputTokens)}`);
+  if (fields.cacheReadTokens !== undefined) parts.push(`缓存读 ${formatTokenCount(fields.cacheReadTokens)}`);
+  if (fields.cacheWriteTokens !== undefined && fields.cacheWriteTokens > 0) {
+    parts.push(`缓存写 ${formatTokenCount(fields.cacheWriteTokens)}`);
   }
-  if (typeof entry.outputTokens === "number") parts.push(`输出 ${formatTokenCount(entry.outputTokens)}`);
-  if (typeof entry.speedTokPerSec === "number") parts.push(`速度 ${formatTokPerSec(entry.speedTokPerSec)}`);
+  if (fields.outputTokens !== undefined) parts.push(`输出 ${formatTokenCount(fields.outputTokens)}`);
+  if (speedTokPerSec !== undefined) parts.push(`速度 ${formatTokPerSec(speedTokPerSec)}`);
   if (!parts.length) return undefined;
   return {
     type: "notification",
-    id: `zcode:${paseoSessionId}:usage:${entry.turnId}`,
+    id: `zcode:${paseoSessionId}:usage:${turnId}${step === undefined ? "" : `:${step}`}`,
     level: "info",
     message: `Token 用量：${parts.join(" · ")}`,
   };
 }
 
 /**
- * Emit the turn's usage row and persist it for replay. Both happen on the
- * same condition — a computable decode speed — so a replayed session shows
- * exactly the rows the live stream showed.
+ * Emit one row as soon as a main-turn model request commits. The app-server
+ * pushes per-request usage on `session.updated` (the `ModelComplete` event), so
+ * a multi-step turn reports token accounting while it is still running instead
+ * of waiting for `turn.completed`.
+ */
+function emitStepUsage(
+  emit: (event: ProviderEvent) => void,
+  state: SessionState,
+  turn: TurnState,
+  usage: Record<string, unknown>,
+  at: number,
+): void {
+  closeDecodeWindow(turn, at);
+  const fields = readUsageFields(usage);
+  const speed = decodeTokPerSec(fields.outputTokens, turn.stepDecodeMs);
+  turn.stepDecodeMs = 0;
+  if (!hasUsageTokens(fields)) return;
+  const step = turn.usageRows + 1;
+  const item = usageNoticeItem(state.paseoSessionId, turn.turnId, step, fields, speed);
+  if (!item) return;
+  turn.usageRows = step;
+  emit({ type: "timeline.item", sessionId: state.paseoSessionId, item });
+}
+
+/**
+ * Fallback for app-server versions that do not push per-request usage: emit the
+ * turn total when the turn settles, preserving the previous behaviour.
  */
 function emitTurnUsage(
   emit: (event: ProviderEvent) => void,
   state: SessionState,
   turn: TurnState,
   usage: Record<string, unknown>,
-  turnUsageDir: string,
 ): void {
-  const output = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
-  const speed = decodeTokPerSec(output, turn.decodeMs);
+  const fields = readUsageFields(usage);
+  if (!hasUsageTokens(fields)) return;
+  const speed = decodeTokPerSec(fields.outputTokens, turn.decodeMs);
   if (speed === undefined) return;
-  const entry: TurnUsageEntry = {
-    turnId: turn.turnId,
-    recordedAt: Date.now(),
-    ...(typeof usage.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
-    ...(typeof usage.cacheReadTokens === "number" ? { cacheReadTokens: usage.cacheReadTokens } : {}),
-    ...(typeof usage.cacheWriteTokens === "number" && usage.cacheWriteTokens > 0
-      ? { cacheWriteTokens: usage.cacheWriteTokens }
-      : {}),
-    ...(output !== undefined ? { outputTokens: output } : {}),
-    speedTokPerSec: speed,
-  };
-  recordTurnUsage(turnUsageDir, state.zcodeSessionId, entry);
-  const item = turnUsageNoticeItem(state.paseoSessionId, entry);
+  const item = usageNoticeItem(state.paseoSessionId, turn.turnId, undefined, fields, speed);
   if (!item) return;
   emit({ type: "timeline.item", sessionId: state.paseoSessionId, item });
 }
@@ -922,20 +990,9 @@ export function zcodeHistoryTimelineItems(
   messages: unknown,
   sessionId: string,
   childSessionIds?: Map<string, string>,
-  turnUsages?: readonly TurnUsageEntry[],
 ): ProviderTimelineItem[] {
   if (!Array.isArray(messages)) return [];
   const items: ProviderTimelineItem[] = [];
-  // Persisted usage rows replay in settle order; each belongs after its own
-  // turn's content, so one row is closed out right before the next visible
-  // user message and any remainder trails the last replayed message.
-  const pendingUsage = (turnUsages ?? [])
-    .map((entry) => turnUsageNoticeItem(sessionId, entry))
-    .filter((item): item is ProviderTimelineItem => item !== undefined);
-  let usageHead = 0;
-  const flushOneUsage = () => {
-    if (usageHead < pendingUsage.length) items.push(pendingUsage[usageHead++]);
-  };
   for (const [messageIndex, raw] of messages.entries()) {
     if (!raw || typeof raw !== "object") continue;
     const message = raw as Record<string, unknown>;
@@ -1010,9 +1067,6 @@ export function zcodeHistoryTimelineItems(
       }
     }
     if (role === "user") {
-      // A visible user message opens the next turn; close out exactly the
-      // previous turn's usage row. The opening message has none before it.
-      if (messageIndex > 0) flushOneUsage();
       const text = parts
         .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
         .map((part) => part.type === "text" && typeof part.text === "string" ? part.text
@@ -1067,8 +1121,6 @@ export function zcodeHistoryTimelineItems(
     }
     flushText();
   }
-  // Usage of the newest turns trails after the last replayed message.
-  while (usageHead < pendingUsage.length) items.push(pendingUsage[usageHead++]);
   return items;
 }
 
@@ -1099,7 +1151,6 @@ export function createZcodeProvider(): ProviderRegistration {
 
       const dataDir = join(process.env.PASEO_HOME ?? join(process.env.HOME ?? "~", ".paseo"), "plugin-data", "zcode");
       const bridgeDir = join(dataDir, "bridge");
-      const turnUsageDir = join(dataDir, "turn-usage");
       mkdirSync(bridgeDir, { recursive: true });
 
       const client = new ZcodeProtocolClient({ cliPath, nodePath: resolveNodePath(), cwd: bridgeDir, onLog: log });
@@ -1335,6 +1386,8 @@ export function createZcodeProvider(): ProviderRegistration {
             reasoning: "",
             emittedAssistant: new Set(),
             decodeMs: 0,
+            stepDecodeMs: 0,
+            usageRows: 0,
             tools: new Map(),
           };
           state.turns.set(turnId, turn);
@@ -1683,6 +1736,7 @@ export function createZcodeProvider(): ProviderRegistration {
               // A new request; the previous window should already have been
               // closed by a finish/tool call, so drop only an incomplete one.
               turn.firstContentAt = undefined;
+              turn.stepDecodeMs = 0;
             } else if (kind === "finish" || kind === "error") {
               closeDecodeWindow(turn, event.timestamp);
             } else if (kind === "text_start" || kind === "reasoning_start" || kind === "tool_input_start"
@@ -1753,6 +1807,17 @@ export function createZcodeProvider(): ProviderRegistration {
             if (typeof payload.content === "string" && payload.content.trim()) {
               flushReasoning(state, turn);
               emitAssistantOnce(state, turn, payload.content);
+            }
+            // `ModelComplete` is projected as `session.updated` with the
+            // request's usage snapshot. Report each main-turn request as it
+            // commits, so a long tool-using turn streams token accounting
+            // instead of surfacing it only when the turn settles.
+            const usage = payload.usage && typeof payload.usage === "object" && !Array.isArray(payload.usage)
+              ? payload.usage as Record<string, unknown>
+              : undefined;
+            if (usage && turn.started && isMainTurnModelUsage(payload)) {
+              emitStepUsage(emit, state, turn, usage, event.timestamp);
+              emitUsageContext(emit, state, contextTokensFromUsage(readUsageFields(usage)), state.contextWindow);
             }
             break;
           }
@@ -1883,10 +1948,12 @@ export function createZcodeProvider(): ProviderRegistration {
               : resultType === "cancelled" ? "canceled" : "failed";
             // The app-server does not project a finish frame for every
             // request, so the completed turn is the final segment boundary.
-            // Emit the usage row before the turn settles so it belongs to the
-            // turn's timeline rather than trailing after its terminal event.
+            // Main-turn requests already reported their own rows as they
+            // committed; the total is only needed for older app-servers that
+            // never pushed a per-request usage snapshot.
             closeDecodeWindow(turn, event.timestamp);
-            emitTurnUsage(emit, state, turn, usage, turnUsageDir);
+            if (turn.usageRows === 0) emitTurnUsage(emit, state, turn, usage);
+            const totals = readUsageFields(usage);
             emit({
               type: "session.turn",
               sessionId: state.paseoSessionId,
@@ -1902,9 +1969,9 @@ export function createZcodeProvider(): ProviderRegistration {
               sessionId: state.paseoSessionId,
               turnId: event.turnId,
               usage: {
-                inputTokens: typeof usage.inputTokens === "number" ? usage.inputTokens : undefined,
-                outputTokens: typeof usage.outputTokens === "number" ? usage.outputTokens : undefined,
-                cachedInputTokens: typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined,
+                inputTokens: totals.inputTokens,
+                outputTokens: totals.outputTokens,
+                cachedInputTokens: totals.cacheReadTokens,
                 contextWindowMaxTokens: state.contextWindow,
                 contextWindowUsedTokens: state.contextUsed,
               },
@@ -2712,14 +2779,14 @@ export function createZcodeProvider(): ProviderRegistration {
             emit({ type: "session.persistence", sessionId: input.sessionId, persistence });
             emitSessionConfig(state, state.catalog ?? catalog);
             if (resuming && input.history === "replay") {
-              // Rebuild the settled per-turn usage rows (ids match the live
-              // stream) so desktop clients reopening the session keep them.
-              const turnUsages = readTurnUsages(turnUsageDir, zcodeSessionId);
-              for (const item of zcodeHistoryTimelineItems(historyMessages, input.sessionId, childSessionIds, turnUsages)) {
+              // Usage notices are live-only. Paseo persists timeline rows
+              // durably, while replaying a notification on every reopen would
+              // append it again (the projection drops notification ids), so
+              // rebuilding them here would multiply the rows. The session
+              // totals below still seed the context meter once after open.
+              for (const item of zcodeHistoryTimelineItems(historyMessages, input.sessionId, childSessionIds)) {
                 emit({ type: "timeline.item", sessionId: input.sessionId, item });
               }
-              // Sessions predating the usage log have no rows; surface the
-              // ZCode-reported session totals once, after the open settles.
               void (async () => {
                 try {
                   const totals = await client.requestOk("session/usage", { sessionId: zcodeSessionId }, 5_000);
@@ -2735,24 +2802,6 @@ export function createZcodeProvider(): ProviderRegistration {
                       ...(state.contextUsed !== undefined ? { contextWindowUsedTokens: state.contextUsed } : {}),
                     },
                   });
-                  if (!turnUsages.length) {
-                    const parts: string[] = [];
-                    if (typeof totals.inputTokens === "number") parts.push(`输入 ${formatTokenCount(totals.inputTokens)}`);
-                    if (typeof totals.cacheReadTokens === "number") parts.push(`缓存读 ${formatTokenCount(totals.cacheReadTokens)}`);
-                    if (typeof totals.outputTokens === "number") parts.push(`输出 ${formatTokenCount(totals.outputTokens)}`);
-                    if (parts.length) {
-                      emit({
-                        type: "timeline.item",
-                        sessionId: input.sessionId,
-                        item: {
-                          type: "notification",
-                          id: `zcode:${input.sessionId}:usage:cumulative`,
-                          level: "info",
-                          message: `Token 用量（本会话累计）：${parts.join(" · ")}`,
-                        },
-                      });
-                    }
-                  }
                 } catch {
                   // Totals are a replay nicety; an unavailable API must not fail the reopen.
                 }

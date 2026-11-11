@@ -593,16 +593,16 @@ test("resuming replays visible ZCode history before session.ready when requested
   });
 
   await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
-  // The replayed history precedes session.ready; the session-total fallback
-  // row arrives asynchronously after it.
+  // Usage notices are live-only; the session totals still update the context
+  // meter asynchronously after the history rows.
   await flush();
 
   const history = f.events.filter((event) => event.type === "timeline.item");
   assert.deepEqual(history.map((event) => event.item.type), [
-    "user_message", "reasoning", "assistant_message", "tool_call", "notification",
+    "user_message", "reasoning", "assistant_message", "tool_call",
   ]);
   assert.deepEqual(history.map((event) => event.item.id), [
-    "user-1", "reasoning-1", "assistant-1:text:0", "tool-1", "zcode:paseo-session:usage:cumulative",
+    "user-1", "reasoning-1", "assistant-1:text:0", "tool-1",
   ]);
   assert.equal(history[0].item.text, "Question");
   assert.equal(history[2].item.text, "Answer");
@@ -612,6 +612,8 @@ test("resuming replays visible ZCode history before session.ready when requested
   assert.ok(!history.some((event) => event.item.text === "Unclassified runtime content"));
   assert.ok(f.events.findIndex((event) => event.type === "timeline.item") < f.events.findIndex((event) => event.type === "session.ready"));
   assert.equal(f.calls("session/read").filter((call) => call.messageLimit === 1000).length, 1);
+  assert.equal(f.notifications().length, 0, "history replay must not duplicate usage notices");
+  assert.ok(f.events.some((event) => event.type === "session.usage"));
 });
 
 test("tool.updated scheduled supplies arguments that streaming never delivered", async (t) => {
@@ -1661,42 +1663,80 @@ test("decode speed aggregates every model request and skips tool-only requests",
   assert.match(f.notifications().at(-1).item.message, /速度 10 tok\/s/);
 });
 
-test("settled turn usage is persisted for replay", async (t) => {
+test("model completions stream one usage row per request", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });
   await f.prompt();
   const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
 
-  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-persist", timestamp: 1_000 });
-  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-persist", timestamp: 1_100, payload: { kind: "text_start" } });
-  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-persist", timestamp: 2_100, payload: { kind: "finish" } });
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-live", timestamp: 900 });
   f.sessionEvent({
-    type: "turn.completed", sessionId, turnId: "turn-persist", timestamp: 2_200,
+    type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 1_000,
+    payload: { kind: "text_delta", delta: "one" },
+  });
+  // A main-turn model request commits mid-turn; the app-server projects it as
+  // session.updated with the request's usage snapshot.
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-live", timestamp: 2_000,
     payload: {
-      resultType: "success",
-      usage: { inputTokens: 1_200, outputTokens: 100, cacheReadTokens: 45_000 },
+      querySource: "main_turn",
+      content: "step one",
+      contextWindow: 400_000,
+      usage: { inputTokens: 1_000, outputTokens: 50, cacheReadTokens: 800, cacheWriteTokens: 10 },
     },
   });
 
-  const file = path.join(process.env.PASEO_HOME, "plugin-data", "zcode", "turn-usage", `${sessionId}.jsonl`);
-  const entries = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].turnId, "turn-persist");
-  assert.equal(entries[0].inputTokens, 1_200);
-  assert.equal(entries[0].outputTokens, 100);
-  assert.equal(entries[0].cacheReadTokens, 45_000);
-  assert.equal(entries[0].speedTokPerSec, 100);
+  let rows = f.notifications();
+  assert.equal(rows.length, 1, "the first row lands while the turn is still running");
+  assert.equal(rows[0].item.id, "zcode:paseo-session:usage:turn-live:1");
+  assert.match(rows[0].item.message, /Token 用量：输入 1k · 缓存读 800 · 缓存写 10 · 输出 50 · 速度 50 tok\/s/);
+  const firstMeter = f.events.filter((event) => event.type === "session.usage").at(-1);
+  assert.equal(firstMeter.usage.contextWindowUsedTokens, 1_050);
+  assert.equal(firstMeter.usage.contextWindowMaxTokens, 400_000);
 
-  // A turn without a decode figure emits no row and persists nothing.
-  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-no-stream", timestamp: 2_500 });
   f.sessionEvent({
-    type: "turn.completed", sessionId, turnId: "turn-no-stream", timestamp: 3_000,
-    payload: { resultType: "success", usage: { inputTokens: 5, outputTokens: 1 } },
+    type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 3_000,
+    payload: { kind: "reasoning_delta", delta: "two" },
   });
-  assert.equal(fs.readFileSync(file, "utf8").trim().split("\n").length, 1);
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-live", timestamp: 4_500,
+    payload: { querySource: "main_turn", usage: { inputTokens: 1_200, outputTokens: 100 } },
+  });
+
+  rows = f.notifications();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].item.id, "zcode:paseo-session:usage:turn-live:2");
+  assert.match(rows[1].item.message, /Token 用量：输入 1\.2k · 输出 100 · 速度 67 tok\/s/);
+
+  // Compact, title and subagent requests, plus all-zero hydration snapshots,
+  // never become turn steps.
+  for (const [index, payload] of [
+    { querySource: "compact", usage: { inputTokens: 9_000, outputTokens: 400 } },
+    { querySource: "subagent", usage: { inputTokens: 8_000, outputTokens: 300 } },
+    { querySource: "main_turn", usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } },
+  ].entries()) {
+    f.sessionEvent({
+      type: "session.updated", sessionId, turnId: "turn-live", timestamp: 5_000 + index,
+      payload,
+    });
+  }
+  assert.equal(f.notifications().length, 2);
+
+  // Per-step rows already cover the turn; settling must not append a total.
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-live", timestamp: 6_000,
+    payload: {
+      response: "done",
+      resultType: "success",
+      usage: { inputTokens: 2_200, outputTokens: 150, cacheReadTokens: 800 },
+    },
+  });
+  assert.equal(f.notifications().length, 2);
+  assert.ok(f.events.some((event) => event.type === "session.turn"
+    && event.turnId === "turn-live" && event.state === "completed"));
 });
 
-test("replayed sessions rebuild persisted usage rows per turn", async (t) => {
+test("replayed sessions leave usage notices to the live timeline", async (t) => {
   const f = await fixture(t, {
     historyMessages: [
       {
@@ -1717,13 +1757,6 @@ test("replayed sessions rebuild persisted usage rows per turn", async (t) => {
       },
     ],
   });
-  const usageDir = path.join(process.env.PASEO_HOME, "plugin-data", "zcode", "turn-usage");
-  fs.mkdirSync(usageDir, { recursive: true });
-  fs.writeFileSync(path.join(usageDir, "sess_history.jsonl"), [
-    JSON.stringify({ turnId: "turn-a", recordedAt: 1, inputTokens: 1_000, outputTokens: 40, cacheReadTokens: 300, speedTokPerSec: 20 }),
-    JSON.stringify({ turnId: "turn-b", recordedAt: 2, inputTokens: 2_000, outputTokens: 80, speedTokPerSec: 8.5 }),
-    "",
-  ].join("\n"));
 
   await f.open({}, { version: 1, data: { zcodeSessionId: "sess_history" } }, "replay");
   await flush();
@@ -1732,15 +1765,12 @@ test("replayed sessions rebuild persisted usage rows per turn", async (t) => {
   assert.deepEqual(rows.map((item) => `${item.type}:${item.id}`), [
     "user_message:user-1",
     "assistant_message:assistant-1:text:0",
-    "notification:zcode:paseo-session:usage:turn-a",
     "user_message:user-2",
     "assistant_message:assistant-2:text:0",
-    "notification:zcode:paseo-session:usage:turn-b",
   ]);
-  assert.match(rows[2].message, /Token 用量：输入 1k · 缓存读 300 · 输出 40 · 速度 20 tok\/s/);
-  assert.match(rows.at(-1).message, /Token 用量：输入 2k · 输出 80 · 速度 8\.5 tok\/s/);
-  // Per-turn rows exist, so no cumulative fallback row appears.
-  assert.ok(!f.notifications().some((event) => event.item.id.endsWith(":usage:cumulative")));
+  // Paseo records live notifications durably; replaying them on every reopen
+  // would append duplicates because the projection drops notification ids.
+  assert.equal(f.notifications().length, 0);
   // Session totals still reach the client as one usage event.
   const totals = f.events.filter((event) => event.type === "session.usage").at(-1);
   assert.equal(totals.usage.inputTokens, 1_000);
@@ -1748,7 +1778,7 @@ test("replayed sessions rebuild persisted usage rows per turn", async (t) => {
   assert.equal(totals.usage.contextWindowMaxTokens, 500_000);
 });
 
-test("replayed sessions without persisted rows fall back to session totals", async (t) => {
+test("replayed sessions surface session totals without a notice", async (t) => {
   const f = await fixture(t, {
     historyMessages: [
       {
@@ -1766,9 +1796,7 @@ test("replayed sessions without persisted rows fall back to session totals", asy
   await flush();
 
   assert.equal(f.calls("session/usage").length, 1);
-  const fallback = f.notifications().find((event) => event.item.id.endsWith(":usage:cumulative"));
-  assert.ok(fallback, "a cumulative usage row was emitted");
-  assert.match(fallback.item.message, /Token 用量（本会话累计）：输入 1k · 缓存读 50 · 输出 234/);
+  assert.equal(f.notifications().length, 0);
   const totals = f.events.filter((event) => event.type === "session.usage").at(-1);
   assert.equal(totals.usage.inputTokens, 1_000);
   assert.equal(totals.usage.outputTokens, 234);
