@@ -46,6 +46,8 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         replyStyle: "default",
         replyStylePrompt: "",
         replyRewrite: "off",
+        rewriteProvider: "",
+        rewriteModel: "",
         replyFormat: "markdown",
         mentionOnReply: "off",
       },
@@ -317,6 +319,8 @@ describe("createDispatcher", () => {
     values.chats[0] = {
       ...values.chats[0],
       replyRewrite: "always",
+      rewriteProvider: "",
+      rewriteModel: "",
       replyStyle: "custom",
       replyStylePrompt: "用三句话回答",
     };
@@ -335,7 +339,32 @@ describe("createDispatcher", () => {
     assert.equal(h.replies[0].text, "精简版回答");
     assert.equal(seen.length, 1);
     assert.equal(seen[0].text, "原始长回答");
+    assert.equal(seen[0].provider, "claude");
     assert.match(seen[0].instruction, /用三句话回答/);
+  });
+
+  it("uses the independent rewrite provider/model when configured", async () => {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0],
+      replyRewrite: "always",
+      rewriteProvider: "codex",
+      rewriteModel: "gpt-5-mini",
+    };
+    let seenProvider = "";
+    const h = makeHarness(values, {
+      resolveProvider: async (provider, model) => (model ? `${provider}/${model}` : provider),
+      rewriteReply: async (options) => {
+        seenProvider = options.provider;
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始回答"));
+    await flush();
+    assert.equal(seenProvider, "codex/gpt-5-mini");
+    assert.equal(h.replies[0].text, "精简版回答");
   });
 
   it("does not rewrite short answers in long mode", async () => {
@@ -1319,6 +1348,8 @@ describe("p2p and delivery hygiene", () => {
         replyStyle: "default",
         replyStylePrompt: "",
         replyRewrite: "off",
+        rewriteProvider: "",
+        rewriteModel: "",
         replyFormat: "markdown",
         mentionOnReply: "off",
       },

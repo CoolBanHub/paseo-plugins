@@ -99,6 +99,15 @@ export function BindingEditor({
     binding.permission && !provider?.permissionOptions.some((option) => option.value === binding.permission)
       ? binding.permission
       : null;
+  const rewriteProviderInfo = binding.rewriteProvider
+    ? providers.find((candidate) => candidate.id === binding.rewriteProvider)
+    : undefined;
+  const unknownRewriteProvider =
+    binding.rewriteProvider && !rewriteProviderInfo ? binding.rewriteProvider : null;
+  const unknownRewriteModel =
+    binding.rewriteModel && !rewriteProviderInfo?.models.some((model) => model.id === binding.rewriteModel)
+      ? binding.rewriteModel
+      : null;
   const defaultPermissionLabel = provider?.defaultPermission
     ? permissionLabel(provider, provider.defaultPermission)
     : null;
@@ -355,9 +364,73 @@ export function BindingEditor({
           {REPLY_REWRITE_OPTIONS.find((option) => option.value === binding.replyRewrite)?.hint ?? ""}
         </Text>
         {binding.replyRewrite !== "off" ? (
-          <Text style={{ fontSize: 11, color: colors().statusWarning, lineHeight: 17 }}>
-            会额外调用一次当前绑定的模型，增加延迟和费用；原文保留在 Paseo，失败/超时自动发原文。带 @ 接力的回复不改写。
-          </Text>
+          <>
+            <FieldLabel text="改写模型（留空跟随当前绑定）" />
+            {providers.length > 0 ? (
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                <ChoicePill
+                  label="跟随当前绑定"
+                  active={!binding.rewriteProvider}
+                  onPress={() => onPatch({ rewriteProvider: "", rewriteModel: "" })}
+                />
+                {providers.map((candidate) => (
+                  <ChoicePill
+                    key={candidate.id}
+                    label={candidate.label}
+                    active={binding.rewriteProvider === candidate.id}
+                    onPress={() => onPatch({ rewriteProvider: candidate.id, rewriteModel: "" })}
+                  />
+                ))}
+                {unknownRewriteProvider ? (
+                  <ChoicePill
+                    label={`${unknownRewriteProvider}（未在列表）`}
+                    active
+                    onPress={() => onPatch({ rewriteProvider: "", rewriteModel: "" })}
+                  />
+                ) : null}
+              </View>
+            ) : (
+              <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                未获取到 provider 列表；留空跟随当前绑定。
+              </Text>
+            )}
+            {binding.rewriteProvider ? (
+              <>
+                <FieldLabel text="改写模型（留空 = 该 provider 默认模型）" />
+                {(rewriteProviderInfo?.models.length ?? 0) > 0 || unknownRewriteModel ? (
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                    <ChoicePill
+                      label="默认"
+                      active={!binding.rewriteModel}
+                      onPress={() => onPatch({ rewriteModel: "" })}
+                    />
+                    {rewriteProviderInfo?.models.map((model) => (
+                      <ChoicePill
+                        key={model.id}
+                        label={model.label + (model.isDefault ? "（默认）" : "")}
+                        active={binding.rewriteModel === model.id}
+                        onPress={() => onPatch({ rewriteModel: model.id })}
+                      />
+                    ))}
+                    {unknownRewriteModel ? (
+                      <ChoicePill
+                        label={`${unknownRewriteModel}（未在列表）`}
+                        active
+                        onPress={() => onPatch({ rewriteModel: "" })}
+                      />
+                    ) : null}
+                  </View>
+                ) : (
+                  <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                    该 provider 没有可选模型，留空使用默认模型。
+                  </Text>
+                )}
+              </>
+            ) : null}
+            <Text style={{ fontSize: 11, color: colors().statusWarning, lineHeight: 17 }}>
+              会额外调用一次模型，增加延迟和费用；原文保留在 Paseo，失败/超时自动发原文。带 @ 接力的回复不改写。
+            </Text>
+          </>
         ) : null}
         <FieldLabel text="回复格式（富文本@ 可在回复里 @ 其他机器人接力）" />
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>

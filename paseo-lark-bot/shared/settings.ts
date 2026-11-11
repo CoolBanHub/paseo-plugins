@@ -194,6 +194,10 @@ export const chatBindingSchema = z.object({
   replyStylePrompt: z.string().default(""),
   /** Optional AI rewrite of the final answer before sending it to Feishu. */
   replyRewrite: replyRewriteSchema.default("off"),
+  /** Provider used only for the rewrite; empty follows the main binding. */
+  rewriteProvider: z.string().default(""),
+  /** Model used only for the rewrite; empty means that provider's default. */
+  rewriteModel: z.string().default(""),
   replyFormat: replyFormatSchema.default("markdown"),
   /** Who to @ in the group after the turn finishes. */
   mentionOnReply: mentionOnReplySchema.default("off"),

@@ -199,6 +199,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               replyStyle: "default",
               replyStylePrompt: "",
               replyRewrite: "off",
+              rewriteProvider: "",
+              rewriteModel: "",
               replyFormat: "markdown",
               mentionOnReply: "off",
             },
@@ -1006,6 +1008,8 @@ function normalize(values: BotValues): BotValues {
       cwd: chat.cwd.trim(),
       systemPrompt: chat.systemPrompt.trim(),
       replyStylePrompt: chat.replyStylePrompt.trim(),
+      rewriteProvider: chat.rewriteProvider.trim(),
+      rewriteModel: chat.rewriteModel.trim(),
     })),
   };
 }

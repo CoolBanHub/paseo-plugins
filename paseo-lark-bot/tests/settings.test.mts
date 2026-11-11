@@ -19,16 +19,31 @@ describe("chat binding schema", () => {
     assert.equal(binding.replyStyle, "default");
     assert.equal(binding.replyStylePrompt, "");
     assert.equal(binding.replyRewrite, "off");
+    assert.equal(binding.rewriteProvider, "");
+    assert.equal(binding.rewriteModel, "");
     assert.equal(binding.replyFormat, "markdown");
   });
 
-  it("accepts explicit AI rewrite modes", () => {
+  it("accepts explicit AI rewrite modes and an independent model", () => {
     const parse = (value: string) =>
       botValuesSchema.parse({ chats: [{ chatId: "oc_group", provider: "dsh", replyRewrite: value }] }).chats[0]
         .replyRewrite;
     assert.equal(parse("off"), "off");
     assert.equal(parse("long"), "long");
     assert.equal(parse("always"), "always");
+
+    const binding = botValuesSchema.parse({
+      chats: [
+        {
+          chatId: "oc_group",
+          provider: "dsh",
+          rewriteProvider: "codex",
+          rewriteModel: "gpt-5-mini",
+        },
+      ],
+    }).chats[0];
+    assert.equal(binding.rewriteProvider, "codex");
+    assert.equal(binding.rewriteModel, "gpt-5-mini");
   });
 
   it("maps reply-style presets to prompt text and trims custom text", () => {

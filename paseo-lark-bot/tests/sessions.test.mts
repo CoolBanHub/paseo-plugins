@@ -74,6 +74,8 @@ const binding: ChatBinding = {
   replyStyle: "default",
   replyStylePrompt: "",
   replyRewrite: "off",
+  rewriteProvider: "",
+  rewriteModel: "",
   replyFormat: "markdown",
   mentionOnReply: "off",
 };
@@ -1346,6 +1348,8 @@ describe("default system prompt", () => {
       replyStyle: "custom",
       replyStylePrompt: "  用三句话回答  ",
       replyRewrite: "off",
+      rewriteProvider: "",
+      rewriteModel: "",
     });
     await flush();
     assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);

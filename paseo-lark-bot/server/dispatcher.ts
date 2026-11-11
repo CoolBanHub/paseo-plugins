@@ -1859,8 +1859,9 @@ export function createDispatcher(options: DispatcherOptions) {
     let body = text;
     if (binding && meta && shouldRewriteReply(binding, body, meta.outcome)) {
       const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
-      const provider = overrides.provider ?? binding.provider;
-      const model = overrides.model ?? binding.model;
+      const rewriteProvider = binding.rewriteProvider.trim();
+      const provider = rewriteProvider || overrides.provider || binding.provider;
+      const model = rewriteProvider ? binding.rewriteModel.trim() : (overrides.model ?? binding.model);
       try {
         const resolvedProvider = options.resolveProvider
           ? await options.resolveProvider(provider, model)
