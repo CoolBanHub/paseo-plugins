@@ -2,6 +2,6 @@
   "id": "zcode",
   "name": "ZCode（GLM）",
   "requirements": {
-    "paseo": ">=0.11.4"
+    "paseo": ">=0.15.3"
   }
 }

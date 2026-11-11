@@ -49,7 +49,7 @@ local ZCode sessions are listed in Paseo's session picker.
   `/Applications/ZCode.app` (or set `ZCODE_CLI_PATH` to a `zcode.cjs`).
 - The ZCode CLI must be signed in (`zcode login`) — credentials are shared
   with the desktop app.
-- Paseo >= 0.11.4.
+- Paseo >= 0.15.3.
 
 ## Capabilities and limits
 

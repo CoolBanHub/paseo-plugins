@@ -15,7 +15,7 @@
 
 ## 前置条件
 
-- Paseo ≥ 0.11.4，且 Claude provider 可用（已安装 Claude Code）；
+- Paseo ≥ 0.15.3，且 Claude provider 可用（已安装 Claude Code）；
 - 至少一个厂商的 API Key，或一个自建的兼容端点（本地 http 端点仅允许回环地址）。
 
 ## 使用

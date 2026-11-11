@@ -77,7 +77,7 @@ dsh's launcher refuses Electron runtime fingerprints.
   the same way. The Web profile's current model definitions, including
   reasoning-effort options, are overlaid automatically at discovery and
   session startup. Credentials resolve from `~/.dsh/.credentials.yaml`.
-- Paseo >= 0.12.0.
+- Paseo >= 0.15.3.
 
 ## Project modes
 

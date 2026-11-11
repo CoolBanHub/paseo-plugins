@@ -95,7 +95,7 @@ merge/rebase/cherry-pick banners.
 ## Requirements
 
 - `git` (>= 2.16 for pathspec stash) on the daemon's PATH.
-- Paseo >= 0.11.4.
+- Paseo >= 0.15.3.
 
 ## Limits
 

@@ -7,7 +7,7 @@
 - Reloading is safe anytime (no provider sessions to lose):
   `paseo plugin reload git-manager`. Client-side changes may need the Paseo
   app to reload the plugin bundle (reopen the panel or restart the app).
-- The daemon runs Paseo 0.11.4 — keep `paseo-plugin.json` requirements and the
+- The daemon runs Paseo 0.15.3 — keep `paseo-plugin.json` requirements and the
   `@getpaseo/plugin` devDependency aligned with it.
 - New git read paths: add the parsing as an exported pure-ish function in
   `server/git-ops.ts` plus a fixture-repo test before wiring an RPC contract

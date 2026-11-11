@@ -22,12 +22,12 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 <!-- plugin-requirements:start -->
 | 目录 | 插件 ID | 显示名称 | Paseo 要求 | 开发 SDK | 额外 Node 要求 |
 | --- | --- | --- | --- | --- | --- |
-| [paseo-claude-models/](paseo-claude-models/) | `claude-models` | Claude 自定义模型 | `>=0.11.4` | `0.12.0` | — |
-| [paseo-dsh/](paseo-dsh/) | `dsh` | dsh (DeepSeek) | `>=0.12.0` | `0.12.0` | `>=22.15.0` |
-| [paseo-git/](paseo-git/) | `git-manager` | Git 管理 | `>=0.11.4` | `0.11.4` | — |
-| [paseo-lark-bot/](paseo-lark-bot/) | `lark-bot` | 飞书机器人 | `>=0.11.4` | `0.12.0` | — |
-| [paseo-lark-notify/](paseo-lark-notify/) | `lark-notify` | 飞书通知 | `>=0.11.4` | `0.12.0` | — |
-| [paseo-zcode/](paseo-zcode/) | `zcode` | ZCode（GLM） | `>=0.11.4` | `0.11.4` | — |
+| [paseo-claude-models/](paseo-claude-models/) | `claude-models` | Claude 自定义模型 | `>=0.15.3` | `0.15.3` | — |
+| [paseo-dsh/](paseo-dsh/) | `dsh` | dsh (DeepSeek) | `>=0.15.3` | `0.15.3` | `>=22.15.0` |
+| [paseo-git/](paseo-git/) | `git-manager` | Git 管理 | `>=0.15.3` | `0.15.3` | — |
+| [paseo-lark-bot/](paseo-lark-bot/) | `lark-bot` | 飞书机器人 | `>=0.15.3` | `0.15.3` | — |
+| [paseo-lark-notify/](paseo-lark-notify/) | `lark-notify` | 飞书通知 | `>=0.15.3` | `0.15.3` | — |
+| [paseo-zcode/](paseo-zcode/) | `zcode` | ZCode（GLM） | `>=0.15.3` | `0.15.3` | — |
 <!-- plugin-requirements:end -->
 
 各插件自身的其他依赖与限制见上表及对应 `OVERVIEW.md`。

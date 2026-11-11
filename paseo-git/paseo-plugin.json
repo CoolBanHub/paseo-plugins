@@ -2,6 +2,6 @@
   "id": "git-manager",
   "name": "Git 管理",
   "requirements": {
-    "paseo": ">=0.11.4"
+    "paseo": ">=0.15.3"
   }
 }

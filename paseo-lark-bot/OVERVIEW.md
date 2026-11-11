@@ -29,7 +29,7 @@ dsh ask_user_question → 开启 questionCards 后以交互卡片发到话题，
 
 ## 前置条件
 
-- Paseo ≥ 0.11.4；
+- Paseo ≥ 0.15.3；
 - 已安装 lark-cli（**扫码一键创建新应用需 ≥ 1.0.98**）；应用凭证三选一：直接用「使用 lark-cli 当前应用」沿用已配置的应用，或手动填写 App ID / App Secret（保存时自动验证并写入 lark-cli），或扫码创建一个新应用；
 - 飞书开发者后台（该 appId）：
   - 事件订阅切换为**长连接**方式，并添加事件 `im.message.receive_v1`（接收消息）；
