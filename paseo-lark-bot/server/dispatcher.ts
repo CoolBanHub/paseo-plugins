@@ -75,6 +75,7 @@ import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
 import { createHelperAgent, ensureWorkspace, workspaceTitleFor } from "./workspace.ts";
 import {
   DEFAULT_BOT_VALUES,
+  NEUTRAL_REWRITE_INSTRUCTION,
   REPLY_REWRITE_LONG_CHARS,
   replyStyleInstruction,
   type BotValues,
@@ -2106,7 +2107,9 @@ export function createDispatcher(options: DispatcherOptions) {
           chatId,
           topicKey: meta.topicKey ?? topicKey ?? "",
           text: body,
-          instruction: replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt),
+          instruction: binding.rewriteIgnoreStyle
+            ? NEUTRAL_REWRITE_INSTRUCTION
+            : replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt),
           log,
         });
         if (rewritten) body = rewritten;

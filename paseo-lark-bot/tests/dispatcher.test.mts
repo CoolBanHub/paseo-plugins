@@ -9,7 +9,7 @@ import type {
 } from "../server/sessions.ts";
 import { questionCardToken } from "../server/question-card.ts";
 import type { RewriteReplyOptions } from "../server/rewrite.ts";
-import { DEFAULT_BOT_VALUES, type BotValues } from "../shared/settings.ts";
+import { DEFAULT_BOT_VALUES, NEUTRAL_REWRITE_INSTRUCTION, type BotValues } from "../shared/settings.ts";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +50,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         replyFormat: "markdown",
         mentionOnReply: "off",
         allowAgentDelegation: false,
+        rewriteIgnoreStyle: false,
       },
     ],
     ...overrides,
@@ -341,6 +342,33 @@ describe("createDispatcher", () => {
     assert.equal(seen[0].text, "原始长回答");
     assert.equal(seen[0].provider, "claude");
     assert.match(seen[0].instruction, /用三句话回答/);
+  });
+
+  it("rewrites with the neutral instruction when rewriteIgnoreStyle is on", async () => {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0],
+      replyRewrite: "always",
+      rewriteProvider: "",
+      rewriteModel: "",
+      replyStyle: "custom",
+      replyStylePrompt: "用三句话回答",
+      rewriteIgnoreStyle: true,
+    };
+    let seenInstruction = "";
+    const h = makeHarness(values, {
+      rewriteReply: async (options) => {
+        seenInstruction = options.instruction;
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始长回答"));
+    await flush();
+    assert.equal(h.replies.length, 1);
+    assert.equal(h.replies[0].text, "精简版回答");
+    assert.equal(seenInstruction, NEUTRAL_REWRITE_INSTRUCTION);
   });
 
   it("uses the independent rewrite provider/model when configured", async () => {
@@ -1472,6 +1500,7 @@ describe("p2p and delivery hygiene", () => {
         replyFormat: "markdown",
         mentionOnReply: "off",
         allowAgentDelegation: false,
+        rewriteIgnoreStyle: false,
       },
     ],
   });
@@ -2387,6 +2416,7 @@ describe("completion mentions", () => {
       chatName: "私聊",
       mentionOnReply: "sender",
       allowAgentDelegation: false,
+      rewriteIgnoreStyle: false,
     };
     const h = makeHarness(values, {
       readThreadRootDetail: async () => ({ text: null, senderOpenId: "ou_user", senderName: "张三" }),

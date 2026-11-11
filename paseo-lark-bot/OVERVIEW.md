@@ -83,12 +83,12 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 | `aiTitle` | `true` | 新话题首次 @ 时，用该会话绑定的模型跑一次一次性命名轮次，为智能体会话生成一句不超过 40 字、直接描述任务内容的标题（首轮回复会稍慢）。失败、超时（45 秒）或关闭时回退为清洗后的话题文本（截 60 字） |
 | `notifyPermission` | `false` | 普通权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题；dsh 的 ask_user_question 走 `questionCards` |
 | `questionCards` | `true` | 把 dsh 的 ask_user_question 以 Card 2.0 发到话题，点选项/多选后提交即可回答；需要飞书后台开启 `card.action.trigger` 回调。关闭后问题只能在 Paseo 处理 |
-| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyRewrite`、`rewriteProvider`、`rewriteModel`、`replyFormat`、`mentionOnReply`、`allowAgentDelegation` |
+| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyRewrite`、`rewriteProvider`、`rewriteModel`、`rewriteIgnoreStyle`、`replyFormat`、`mentionOnReply`、`allowAgentDelegation` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。设置保存会串行执行，避免并发 stop/start。
 - 每条绑定可选择**模型**、**思考深度**和**权限**：模型列表来自 Paseo provider 快照，留空使用 provider 默认模型；思考深度来自所选模型的 thinking options，留空使用模型默认（dsh 留空仍为最深 `max`）；权限在 Claude/Codex/ZCode 等 provider 上对应 provider mode（如 plan / acceptEdits / bypass、Codex default / full-access），在 dsh 上对应权限预设（仅可查看 / 工作区内修改 / 完全权限），留空时 dsh 沿用旧的 `danger-full-access`。
 - 每条绑定可选**回复风格**（`replyStyle`）：`default` / `concise`（3-5 句结论 + 下一步，保留代码命令）/ `plain`（面向非技术同事）/ `custom`（使用 `replyStylePrompt`）。风格指令追加在系统提示末尾，**不额外调用模型、不增加费用**；它只是提示词，模型仍可能不完全遵守。硬性长度仍由全局 `maxReplyChars` 和 `replySplit` 控制。保存后对新建的智能体会话生效；已有话题可发 `/new` 或等空闲重建后使用新风格。
-- 每条绑定可选 **AI 改写**（`replyRewrite`）：`off`（默认）/ `long`（超过 800 字才改写）/ `always`。开启后最终回答会再跑一次一次性模型轮次，用当前话题覆盖后的 provider/model 和上面的回复风格，把原文压成短版再发飞书；**会增加一次模型调用、延迟和费用**。原文保留在 Paseo 时间线；改写失败、超时或为空时自动发送原文。带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写。
+- 每条绑定可选 **AI 改写**（`replyRewrite`）：`off`（默认）/ `long`（超过 800 字才改写）/ `always`。开启后最终回答会再跑一次一次性模型轮次，用当前话题覆盖后的 provider/model 和上面的回复风格，把原文压成短版再发飞书；**会增加一次模型调用、延迟和费用**。原文保留在 Paseo 时间线；改写失败、超时或为空时自动发送原文。带 @（`<at>`）的回复（包括 `[[@名字]]` 解析出的提及）、失败/取消提示不改写。改写轮次**不携带**绑定的 `systemPrompt`，只带回复风格指令；风格为 `default` 时回退到内置的「3-5 句、面向非技术同事」默认改写指令。开启 `rewriteIgnoreStyle`（默认关）后改写不再套用任何风格，只按「压缩长度、保持原文语气与术语深度」的中性指令改写。
 - **独立改写模型**：可单独选择 `rewriteProvider` / `rewriteModel`（改写模型留空 = 该 provider 默认模型），不选则跟随主绑定/话题覆盖。适合“主回答用强模型、改写用便宜快模型”；改写只使用 provider/model，思考深度和权限用该 provider 默认。
 - `systemPrompt` 是替换而不是追加：填写后不再使用插件默认提示（包括提示注入边界、附件 helper 用法和 lark-cli 能力指针）；`replyStyle` / `replyStylePrompt` 会在这份自定义提示末尾再追加风格指令。
 - 每条绑定可配置「允许 @ 的成员」（`allowedUsers`，按飞书 open_id 匹配）：留空表示**所有人**都可以 @ 并触发（默认）；填写后只有名单内成员能驱动智能体。非名单成员 @ 机器人时只回复一条「当前会话仅允许指定成员 @ 我处理」提示，不创建智能体；但这条 @ 的文字、图片、视频、文件仍会作为话题上下文记录，方便名单内成员追问前文。机器人发送者不在名单内时，其 @ 静默忽略（不回复提示），但消息同样进入话题历史，避免机器人互相触发。

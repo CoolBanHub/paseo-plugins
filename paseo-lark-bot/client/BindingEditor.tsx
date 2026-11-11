@@ -381,6 +381,12 @@ export function BindingEditor({
                 )}
               </>
             ) : null}
+            <ToggleRow
+              label="改写不套用回复风格"
+              hint="开启后改写只压缩长度，保持原文的语气与术语深度；不注入回复风格，风格为「默认」时也不用内置的通俗化指令"
+              value={binding.rewriteIgnoreStyle}
+              onChange={(value) => onPatch({ rewriteIgnoreStyle: value })}
+            />
             <Text style={{ fontSize: 11, color: colors().statusWarning, lineHeight: 17 }}>
               会额外调用一次模型，增加延迟和费用；原文保留在 Paseo，失败/超时自动发原文。带 @ 接力的回复不改写。
             </Text>

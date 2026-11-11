@@ -154,6 +154,15 @@ export const DEFAULT_REWRITE_INSTRUCTION =
   "把回答改写成 3-5 句：先给结论，再给关键下一步或注意事项；面向非技术同事，少用术语；代码块、命令、文件路径、链接和数字原样保留。";
 
 /**
+ * Rewrite instruction for bindings that set rewriteIgnoreStyle: compress the
+ * length only. Unlike DEFAULT_REWRITE_INSTRUCTION it keeps the original tone
+ * and terminology instead of simplifying for a general audience, so the
+ * rewritten answer still reads like the main turn's answer.
+ */
+export const NEUTRAL_REWRITE_INSTRUCTION =
+  "只压缩长度：在保留全部关键信息的前提下尽量缩短篇幅；保持原文的语气、术语深度和结构，不要简化概念，不要面向特定受众改写。";
+
+/**
  * A Feishu user allowed to drive the bot in one chat. Only `openId` is used
  * for matching; `name` is a display convenience kept from the member picker.
  */
@@ -228,6 +237,13 @@ export const chatBindingSchema = z.object({
   rewriteProvider: z.string().default(""),
   /** Model used only for the rewrite; empty means that provider's default. */
   rewriteModel: z.string().default(""),
+  /**
+   * Rewrite without any style instruction: compress length only, keeping the
+   * original tone and terminology (NEUTRAL_REWRITE_INSTRUCTION). When false
+   * (default) the rewrite carries the binding's reply-style instruction,
+   * falling back to DEFAULT_REWRITE_INSTRUCTION for the `default` style.
+   */
+  rewriteIgnoreStyle: z.boolean().default(false),
   replyFormat: replyFormatSchema.default("markdown"),
   /** Who to @ in the group after the turn finishes. */
   mentionOnReply: mentionOnReplySchema.default("off"),

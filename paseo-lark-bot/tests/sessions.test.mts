@@ -80,6 +80,7 @@ const binding: ChatBinding = {
   replyFormat: "markdown",
   mentionOnReply: "off",
   allowAgentDelegation: false,
+  rewriteIgnoreStyle: false,
 };
 
 function makeHarness(

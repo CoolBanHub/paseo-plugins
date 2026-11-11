@@ -43,6 +43,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyFormat: "markdown" as const,
         mentionOnReply: "off" as const,
         allowAgentDelegation: false,
+        rewriteIgnoreStyle: false,
       },
       {
         chatId: "oc_p2p",
@@ -62,6 +63,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         replyFormat: "text" as const,
         mentionOnReply: "off" as const,
         allowAgentDelegation: false,
+        rewriteIgnoreStyle: false,
       },
     ],
     ...overrides,

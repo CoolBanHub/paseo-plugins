@@ -207,6 +207,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               replyFormat: "markdown",
               mentionOnReply: "off",
               allowAgentDelegation: false,
+              rewriteIgnoreStyle: false,
             },
           ],
         };
