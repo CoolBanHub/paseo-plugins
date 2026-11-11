@@ -660,6 +660,11 @@ export default function contribute(server: PluginServerContext) {
     capture(context.paseo);
     const values = await readValues();
     try {
+      if (input.action === "clear") {
+        issueBaseJobs.delete(input.chatId);
+        issueTracker?.forgetBase(input.chatId);
+        return emptyIssueBaseState();
+      }
       if (input.action === "create") {
         const current = await issueTracker?.config(input.chatId, values);
         if (current) return await issueBaseStatus(values, input.chatId);

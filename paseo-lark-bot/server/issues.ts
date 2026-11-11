@@ -207,6 +207,8 @@ export interface IssueTracker {
   createBase(values: BotValues, chatIds?: string[]): Promise<IssueBaseConfig>;
   /** Validate that a chat's table has every required field. */
   verifyBase(values: BotValues, chatId: string): Promise<{ ok: boolean; missing: string[] }>;
+  /** Unlink an auto-created Base from this chat; the Feishu Base is untouched. */
+  forgetBase(chatId: string): void;
   flush(): void;
 }
 
@@ -473,6 +475,13 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   function saveLocalConfig(config: IssueBaseConfig, chatId: string): void {
     const store = baseStore();
     store.bases[chatId] = config;
+    writeJsonAtomic(options.baseStorePath, store);
+  }
+
+  function forgetBase(chatId: string): void {
+    const store = baseStore();
+    if (!(chatId in store.bases)) return;
+    delete store.bases[chatId];
     writeJsonAtomic(options.baseStorePath, store);
   }
 
@@ -1198,6 +1207,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     config: (chatId: string, values?: BotValues) => loadConfig(values, chatId),
     createBase,
     verifyBase,
+    forgetBase,
     flush,
   };
 }

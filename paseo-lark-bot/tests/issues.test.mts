@@ -330,6 +330,13 @@ describe("issue tracker", () => {
       for (const name of ISSUE_FIELD_NAMES) assert.match(fields, new RegExp(name));
       assert.match(fields, /已发布/);
       assert.ok(fake.calls.some((args) => args.includes("+member-add") && args.includes(CHAT)));
+
+      const empty = values({
+        chats: [binding({ issueBaseToken: "", issueTableId: "", issueBaseUrl: "" })],
+      });
+      assert.equal((await tracker.config(CHAT, empty))?.baseToken, "bascnNew");
+      tracker.forgetBase(CHAT);
+      assert.equal(await tracker.config(CHAT, empty), null);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

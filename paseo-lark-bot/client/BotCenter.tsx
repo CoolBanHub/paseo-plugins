@@ -171,7 +171,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   }, [refreshStatus]);
 
   const loadIssueBase = useCallback(
-    async (chatId: string, action: "status" | "create" | "test" = "status") => {
+    async (chatId: string, action: "status" | "create" | "test" | "clear" = "status") => {
       setIssueBusy((current) => ({ ...current, [chatId]: true }));
       setIssueErrors((current) => ({ ...current, [chatId]: null }));
       try {
@@ -1027,10 +1027,42 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                             onPress={() => void Linking.openURL(chat.issueBaseUrl)}
                           />
                         ) : null}
+                        <PrimaryButton
+                          label="清除配置"
+                          danger
+                          disabled={busy}
+                          onPress={() => {
+                            void (async () => {
+                              const result = await loadIssueBase(chat.chatId, "clear");
+                              if (!result) return;
+                              const next = {
+                                ...draft,
+                                chats: draft.chats.map((entry) =>
+                                  entry.chatId === chat.chatId
+                                    ? {
+                                        ...entry,
+                                        issueTracking: "off" as const,
+                                        issueBaseToken: "",
+                                        issueTableId: "",
+                                        issueBaseUrl: "",
+                                      }
+                                    : entry,
+                                ),
+                              };
+                              patchDraft(next);
+                              void persistDraft(
+                                next,
+                                "已清除该会话的问题跟踪配置；飞书里的 Base 未删除",
+                              );
+                            })();
+                          }}
+                        />
                       </View>
                       <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
                         创建会用机器人身份建 Base + 首表 + 全部字段，并把本群加为可编辑协作者；不需要登录 lark-cli user。
                         已有表需要把机器人加为可编辑协作者，再点「测试连接」检查字段。
+                        「清除配置」只解除本会话与 Base 的关联（并关掉采集），不会删除飞书里的表；要删表请到飞书里操作。
+                        自动创建的表还会记录在插件数据里，只清空输入框不会彻底解除，请用「清除配置」。
                       </Text>
                     </>
                   ) : null}

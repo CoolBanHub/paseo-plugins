@@ -93,7 +93,7 @@ export const larkBotIssueBaseRpc = defineRpc({
   name: "lark-bot.issue-base",
   input: z
     .object({
-      action: z.enum(["status", "create", "test"]),
+      action: z.enum(["status", "create", "test", "clear"]),
       /** The chat binding that owns this one ledger. */
       chatId: z.string().min(1),
     })
