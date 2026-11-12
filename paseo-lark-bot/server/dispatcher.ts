@@ -120,7 +120,7 @@ export interface DispatcherOptions {
   /**
    * Path of the persisted topic→agent store. When set, topicKey→agentId
    * mappings survive a daemon restart, so a topic resumes its existing agent
-   * (within the idle window) instead of starting a cold session.
+   * instead of starting a cold session.
    */
   topicStorePath?: string;
   /**
@@ -435,8 +435,6 @@ export function createDispatcher(options: DispatcherOptions) {
     }
   }
 
-  // The idle window is read through a getter so settings edits apply without
-  // rebuilding the registry.
   let valuesCache: BotValues = { ...DEFAULT_BOT_VALUES };
   /** Inbound turn budget; settings changes call setLimit. */
   const limiter = new SlidingWindowLimiter({
@@ -458,7 +456,6 @@ export function createDispatcher(options: DispatcherOptions) {
 
   const sessions = createSessionRegistry({
     paseo: options.paseo,
-    getIdleMs: () => valuesCache.sessionIdleMinutes * 60_000,
     getAiTitle: () => valuesCache.aiTitle,
     resolveProvider: options.resolveProvider,
     fetchLastReply: options.fetchLastReply,
@@ -1566,7 +1563,7 @@ export function createDispatcher(options: DispatcherOptions) {
   /**
    * First @ in a topic gets the root subject plus the recorded history; later
    * @s only get messages after the previous trigger because the agent already
-   * holds the earlier turns. A rebuilt/expired agent is treated as a first @.
+   * holds the earlier turns. A rebuilt agent is treated as a first @.
    * `topicRootText` is the sanitized root text for the session title.
    */
   async function withThreadContext(
@@ -1593,7 +1590,7 @@ export function createDispatcher(options: DispatcherOptions) {
         });
       }
     }
-    // A fresh/expired agent has no prior turns in its own context, so treat
+    // A fresh/rebuilt agent has no prior turns in its own context, so treat
     // this as the first message and include the topic root/history again.
     if (sessions.needsRebuild(historyKey)) lastTriggerMessage.delete(historyKey);
     const previousTrigger = lastTriggerMessage.get(historyKey);

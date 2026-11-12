@@ -322,8 +322,6 @@ export const botValuesSchema = z.object({
   larkCliPath: z.string().default(""),
   /** Reply inside the source message's thread instead of the main stream. */
   replyInThread: z.boolean().default(true),
-  /** Start a fresh agent session after this many idle minutes. */
-  sessionIdleMinutes: z.number().int().min(0).max(24 * 60).default(30),
   /**
    * Split replies longer than this many characters into several thread
    * replies (code-fence aware) instead of clipping them.

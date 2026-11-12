@@ -1424,13 +1424,6 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               value={draft.aiTitle}
               onChange={(value) => patchDraft({ aiTitle: value })}
             />
-            <NumberField
-              label="话题空闲重建"
-              hint="0 = 一直复用；空闲超过该时长的话题，下次 @ 时新建智能体会话"
-              value={draft.sessionIdleMinutes}
-              onChange={(value) => patchDraft({ sessionIdleMinutes: value })}
-              suffix="分钟"
-            />
             <ToggleRow
               label="按会话划分 workspace"
               hint="每个会话一个以群名命名的 workspace，适合不同绑定指向不同项目目录；默认全部放进「飞书任务」"

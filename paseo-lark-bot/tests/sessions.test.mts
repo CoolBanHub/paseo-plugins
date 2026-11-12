@@ -95,7 +95,6 @@ const binding: ChatBinding = {
 
 function makeHarness(
   options?: {
-    idleMinutes?: number;
     aiTitle?: boolean;
     workspaces?: WorkspacesFakeOptions;
     turnRetryDelaysMs?: number[];
@@ -203,7 +202,6 @@ function makeHarness(
           },
         }
       : paseo,
-    getIdleMs: () => (options?.idleMinutes ?? 30) * 60_000,
     getAiTitle: () => options?.aiTitle ?? false,
     getWorkspacePerBinding: () => options?.workspacePerBinding ?? false,
     getMemberDirectory: options?.getMemberDirectory,
@@ -352,9 +350,10 @@ describe("createSessionRegistry", () => {
     assert.deepEqual(h.replies, []);
   });
 
-  it("rebuilds the session after the idle window", async () => {
+  it("keeps the same agent across a long idle window", async () => {
     let clock = 0;
     const replies: ReplyCall[] = [];
+    const runCalls: string[] = [];
     let created = 0;
     const paseo: SessionPaseoApi = {
       agents: {
@@ -363,7 +362,10 @@ describe("createSessionRegistry", () => {
           const handle: SessionAgentHandle = {
             id: `agent-${created}`,
             send: async () => {},
-            run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+            run: async (text: string) => {
+              runCalls.push(text);
+              return { status: "idle", error: null, lastMessage: "ok" };
+            },
           };
           return handle;
         },
@@ -375,7 +377,6 @@ describe("createSessionRegistry", () => {
     const registry = createSessionRegistry({
       paseo,
       now: () => clock,
-      getIdleMs: () => 30 * 60_000,
       getAiTitle: () => false,
       callbacks: {
         onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
@@ -388,10 +389,11 @@ describe("createSessionRegistry", () => {
     registry.handleTurnEnded("agent-1", completed("第一轮答复"));
     await flush();
 
-    clock += 31 * 60_000;
-    registry.enqueue("om_1", "oc_group", "om_2", "第二天的问题", binding);
+    clock += 31 * 24 * 60 * 60_000;
+    registry.enqueue("om_1", "oc_group", "om_2", "很久之后的问题", binding);
     await flush();
-    assert.equal(created, 2, "idle expiry must start a new session");
+    assert.equal(created, 1, "a long idle window must not start a new session");
+    assert.deepEqual(runCalls, ["很久之后的问题"]);
   });
 
   it("runs independent topics in parallel with separate agents", async () => {
@@ -489,7 +491,6 @@ describe("createSessionRegistry", () => {
     };
     const registry = createSessionRegistry({
       paseo,
-      getIdleMs: () => 30 * 60_000,
       getAiTitle: () => false,
       callbacks: {
         onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
@@ -602,7 +603,6 @@ describe("createSessionRegistry", () => {
     };
     const registry = createSessionRegistry({
       paseo,
-      getIdleMs: () => 30 * 60_000,
       resolveProvider: async (provider, model) => {
         resolutions.push({ provider, model });
         return provider + "/" + model;
@@ -667,7 +667,6 @@ describe("reply fallbacks", () => {
     };
     const registry = createSessionRegistry({
       paseo,
-      getIdleMs: () => 30 * 60_000,
       // Injected the way index.server.ts wires it; the registry only calls it.
       fetchLastReply: async () => {
         fetched = true;
@@ -1135,7 +1134,6 @@ describe("topic agent store", () => {
             },
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1170,7 +1168,6 @@ describe("topic agent store", () => {
             },
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1181,6 +1178,48 @@ describe("topic agent store", () => {
       await flush();
       assert.equal(recreated, 0, "the stored agent is resumed, not recreated");
       assert.deepEqual(runCalls, ["重启后的问题"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes a stored agent regardless of how old its last activity is", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lark-sessions-"));
+    const storePath = join(dir, "topic-agents.json");
+    try {
+      writeFileSync(storePath, JSON.stringify({
+        version: 1,
+        topics: [{ topicKey: "om_1", chatId: "oc_group", agentId: "agent-old", lastActivityAt: 0 }],
+      }));
+      const runCalls: string[] = [];
+      let created = 0;
+      const registry = createSessionRegistry({
+        paseo: {
+          agents: {
+            create: async () => {
+              created += 1;
+              throw new Error("an existing stored agent must be reused");
+            },
+            ref: (id) => ({
+              id,
+              send: async () => {},
+              run: async (text: string) => {
+                runCalls.push(text);
+                return { status: "idle", error: null, lastMessage: "ok" };
+              },
+            }),
+          },
+        },
+        getAiTitle: () => false,
+        topicStorePath: storePath,
+        topicStoreDebounceMs: 10,
+        callbacks: { onReply: () => {}, onNotice: () => {} },
+      });
+
+      registry.enqueue("om_1", "oc_group", "om_1", "很久之后的问题", binding);
+      await flush();
+      assert.equal(created, 0, "a stored agent is reused no matter how old the mapping is");
+      assert.deepEqual(runCalls, ["很久之后的问题"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1211,7 +1250,6 @@ describe("topic agent store", () => {
             },
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1266,7 +1304,6 @@ describe("topic agent store", () => {
             }),
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1316,7 +1353,6 @@ describe("topic agent store", () => {
             }),
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1359,7 +1395,6 @@ describe("topic agent store", () => {
             },
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         stuckBusyMs: 20,
         topicStorePath: storePath,
@@ -1424,7 +1459,6 @@ describe("restart recovery", () => {
             ref: () => handle,
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1461,7 +1495,6 @@ describe("restart recovery", () => {
             ref: () => handle,
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1496,7 +1529,6 @@ describe("restart recovery", () => {
             ref: () => ({ ...handle, refresh: async () => ({ lastStatus: "running" }) }),
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1538,7 +1570,6 @@ describe("restart recovery", () => {
             ref: () => handle,
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1580,7 +1611,6 @@ describe("restart recovery", () => {
             ref: () => ({ ...handle, refresh: async () => null }),
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,
@@ -1618,7 +1648,6 @@ describe("restart recovery", () => {
             }),
           },
         },
-        getIdleMs: () => 0,
         getAiTitle: () => false,
         topicStorePath: storePath,
         topicStoreDebounceMs: 10,

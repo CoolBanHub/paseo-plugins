@@ -660,7 +660,6 @@ function activityOf(item: Record<string, unknown> | null): AgentActivity | null 
 export function createSessionRegistry(options: {
   paseo: SessionPaseoApi;
   callbacks: SessionCallbacks;
-  getIdleMs: () => number;
   /**
    * Newer daemons reject bare provider ids: normalize `dsh` to
    * `dsh/<default-model>` before agents.create(). An explicit model from the
@@ -853,8 +852,8 @@ export function createSessionRegistry(options: {
           }
           topics.set(topicKey, state);
           // Restore the reverse mapping so turn_ended/permission events for a
-          // turn that outlived the restart still route to their topic. Idle
-          // expiry is decided on first use (getIdleMs may not be loaded yet).
+          // turn that outlived the restart still route to their topic. The
+          // mapping is reused on first use unless the agent is gone.
           agentToTopic.set(agentId, topicKey);
         }
       }
@@ -863,17 +862,13 @@ export function createSessionRegistry(options: {
     }
   }
 
-  /** Serialize topics with a live agent, skipping idle-expired mappings. */
+  /** Serialize every topic mapping with a live agent. */
   function writeTopicStore(): void {
     if (!topicStorePath) return;
     try {
-      const idleMs = options.getIdleMs();
       const entries: StoredTopic[] = [];
       for (const [topicKey, state] of topics) {
         if (!state.agentId) continue;
-        // Never drop an in-flight turn just because its topic looks idle; the
-        // marker is the only way to recover its reply after a restart.
-        if (idleMs > 0 && now() - state.lastActivityAt > idleMs && !state.pendingTurn) continue;
         entries.push({
           topicKey,
           chatId: state.chatId,
@@ -956,8 +951,8 @@ export function createSessionRegistry(options: {
   ): boolean {
     if (disposed) return false;
     const state = stateFor(topicKey, chatId);
-    // lastActivityAt stays at the previous turn's end here so ensureAgent can
-    // measure the real idle window; drain() refreshes it once a turn starts.
+    // lastActivityAt stays at the previous turn's end here so status ordering
+    // reflects completed activity; drain() refreshes it once a turn starts.
     state.lastSeenMessageId = messageId;
     // Heal a stuck topic before the queue-full rejection so a full backlog
     // cannot pin a hung turn forever. A permission wait is human-paced, not a
@@ -1118,8 +1113,7 @@ export function createSessionRegistry(options: {
     try {
       // ensureAgent() passes the prompt to agents.create() for fresh sessions,
       // which already starts the first turn — running it again would duplicate
-      // the message. lastActivityAt refreshes only after the idle check so the
-      // window measures the real gap since the previous turn.
+      // the message.
       const { handle, created } = await ensureAgent(topicKey, item);
       if (state.activeTurn !== turn) return;
       state.lastActivityAt = now();
@@ -1379,8 +1373,6 @@ export function createSessionRegistry(options: {
     item: QueueItem,
   ): Promise<{ handle: SessionAgentHandle; created: boolean }> {
     const state = stateFor(topicKey, "");
-    const idleMs = options.getIdleMs();
-    const expired = idleMs > 0 && now() - state.lastActivityAt > idleMs;
     // A mapping restored from the topic store after a daemon restart has no
     // live handle yet: re-attach by id. ref() itself is lazy (it does not
     // validate), so when the handle supports refresh(), confirm the agent is
@@ -1421,7 +1413,7 @@ export function createSessionRegistry(options: {
         state.workspace = null;
       }
     }
-    if (state.handle && !expired) {
+    if (state.handle) {
       attachTimeline(topicKey, state, state.handle);
       return { handle: state.handle, created: false };
     }
@@ -1706,12 +1698,9 @@ export function createSessionRegistry(options: {
     return best?.key ?? null;
   }
 
-  /** True when the next message will start a fresh agent (no reusable context). */
+  /** True when no live handle is attached; include the full topic history. */
   function needsRebuild(topicKey: string): boolean {
-    const state = topics.get(topicKey);
-    if (!state?.handle) return true;
-    const idleMs = options.getIdleMs();
-    return idleMs > 0 && now() - state.lastActivityAt > idleMs;
+    return !topics.get(topicKey)?.handle;
   }
 
   function overridesFor(topicKey: string): TopicOverrides {
