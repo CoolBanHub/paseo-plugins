@@ -260,6 +260,8 @@ export interface MessageDetail {
   rootId?: string | null;
   threadId?: string | null;
   senderType?: string | null;
+  /** Feishu msg_type (text/image/media/post/…), for media handling. */
+  messageType?: string | null;
 }
 
 /** Fetch one message (thread roots) with its pre-rendered text and sender. */
@@ -283,6 +285,7 @@ export async function readMessageDetail(cliPath: string, messageId: string): Pro
     rootId: typeof record.root_id === "string" ? record.root_id : null,
     threadId: typeof record.thread_id === "string" ? record.thread_id : null,
     senderType: typeof sender?.sender_type === "string" ? sender.sender_type : null,
+    messageType: typeof record.msg_type === "string" ? record.msg_type : null,
   };
 }
 

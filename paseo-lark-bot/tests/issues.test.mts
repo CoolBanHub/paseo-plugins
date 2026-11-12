@@ -15,7 +15,7 @@ import { buildIssueCard, parseIssueAction } from "../server/issue-card.ts";
 import { parseIssueClassification } from "../server/issue-classifier.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
 import { DEFAULT_BOT_VALUES, type BotValues, type ChatBinding } from "../shared/settings.ts";
-import type { LarkPayload } from "../server/lark.ts";
+import type { LarkPayload, MessageDetail } from "../server/lark.ts";
 
 const BOT = "ou_bot";
 const USER = "ou_user";
@@ -669,6 +669,7 @@ describe("issue card", () => {
       tableId: "tblTest",
       lastActiveAt: 1,
       messageCount: 1,
+      mediaSynced: [],
       updatedAt: 1,
     };
     const card = buildIssueCard({ record, summary: "已修复", topicKey: THREAD });
@@ -685,5 +686,277 @@ describe("issue card", () => {
     assert.equal(accept?.topicKey, THREAD);
     assert.equal(parseIssueAction("not-json"), null);
     assert.equal(parseIssueAction(JSON.stringify({ kind: "issue", action: "release" })), null);
+  });
+});
+
+describe("issue media sync", () => {
+  interface MediaHarness {
+    calls: string[][];
+    downloads: Array<{ messageId: string; fileKey: string; type: string; maxBytes?: number }>;
+    run: (cliPath: string, args: string[], label: string) => Promise<LarkPayload>;
+    download: (options: {
+      cliPath: string;
+      messageId: string;
+      fileKey: string;
+      type: "image" | "file";
+      maxBytes?: number;
+    }) => Promise<{ bytes: Buffer; extension: string }>;
+    readRaw: (cliPath: string, messageId: string) => Promise<Record<string, unknown> | null>;
+    readRoot: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;
+  }
+
+  function mediaHarness(config: {
+    rawByMessage?: Record<string, Record<string, unknown>>;
+    rootDetail?: { messageType?: string | null };
+    existingRecord?: boolean;
+    fieldExists?: boolean;
+  } = {}): MediaHarness {
+    const calls: string[][] = [];
+    const downloads: MediaHarness["downloads"] = [];
+    return {
+      calls,
+      downloads,
+      run: async (_cliPath, args) => {
+        calls.push(args);
+        if (args.includes("+record-list")) {
+          if (config.existingRecord && args.includes("--filter-json")) {
+            return {
+              ok: true,
+              data: { fields: ["标题", "状态"], data: [["历史问题", ["处理中"]]], record_id_list: ["rec_existing"] },
+            };
+          }
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        if (args.includes("+field-get") && config.fieldExists === false) {
+          throw new Error("字段不存在");
+        }
+        return { ok: true, data: {} };
+      },
+      download: async (options) => {
+        downloads.push({
+          messageId: options.messageId,
+          fileKey: options.fileKey,
+          type: options.type,
+          maxBytes: options.maxBytes,
+        });
+        return { bytes: Buffer.from("media-bytes"), extension: options.type === "file" ? ".mp4" : ".png" };
+      },
+      readRaw: async (_cliPath, messageId) => config.rawByMessage?.[messageId] ?? null,
+      readRoot: async (_cliPath, _messageId): Promise<MessageDetail> => ({
+        text: "历史话题",
+        senderOpenId: USER,
+        senderName: null,
+        messageType: config.rootDetail?.messageType ?? null,
+      }),
+    };
+  }
+
+  function uploadCalls(calls: string[][]): string[][] {
+    return calls.filter((args) => args.includes("+record-upload-attachment"));
+  }
+
+  function flagValue(args: string[], flag: string): string | undefined {
+    const index = args.indexOf(flag);
+    return index >= 0 ? args[index + 1] : undefined;
+  }
+
+  function uploadFiles(args: string[]): string[] {
+    const files: string[] = [];
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "--file" && typeof args[index + 1] === "string") files.push(args[index + 1]!);
+    }
+    return files;
+  }
+
+  function mediaTracker(dir: string, fake: MediaHarness) {
+    return createIssueTracker({
+      readValues: async () => values(),
+      storePath: join(dir, "records.json"),
+      baseStorePath: join(dir, "base.json"),
+      run: fake.run,
+      download: fake.download,
+      readRaw: fake.readRaw,
+      readRoot: fake.readRoot,
+    });
+  }
+
+  it("uploads a root image into the 附件 column", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({ rawByMessage: { [ROOT]: { image_key: "img_v2_root" } } });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(rootEvent({ message_type: "image", content: "[图片]" }), binding(), values());
+      await waitFor(() => uploadCalls(fake.calls).length > 0);
+      const args = uploadCalls(fake.calls)[0]!;
+      assert.equal(flagValue(args, "--field-id"), "附件");
+      assert.equal(flagValue(args, "--record-id"), "rec_1");
+      assert.equal(uploadFiles(args).length, 1);
+      assert.ok(uploadFiles(args)[0]!.endsWith(`${ROOT}-1.png`));
+      assert.deepEqual(fake.downloads.map((entry) => entry.type), ["image"]);
+      // The 附件 column existence is checked before the first upload.
+      assert.ok(fake.calls.findIndex((entry) => entry.includes("+field-get")) >= 0);
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD)?.mediaSynced.includes(ROOT) === true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uploads a reply video as the original file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({ rawByMessage: { om_reply_1: { file_key: "file_v2_video" } } });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+      tracker.observe(
+        replyEvent({ message_type: "media", content: "[视频]" }),
+        binding(),
+        values(),
+      );
+      await waitFor(() => uploadCalls(fake.calls).length > 0);
+      assert.deepEqual(fake.downloads[0], {
+        messageId: "om_reply_1",
+        fileKey: "file_v2_video",
+        type: "file",
+        maxBytes: 50 * 1024 * 1024,
+      });
+      assert.ok(uploadFiles(uploadCalls(fake.calls)[0]!)[0]!.endsWith("om_reply_1-1.mp4"));
+      await waitFor(
+        () => tracker.recordForTopic(CHAT, THREAD)?.mediaSynced.includes("om_reply_1") === true,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("collects post-embedded images in one upload", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({
+        rawByMessage: {
+          [ROOT]: {
+            title: { text: "看这个" },
+            content: [
+              { tag: "img", image_key: "img_v2_a" },
+              { tag: "img", image_key: "img_v2_b" },
+            ],
+          },
+        },
+      });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(rootEvent({ message_type: "post", content: "看这个" }), binding(), values());
+      await waitFor(() => uploadCalls(fake.calls).length > 0);
+      assert.deepEqual(
+        fake.downloads.map((entry) => entry.fileKey),
+        ["img_v2_a", "img_v2_b"],
+      );
+      const files = uploadFiles(uploadCalls(fake.calls)[0]!);
+      assert.equal(files.length, 2);
+      assert.ok(files[0]!.endsWith(`${ROOT}-1.png`));
+      assert.ok(files[1]!.endsWith(`${ROOT}-2.png`));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("syncs a message only once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({ rawByMessage: { [ROOT]: { image_key: "img_v2_root" } } });
+      const tracker = mediaTracker(dir, fake);
+      const event = rootEvent({ message_type: "image", content: "[图片]" });
+      tracker.observe(event, binding(), values());
+      await waitFor(
+        () => tracker.recordForTopic(CHAT, THREAD)?.mediaSynced.includes(ROOT) === true,
+      );
+      tracker.observe(event, binding(), values());
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(uploadCalls(fake.calls).length, 1);
+      assert.equal(fake.downloads.length, 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the 附件 field once when the table predates it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({
+        fieldExists: false,
+        rawByMessage: {
+          [ROOT]: { image_key: "img_v2_root" },
+          om_root_2: { image_key: "img_v2_second" },
+        },
+      });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(rootEvent({ message_type: "image", content: "[图片]" }), binding(), values());
+      await waitFor(() => uploadCalls(fake.calls).length > 0);
+      tracker.observe(
+        rootEvent({
+          message_id: "om_root_2",
+          thread_id: "omt_topic_2",
+          message_type: "image",
+          content: "[图片]",
+        }),
+        binding(),
+        values(),
+      );
+      await waitFor(() => uploadCalls(fake.calls).length >= 2);
+      assert.equal(fake.calls.filter((args) => args.includes("+field-get")).length, 1);
+      const creates = fake.calls.filter((args) => args.includes("+field-create"));
+      assert.equal(creates.length, 1);
+      assert.deepEqual(JSON.parse(flagValue(creates[0]!, "--json")!), {
+        name: "附件",
+        type: "attachment",
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops uploading once the attachment cell is full", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({ rawByMessage: { om_reply_1: { image_key: "img_v2_reply" } } });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+      tracker.recordForTopic(CHAT, THREAD)!.mediaSynced = Array.from(
+        { length: 50 },
+        (_, index) => `om_old_${index}`,
+      );
+      tracker.observe(replyEvent({ message_type: "image", content: "[图片]" }), binding(), values());
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(uploadCalls(fake.calls).length, 0);
+      assert.equal(fake.downloads.length, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("backfills root media when a record is rediscovered", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = mediaHarness({
+        existingRecord: true,
+        rootDetail: { messageType: "image" },
+        rawByMessage: { [ROOT]: { image_key: "img_v2_root" } },
+      });
+      const tracker = mediaTracker(dir, fake);
+      tracker.observe(replyEvent(), binding(), values());
+      await waitFor(() => uploadCalls(fake.calls).length > 0);
+      const args = uploadCalls(fake.calls)[0]!;
+      assert.equal(flagValue(args, "--record-id"), "rec_existing");
+      assert.ok(uploadFiles(args)[0]!.endsWith(`${ROOT}-1.png`));
+      assert.equal(
+        tracker.recordForTopic(CHAT, THREAD)?.mediaSynced.includes(ROOT),
+        true,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -2193,6 +2193,7 @@ describe("issue acceptance card ordering", () => {
       tableId: "tblTest",
       lastActiveAt: 1,
       messageCount: 1,
+      mediaSynced: [],
       updatedAt: 1,
     };
     const tracker = {

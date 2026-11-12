@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { BotValues, ChatBinding } from "../shared/settings.ts";
 import type { LarkMessageEvent } from "./lark-events.ts";
-import { parseLarkJson, resolveLarkCli, type LarkPayload } from "./lark.ts";
+import { parseLarkJson, readMessageDetail, readRawContent, resolveLarkCli, type LarkPayload, type MessageDetail } from "./lark.ts";
 import { sanitizeTopicText } from "./format.ts";
 import type { IssueClassification } from "./issue-classifier.ts";
+import { collectImageKeys, downloadMessageResource } from "./media.ts";
 
 const execFileAsync = promisify(execFile);
 const CLI_TIMEOUT_MS = 30_000;
@@ -17,6 +19,14 @@ const ISSUE_TIME_ZONE = "Asia/Shanghai";
 const MAX_RECORDS = 1_000;
 const ACTIVITY_WRITE_MS = 10 * 60_000;
 const RECORD_STORE_VERSION = 1;
+/** Attachment column the topic media is appended to. */
+export const ISSUE_ATTACHMENT_FIELD = "附件";
+/** Feishu caps one attachment cell at 50 files. */
+const MAX_ATTACHMENT_FILES = 50;
+/** Images per message we are willing to mirror into the ledger. */
+const MAX_IMAGES_PER_MESSAGE = 9;
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const VIDEO_MAX_BYTES = 50 * 1024 * 1024;
 
 /**
  * Status order matters for the flow, not for the API: the ledger is a single
@@ -122,6 +132,7 @@ export const ISSUE_FIELD_NAMES = [
   "根消息ID",
   "话题ID",
   "最近进展",
+  "附件",
   "处理人",
   "Paseo 会话",
   "最后活跃",
@@ -165,6 +176,7 @@ export const ISSUE_FIELD_DEFINITIONS: Record<string, unknown>[] = [
   { type: "text", name: "根消息ID" },
   { type: "text", name: "话题ID" },
   { type: "text", name: "最近进展" },
+  { type: "attachment", name: "附件" },
   { type: "user", name: "处理人", multiple: false },
   { type: "text", name: "Paseo 会话" },
   { type: "datetime", name: "最后活跃", style: { format: "yyyy-MM-dd HH:mm" } },
@@ -204,6 +216,8 @@ const issueRecordSchema = z.object({
   tableId: z.string().default(""),
   lastActiveAt: z.number().default(0),
   messageCount: z.number().default(1),
+  /** Message ids whose media was already appended to the 附件 column. */
+  mediaSynced: z.array(z.string()).default([]),
   updatedAt: z.number().default(0),
 });
 export type IssueRecord = z.output<typeof issueRecordSchema>;
@@ -251,6 +265,18 @@ export interface IssueTrackerOptions {
   log?: (message: string, detail?: unknown) => void;
   /** Injectable lark-cli runner for tests. */
   run?: (cliPath: string, args: string[], label: string) => Promise<LarkPayload>;
+  /** Injectable raw message reader (attachment sync); defaults to lark.ts. */
+  readRaw?: (cliPath: string, messageId: string) => Promise<Record<string, unknown> | null>;
+  /** Injectable thread-root reader (media backfill); defaults to lark.ts. */
+  readRoot?: (cliPath: string, messageId: string) => Promise<MessageDetail | null>;
+  /** Injectable media downloader (attachment sync); defaults to media.ts. */
+  download?: (options: {
+    cliPath: string;
+    messageId: string;
+    fileKey: string;
+    type: "image" | "file";
+    maxBytes?: number;
+  }) => Promise<{ bytes: Buffer; extension: string }>;
   /** Optional one-shot model gate; null means fall back to keyword/track all. */
   classify?: (input: {
     text: string;
@@ -476,8 +502,14 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   const backfilledChats = new Set<string>();
   const backfillInFlight = new Set<string>();
   const skipped = new Map<string, { chatId: string; topicKey: string; reason: string; at: number }>();
+  /** Tables whose 附件 column was checked (and created when missing). */
+  const attachmentFieldChecked = new Set<string>();
+  /** recordId:messageId pairs currently uploading, to keep sync single-shot. */
+  const mediaInFlight = new Set<string>();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let warnedMissingBase = false;
+  const readRaw = options.readRaw ?? readRawContent;
+  const download = options.download ?? downloadMessageResource;
 
   const stored = readJson(options.storePath, recordStoreSchema);
   if (stored) {
@@ -758,6 +790,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       tableId: config.tableId,
       lastActiveAt: input.at,
       messageCount: 1,
+      mediaSynced: [],
       updatedAt: now(),
     };
     register(record);
@@ -825,6 +858,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
           tableId: config.tableId,
           lastActiveAt: now(),
           messageCount: 1,
+          mediaSynced: [],
           updatedAt: now(),
         };
         register(record);
@@ -865,8 +899,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     }
     try {
       const cli = await cliPath(values);
-      const { readMessageDetail } = await import("./lark.ts");
-      const detail = await readMessageDetail(cli, rootMessageId);
+      const readRoot = options.readRoot ?? readMessageDetail;
+      const detail = await readRoot(cli, rootMessageId);
       const title = sanitizeTopicText(detail?.text ?? "", 60) || "未命名话题";
       const gate = mode.force
         ? { skip: false, type: undefined as IssueType | undefined }
@@ -893,12 +927,14 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
           tableId: config.tableId,
           lastActiveAt: now(),
           messageCount: 1,
+          mediaSynced: [],
           updatedAt: now(),
         };
         register(record);
+        queueMediaSync(values, record, rootMessageId, detail?.messageType);
         return record;
       }
-      return await createRecord(values, config, {
+      const created = await createRecord(values, config, {
         chatId: event.chat_id,
         chatName: binding.chatName,
         rootMessageId,
@@ -908,6 +944,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
         at: now(),
         ...(gate.type ? { type: gate.type } : {}),
       });
+      if (created) queueMediaSync(values, created, rootMessageId, detail?.messageType);
+      return created;
     } catch (error) {
       log("补建话题记录失败", errorDetail(error));
       return null;
@@ -933,20 +971,20 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     event: LarkMessageEvent,
     binding: ChatBinding,
     values: BotValues,
-  ): Promise<void> {
+  ): Promise<IssueRecord | null> {
     const key = event.thread_id || event.root_id || "";
     let record = key ? find(event.chat_id, key) : null;
     if (!record && event.root_id) {
       record = await ensureFromRootMessage(event, binding, values, event.root_id);
     }
-    if (!record) return;
+    if (!record) return null;
     record.messageCount += 1;
     record.lastActiveAt = now();
     record.updatedAt = now();
     const last = lastActivityWrite.get(record.recordId) ?? 0;
     if (now() - last < ACTIVITY_WRITE_MS) {
       scheduleSave();
-      return;
+      return record;
     }
     lastActivityWrite.set(record.recordId, now());
     try {
@@ -957,6 +995,183 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       log("更新话题活跃时间失败", errorDetail(error));
     }
     scheduleSave();
+    return record;
+  }
+
+  // ── Topic media → 附件 column ───────────────────────────────────────────
+
+  /** Message types whose media is mirrored into the 附件 column. */
+  function carriesMedia(messageType: string | null | undefined): messageType is string {
+    return messageType === "image" || messageType === "media" || messageType === "post";
+  }
+
+  /** Fire-and-forget media sync; failures only log. */
+  function queueMediaSync(
+    values: BotValues,
+    record: IssueRecord,
+    messageId: string,
+    messageType: string | null | undefined,
+  ): void {
+    if (!carriesMedia(messageType)) return;
+    void syncMessageMedia(values, record, messageId, messageType).catch((error) =>
+      log("同步话题媒体失败", errorDetail(error)),
+    );
+  }
+
+  function markMediaSynced(record: IssueRecord, messageId: string): void {
+    if (record.mediaSynced.includes(messageId)) return;
+    record.mediaSynced.push(messageId);
+    // The list doubles as a dedup log; keep it bounded alongside the cell cap.
+    if (record.mediaSynced.length > MAX_ATTACHMENT_FILES * 2) {
+      record.mediaSynced.splice(0, record.mediaSynced.length - MAX_ATTACHMENT_FILES * 2);
+    }
+    record.updatedAt = now();
+    scheduleSave();
+  }
+
+  /**
+   * Make sure the ledger table has the 附件 column. Pre-attachment tables are
+   * upgraded in place; the check runs once per table per process.
+   */
+  async function ensureAttachmentField(
+    values: BotValues,
+    config: { baseToken: string; tableId: string },
+  ): Promise<void> {
+    const key = `${config.baseToken}:${config.tableId}`;
+    if (attachmentFieldChecked.has(key)) return;
+    attachmentFieldChecked.add(key);
+    try {
+      await call(
+        values,
+        [
+          "base",
+          "+field-get",
+          "--base-token",
+          config.baseToken,
+          "--table-id",
+          config.tableId,
+          "--field-id",
+          ISSUE_ATTACHMENT_FIELD,
+          "--as",
+          "bot",
+          "--format",
+          "json",
+        ],
+        "读取附件字段",
+      );
+      return;
+    } catch {
+      // Missing on tables created before attachment sync; create it below.
+    }
+    try {
+      await call(
+        values,
+        [
+          "base",
+          "+field-create",
+          "--base-token",
+          config.baseToken,
+          "--table-id",
+          config.tableId,
+          "--as",
+          "bot",
+          "--json",
+          JSON.stringify({ name: ISSUE_ATTACHMENT_FIELD, type: "attachment" }),
+        ],
+        "补建附件字段",
+      );
+      log("已为问题跟踪表补建附件字段");
+    } catch (error) {
+      log("补建附件字段失败，话题媒体暂不上传", errorDetail(error));
+    }
+  }
+
+  /**
+   * Mirror one message's images / video into the record's 附件 column:
+   * download via lark-cli, then append with +record-upload-attachment. A
+   * message is marked synced only after the upload lands, so transient
+   * failures stay retryable when the topic becomes active again.
+   */
+  async function syncMessageMedia(
+    values: BotValues,
+    record: IssueRecord,
+    messageId: string,
+    messageType: string,
+  ): Promise<void> {
+    if (record.mediaSynced.includes(messageId)) return;
+    if (record.mediaSynced.length >= MAX_ATTACHMENT_FILES) return;
+    const inFlightKey = `${record.recordId}:${messageId}`;
+    if (mediaInFlight.has(inFlightKey)) return;
+    mediaInFlight.add(inFlightKey);
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-issue-media-"));
+    try {
+      const cli = await cliPath(values);
+      const raw = await readRaw(cli, messageId);
+      if (!raw) {
+        markMediaSynced(record, messageId);
+        return;
+      }
+      const requests: Array<{ fileKey: string; type: "image" | "file"; maxBytes: number }> = [];
+      if (messageType === "media" && typeof raw.file_key === "string" && raw.file_key) {
+        requests.push({ fileKey: raw.file_key, type: "file", maxBytes: VIDEO_MAX_BYTES });
+      } else {
+        const keys = new Set<string>();
+        if (typeof raw.image_key === "string" && raw.image_key.startsWith("img_")) {
+          keys.add(raw.image_key);
+        }
+        collectImageKeys(raw, keys);
+        for (const fileKey of [...keys].slice(0, MAX_IMAGES_PER_MESSAGE)) {
+          requests.push({ fileKey, type: "image", maxBytes: IMAGE_MAX_BYTES });
+        }
+      }
+      if (requests.length === 0) {
+        markMediaSynced(record, messageId);
+        return;
+      }
+      const config =
+        record.baseToken && record.tableId
+          ? { baseToken: record.baseToken, tableId: record.tableId }
+          : await loadConfig(values, record.chatId);
+      if (!config) return;
+      await ensureAttachmentField(values, config);
+      const files: string[] = [];
+      let index = 0;
+      for (const request of requests) {
+        const resource = await download({
+          cliPath: cli,
+          messageId,
+          fileKey: request.fileKey,
+          type: request.type,
+          maxBytes: request.maxBytes,
+        });
+        index += 1;
+        const extension = resource.extension || (request.type === "image" ? ".png" : ".mp4");
+        const path = join(dir, `${messageId}-${index}${extension}`);
+        writeFileSync(path, resource.bytes);
+        files.push(path);
+      }
+      const args = [
+        "base",
+        "+record-upload-attachment",
+        "--base-token",
+        config.baseToken,
+        "--table-id",
+        config.tableId,
+        "--record-id",
+        record.recordId,
+        "--field-id",
+        ISSUE_ATTACHMENT_FIELD,
+        "--as",
+        "bot",
+      ];
+      for (const file of files) args.push("--file", file);
+      await call(values, args, "上传话题媒体");
+      markMediaSynced(record, messageId);
+      log(`已同步 ${files.length} 个话题媒体到问题跟踪表`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      mediaInFlight.delete(inFlightKey);
+    }
   }
 
   async function updateRecord(
@@ -1272,10 +1487,12 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       const current = await valuesFor(values);
       scheduleTypeBackfill(current, event.chat_id);
       if (isRoot) {
-        await ensureRecord(event, binding, current);
+        const record = await ensureRecord(event, binding, current);
+        if (record) queueMediaSync(current, record, event.message_id, event.message_type);
         return;
       }
-      await noteActivity(event, binding, current);
+      const record = await noteActivity(event, binding, current);
+      if (record) queueMediaSync(current, record, event.message_id, event.message_type);
     })().catch((error) => log("问题跟踪采集失败", errorDetail(error)));
   }
 

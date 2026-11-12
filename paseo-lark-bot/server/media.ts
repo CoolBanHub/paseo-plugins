@@ -22,6 +22,20 @@ export function resolveFfmpeg(): string | null {
   return null;
 }
 
+/** Recursively collect image keys from a raw post payload. */
+export function collectImageKeys(value: unknown, output: Set<string>, depth = 0): void {
+  if (depth > 8 || !value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectImageKeys(item, output, depth + 1);
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.image_key === "string" && record.image_key.startsWith("img_")) {
+    output.add(record.image_key);
+  }
+  for (const item of Object.values(record)) collectImageKeys(item, output, depth + 1);
+}
+
 /**
  * Download one message resource (image or file) via lark-cli into a temp
  * directory and return its bytes. Caller is responsible for cleanup.

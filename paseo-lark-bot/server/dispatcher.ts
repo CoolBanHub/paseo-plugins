@@ -22,6 +22,7 @@ import {
   type MessageDetail,
 } from "./lark.ts";
 import {
+  collectImageKeys,
   downloadMessageResource,
   extractVideoFrames,
   persistMediaFile,
@@ -739,20 +740,6 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!label) return "";
     const detail = extractPrompt(event).slice(0, 80);
     return "[" + label + (detail ? "：" + detail : "") + "]";
-  }
-
-  /** Recursively collect image keys from a raw post payload. */
-  function collectImageKeys(value: unknown, output: Set<string>, depth = 0): void {
-    if (depth > 8 || !value || typeof value !== "object") return;
-    if (Array.isArray(value)) {
-      for (const item of value) collectImageKeys(item, output, depth + 1);
-      return;
-    }
-    const record = value as Record<string, unknown>;
-    if (typeof record.image_key === "string" && record.image_key.startsWith("img_")) {
-      output.add(record.image_key);
-    }
-    for (const item of Object.values(record)) collectImageKeys(item, output, depth + 1);
   }
 
   /**
