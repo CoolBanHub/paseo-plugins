@@ -301,6 +301,10 @@ interface TurnState {
   stepDecodeMs: number;
   /** Number of live usage rows emitted for this turn's model requests. */
   usageRows: number;
+  /** Fingerprint of the usage snapshot already reported by the last row. */
+  lastUsageKey?: string;
+  /** Whether any model streaming was observed since the last usage row. */
+  stepSawStream: boolean;
   tools: Map<string, {
     name: string;
     input?: Record<string, unknown>;
@@ -845,6 +849,7 @@ function formatTokPerSec(tps: number): string {
 
 function openDecodeWindow(turn: TurnState, at: number): void {
   if (turn.firstContentAt === undefined) turn.firstContentAt = at;
+  turn.stepSawStream = true;
 }
 
 function closeDecodeWindow(turn: TurnState, at: number): void {
@@ -931,6 +936,16 @@ function usageNoticeItem(
   };
 }
 
+/** Fingerprint matching rule: identifies the same request's usage snapshot. */
+function usageKey(fields: UsageFields): string {
+  return [
+    fields.inputTokens ?? -1,
+    fields.cacheReadTokens ?? -1,
+    fields.cacheWriteTokens ?? -1,
+    fields.outputTokens ?? -1,
+  ].join("/");
+}
+
 /**
  * Emit one row as soon as a main-turn model request commits. The app-server
  * pushes per-request usage on `session.updated` (the `ModelComplete` event), so
@@ -949,10 +964,17 @@ function emitStepUsage(
   const speed = decodeTokPerSec(fields.outputTokens, turn.stepDecodeMs);
   turn.stepDecodeMs = 0;
   if (!hasUsageTokens(fields)) return;
+  // The app-server re-broadcasts the final request's usage snapshot when the
+  // turn settles: identical numbers with no model streaming since the last row
+  // is that duplicate, not a new request, so it must not become a second row.
+  const key = usageKey(fields);
+  if (!turn.stepSawStream && key === turn.lastUsageKey) return;
   const step = turn.usageRows + 1;
   const item = usageNoticeItem(state.paseoSessionId, turn.turnId, step, fields, speed);
   if (!item) return;
   turn.usageRows = step;
+  turn.lastUsageKey = key;
+  turn.stepSawStream = false;
   emit({ type: "timeline.item", sessionId: state.paseoSessionId, item });
 }
 
@@ -1388,6 +1410,7 @@ export function createZcodeProvider(): ProviderRegistration {
             decodeMs: 0,
             stepDecodeMs: 0,
             usageRows: 0,
+            stepSawStream: false,
             tools: new Map(),
           };
           state.turns.set(turnId, turn);
@@ -1737,8 +1760,10 @@ export function createZcodeProvider(): ProviderRegistration {
               // closed by a finish/tool call, so drop only an incomplete one.
               turn.firstContentAt = undefined;
               turn.stepDecodeMs = 0;
+              turn.stepSawStream = true;
             } else if (kind === "finish" || kind === "error") {
               closeDecodeWindow(turn, event.timestamp);
+              turn.stepSawStream = true;
             } else if (kind === "text_start" || kind === "reasoning_start" || kind === "tool_input_start"
               || kind === "text_delta" || kind === "reasoning_delta" || kind === "tool_input_delta") {
               openDecodeWindow(turn, event.timestamp);
@@ -1749,6 +1774,7 @@ export function createZcodeProvider(): ProviderRegistration {
               turn.text += payload.delta;
             } else if (kind === "tool_call") {
               closeDecodeWindow(turn, event.timestamp);
+              turn.stepSawStream = true;
               flushReasoning(state, turn);
               const toolCallId = String(payload.toolCallId ?? "");
               const toolName = String(payload.toolName ?? "tool");

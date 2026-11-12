@@ -66,7 +66,10 @@ local ZCode sessions are listed in Paseo's session picker.
   tool call, the model commit or the turn completion closes each segment, and a
   request without content timing omits only the speed. Older app-server
   versions that never push per-request usage fall back to one row at turn
-  completion. Usage rows are live-only: Paseo persists them with the agent
+  completion. A snapshot with identical numbers and no model streaming since
+  the last row is the app-server re-broadcasting the final request's usage as
+  the turn settles, and is dropped instead of becoming a duplicate row. Usage
+  rows are live-only: Paseo persists them with the agent
   timeline, while replaying notifications on every reopen would duplicate
   them; `session/usage` totals still seed the context meter when a session
   opens.

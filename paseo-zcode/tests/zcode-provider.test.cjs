@@ -1736,6 +1736,78 @@ test("model completions stream one usage row per request", async (t) => {
     && event.turnId === "turn-live" && event.state === "completed"));
 });
 
+test("a re-broadcast final usage snapshot does not duplicate the row", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-dup", timestamp: 1_000 });
+  // Step one commits: the app-server projects its ModelComplete with usage.
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-dup", timestamp: 1_100,
+    payload: { kind: "text_delta", delta: "one" },
+  });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-dup", timestamp: 2_000,
+    payload: { querySource: "main_turn", usage: { inputTokens: 50_900, outputTokens: 125, cacheReadTokens: 49_300 } },
+  });
+  // Step two streams and commits with different numbers.
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-dup", timestamp: 3_000,
+    payload: { kind: "text_delta", delta: "two" },
+  });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-dup", timestamp: 3_001,
+    payload: { querySource: "main_turn", usage: { inputTokens: 52_200, outputTokens: 58, cacheReadTokens: 50_800 } },
+  });
+
+  let rows = f.notifications();
+  assert.equal(rows.length, 2);
+  assert.match(rows[1].item.message, /速度 58000 tok\/s/);
+
+  // The app-server re-broadcasts the final request's snapshot when the turn
+  // settles: same numbers, no streaming in between. It must not become a row.
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-dup", timestamp: 4_000,
+    payload: { querySource: "main_turn", usage: { inputTokens: 52_200, outputTokens: 58, cacheReadTokens: 50_800 } },
+  });
+  assert.equal(f.notifications().length, 2, "the re-broadcast snapshot is dropped");
+  f.sessionEvent({
+    type: "turn.completed", sessionId, turnId: "turn-dup", timestamp: 4_100,
+    payload: { response: "done", resultType: "success", usage: { inputTokens: 52_200, outputTokens: 58, cacheReadTokens: 50_800 } },
+  });
+  assert.equal(f.notifications().length, 2, "settling still does not append a total");
+});
+
+test("identical usage numbers with fresh streaming still become a row", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-same", timestamp: 1_000 });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-same", timestamp: 2_000,
+    payload: { querySource: "main_turn", usage: { inputTokens: 1_000, outputTokens: 50 } },
+  });
+  assert.equal(f.notifications().length, 1);
+
+  // Two real requests may legitimately report the same numbers; the streaming
+  // in between marks the second snapshot as a new request, not a replay.
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-same", timestamp: 3_000,
+    payload: { kind: "text_delta", delta: "again" },
+  });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-same", timestamp: 4_000,
+    payload: { querySource: "main_turn", usage: { inputTokens: 1_000, outputTokens: 50 } },
+  });
+  const rows = f.notifications();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].item.id, "zcode:paseo-session:usage:turn-same:2");
+});
+
 test("replayed sessions leave usage notices to the live timeline", async (t) => {
   const f = await fixture(t, {
     historyMessages: [
