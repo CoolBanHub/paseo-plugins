@@ -25,6 +25,77 @@ const RECORD_STORE_VERSION = 1;
 export const ISSUE_STATUSES = ["待处理", "处理中", "待验收", "已修复", "已发布", "已关闭"] as const;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
+export const ISSUE_TYPES = ["问题", "需求", "咨询"] as const;
+export type IssueType = (typeof ISSUE_TYPES)[number];
+
+/**
+ * Cheap first-pass classification for topic titles. It is deliberately local
+ * (no model call) and only fills an empty type; humans can correct it via the
+ * Base or `/issue type`.
+ */
+export function classifyIssueType(text: string): IssueType {
+  const value = text.toLowerCase();
+  const count = (haystack: string, words: readonly string[], weight = 1): number =>
+    words.reduce((score, word) => score + (haystack.includes(word) ? weight : 0), 0);
+  const problem = count(
+    value,
+    [
+      "bug",
+      "报错",
+      "异常",
+      "错误",
+      "失败",
+      "无法",
+      "不能",
+      "不显示",
+      "没有",
+      "不足",
+      "闪退",
+      "崩溃",
+      "卡顿",
+      "掉线",
+      "不对",
+      "有误",
+      "重复",
+      "驳回",
+      "锁单",
+      "少了",
+      "缺失",
+      "未",
+      "禁止",
+    ],
+    2,
+  ) + count(value, ["问题", "故障", "退款", "申诉"], 1);
+  // "不显示/没有显示" is a bug phrase, not a requirement to add a display.
+  const requirementText = value.replace(/不显示|没有显示|未显示/gu, "");
+  const requirement = count(requirementText, ["改为", "改成"], 3) + count(
+    requirementText,
+    [
+      "新增",
+      "增加",
+      "加个",
+      "加一个",
+      "支持",
+      "希望",
+      "优化",
+      "建议",
+      "调整",
+      "能否",
+      "可否",
+      "需要",
+      "功能",
+      "不用",
+      "无需",
+      "接入",
+    ],
+    2,
+  ) + count(requirementText, ["页面", "显示", "评价", "原因", "恢复", "使用"], 1);
+  const question = count(value, ["怎么", "如何", "为什么", "咨询"], 2) + (/[?？]/u.test(value) ? 2 : 0);
+  if (problem === 0 && question > 0 && question > requirement + 1) return "咨询";
+  if (problem === 0 && requirement === 0 && question > 0) return "咨询";
+  return requirement > problem ? "需求" : "问题";
+}
+
 export const ISSUE_TABLE_NAME = "问题与需求";
 const DEFAULT_BASE_NAME = "问题跟踪";
 const OPEN_STATUSES: IssueStatus[] = ["待处理", "处理中", "待验收", "已修复"];
@@ -207,6 +278,10 @@ export interface IssueTracker {
   createBase(values: BotValues, chatIds?: string[]): Promise<IssueBaseConfig>;
   /** Validate that a chat's table has every required field. */
   verifyBase(values: BotValues, chatId: string): Promise<{ ok: boolean; missing: string[] }>;
+  /** Fill 类型 for records that have none; -1 means the chat has no ledger. */
+  backfillTypes(values: BotValues, chatId: string): Promise<number>;
+  /** Human correction for one record's type. */
+  setType(recordId: string, type: string, values?: BotValues): Promise<IssueRecord | null>;
   /** Unlink an auto-created Base from this chat; the Feishu Base is untouched. */
   forgetBase(chatId: string): void;
   flush(): void;
@@ -370,6 +445,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   const byRecord = new Map<string, IssueRecord>();
   const creating = new Set<string>();
   const lastActivityWrite = new Map<string, number>();
+  const backfilledChats = new Set<string>();
+  const backfillInFlight = new Set<string>();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let warnedMissingBase = false;
 
@@ -566,6 +643,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     const fields: Record<string, unknown> = {
       标题: input.title,
       状态: ["待处理"],
+      类型: [classifyIssueType(input.title)],
       提出人ID: input.senderOpenId ?? "",
       群: input.chatName,
       群ID: input.chatId,
@@ -948,12 +1026,96 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     return { ok: missing.length === 0, missing };
   }
 
+  /** Fill the `类型` column for records that predate the classifier. */
+  async function backfillTypes(values: BotValues, chatId: string): Promise<number> {
+    const config = await loadConfig(values, chatId);
+    if (!config) return -1;
+    const payload = await call(
+      values,
+      [
+        "base",
+        "+record-list",
+        "--base-token",
+        config.baseToken,
+        "--table-id",
+        config.tableId,
+        "--as",
+        "bot",
+        "--format",
+        "json",
+        "--limit",
+        "200",
+        "--field-id",
+        "标题",
+        "--field-id",
+        "类型",
+      ],
+      "读取待分类问题",
+    );
+    const { fields, rows, ids, hasMore } = parseRecordMatrix(payload);
+    const updates: Record<string, Record<string, unknown>> = {};
+    for (let index = 0; index < rows.length; index += 1) {
+      const recordId = ids[index];
+      if (!recordId) continue;
+      if (cellText(cell(rows[index]!, fields, "类型"))) continue;
+      const title = cellText(cell(rows[index]!, fields, "标题"));
+      updates[recordId] = { 类型: [classifyIssueType(title)] };
+    }
+    const count = Object.keys(updates).length;
+    if (count === 0) return 0;
+    await call(
+      values,
+      [
+        "base",
+        "+record-batch-update",
+        "--base-token",
+        config.baseToken,
+        "--table-id",
+        config.tableId,
+        "--as",
+        "bot",
+        "--json",
+        JSON.stringify({ update_records: updates }),
+      ],
+      "补齐问题类型",
+    );
+    log(`已为 ${count} 条问题补齐类型${hasMore ? "（只处理了前 200 条）" : ""}`);
+    return count;
+  }
+
+  async function setType(
+    recordId: string,
+    type: string,
+    values?: BotValues,
+  ): Promise<IssueRecord | null> {
+    const normalized = type.trim();
+    if (!(ISSUE_TYPES as readonly string[]).includes(normalized)) return null;
+    const record = byRecord.get(recordId);
+    if (!record) return null;
+    const current = await valuesFor(values);
+    await updateRecord(current, record, { 类型: [normalized] });
+    return record;
+  }
+
+  function scheduleTypeBackfill(values: BotValues, chatId: string): void {
+    if (backfilledChats.has(chatId) || backfillInFlight.has(chatId)) return;
+    backfillInFlight.add(chatId);
+    void backfillTypes(values, chatId)
+      .then((count) => {
+        // -1 means no ledger yet; retry on the next message after it exists.
+        if (count >= 0) backfilledChats.add(chatId);
+      })
+      .catch((error) => log("补齐问题类型失败", errorDetail(error)))
+      .finally(() => backfillInFlight.delete(chatId));
+  }
+
   function observe(event: LarkMessageEvent, binding: ChatBinding, values?: BotValues): void {
     if (binding.issueTracking !== "auto") return;
     if (event.sender_type === "bot" || event.message_type === "system") return;
     const isRoot = !event.root_id && !event.reply_to && Boolean(event.thread_id);
     void (async () => {
       const current = await valuesFor(values);
+      scheduleTypeBackfill(current, event.chat_id);
       if (isRoot) {
         await ensureRecord(event, binding, current);
         return;
@@ -1207,6 +1369,8 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     config: (chatId: string, values?: BotValues) => loadConfig(values, chatId),
     createBase,
     verifyBase,
+    backfillTypes,
+    setType,
     forgetBase,
     flush,
   };

@@ -90,6 +90,7 @@ export function commandHelp(): string {
     "`/issues [mine|pending|all]` 查看本群的问题/需求台账（默认未关闭）",
     "`/issue done [说明]` 把当前话题标记为待验收；`/issue release` 标记已发布",
     "`/issue close [原因]` 关闭当前话题的问题记录",
+    "`/issue type 问题|需求|咨询` 修正当前话题的类型",
     "`/doctor` 自检 lark-cli、监听、卡片回调与 provider",
     "`/help` 显示这份帮助",
   ].join("\n");
@@ -115,6 +116,8 @@ export interface CommandIssueActions {
   done: (summary: string) => Promise<string>;
   release: () => Promise<string>;
   close: (reason: string) => Promise<string>;
+  /** Human correction for the current record's type. */
+  type: (type: string) => Promise<string>;
 }
 
 export interface CommandContext {
@@ -392,7 +395,11 @@ export async function runCommand(context: CommandContext): Promise<void> {
         await reply(await context.issue.close(tail));
         return;
       }
-      await reply("用法：`/issue` 查看状态，`/issue done [说明]` 待验收，`/issue release` 已发布，`/issue close [原因]` 关闭。");
+      if (sub === "type" || sub === "类型") {
+        await reply(await context.issue.type(tail));
+        return;
+      }
+      await reply("用法：`/issue` 查看状态，`/issue done [说明]` 待验收，`/issue release` 已发布，`/issue close [原因]` 关闭，`/issue type 问题|需求|咨询` 修正类型。");
       return;
     }
     case "cron":

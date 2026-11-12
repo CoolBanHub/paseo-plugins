@@ -446,6 +446,8 @@ export function createDispatcher(options: DispatcherOptions) {
   /** Live progress card per topic (at most one). */
   const progressByTopic = new Map<string, ProgressTracker>();
   const filesByMessage = new Map<string, TopicFile[]>();
+  /** Dedupe acceptance cards when helper and auto-review race. */
+  const issueReviewSent = new Set<string>();
 
   const sessions = createSessionRegistry({
     paseo: options.paseo,
@@ -1062,6 +1064,14 @@ export function createDispatcher(options: DispatcherOptions) {
   ): Promise<boolean> {
     const target = lastTriggerMessage.get(topicKey) ?? record.rootMessageId;
     if (!target) return false;
+    const reviewKey = `${record.recordId}:${target}`;
+    if (issueReviewSent.has(reviewKey)) return true;
+    issueReviewSent.add(reviewKey);
+    while (issueReviewSent.size > 500) {
+      const oldest = issueReviewSent.values().next().value;
+      if (!oldest) break;
+      issueReviewSent.delete(oldest);
+    }
     try {
       const messageId = await sendCard({
         cliPath,
@@ -1077,7 +1087,7 @@ export function createDispatcher(options: DispatcherOptions) {
     } catch (error) {
       log("发送问题验收卡片失败，改发文本", error instanceof Error ? error.message : String(error));
     }
-    return send(
+    const sent = await send(
       cliPath,
       target,
       `**问题待验收：${record.title}**\n` +
@@ -1086,6 +1096,8 @@ export function createDispatcher(options: DispatcherOptions) {
       values,
       "markdown",
     );
+    if (!sent) issueReviewSent.delete(reviewKey);
+    return sent;
   }
 
   async function issueStatusText(record: IssueRecord | null, values: BotValues): Promise<string> {
@@ -1213,6 +1225,14 @@ export function createDispatcher(options: DispatcherOptions) {
                 values,
               );
               return updated ? "已关闭这条问题记录。" : "关闭失败：记录不存在。";
+            },
+            type: async (type) => {
+              const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
+              if (!current) return "本话题还没有登记到问题跟踪表。";
+              const updated = await options.issueTracker!.setType(current.recordId, type, values);
+              return updated
+                ? `类型已改为「${type.trim()}」。`
+                : "类型只能是「问题」「需求」或「咨询」。";
             },
           }
         : undefined,
@@ -1633,12 +1653,46 @@ export function createDispatcher(options: DispatcherOptions) {
       const topicKey = sessions.topicKeyForAgent(event.agent.id);
       const chatId = sessions.chatIdForAgent(event.agent.id);
       if (topicKey && chatId) {
-        options.issueTracker?.updateProgress({
-          chatId,
-          topicKey,
-          summary: lastText,
-          agentId: event.agent.id,
-        });
+        const tracker = options.issueTracker;
+        const current = tracker?.recordForTopic(chatId, topicKey) ?? null;
+        // Reliability: do not depend on the model remembering the helper. A
+        // completed turn in a tracked topic moves to 待验收; the human still
+        // has to accept it before it becomes 已修复.
+        const canReview =
+          current !== null &&
+          current.status !== "待验收" &&
+          current.status !== "已修复" &&
+          current.status !== "已发布" &&
+          current.status !== "已关闭";
+        if (tracker && canReview) {
+          void (async () => {
+            try {
+              const values = await currentValues();
+              const cliPath = cliPathFor(values);
+              if (!cliPath) return;
+              const updated = await tracker.markDone({
+                chatId,
+                topicKey,
+                summary: lastText,
+                agentId: event.agent.id,
+                values,
+              });
+              if (updated) {
+                await sendIssueAcceptanceCard(cliPath, values, updated, topicKey, lastText);
+              }
+            } catch (error) {
+              log("自动转待验收失败", error instanceof Error ? error.message : String(error));
+              tracker.updateProgress({ chatId, topicKey, summary: lastText, agentId: event.agent.id });
+            }
+          })();
+        } else {
+          tracker?.updateProgress({
+            chatId,
+            topicKey,
+            summary: lastText,
+            agentId: event.agent.id,
+          });
+        }
       }
     }
     void sessions.handleTurnEnded(event.agent.id, {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+  classifyIssueType,
   createIssueTracker,
   formatIssueList,
   ISSUE_FIELD_NAMES,
@@ -120,6 +121,16 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
   }
 }
 
+describe("issue type classifier", () => {
+  it("separates problems, requirements and questions", () => {
+    assert.equal(classifyIssueType("登录后偶发闪退"), "问题");
+    assert.equal(classifyIssueType("减少余额100元显示余额不足"), "问题");
+    assert.equal(classifyIssueType("组队单群聊老板信息后面加个老板提示"), "需求");
+    assert.equal(classifyIssueType("客服页面新增【发送】按钮"), "需求");
+    assert.equal(classifyIssueType("这个功能怎么用？"), "咨询");
+  });
+});
+
 describe("issue tracker", () => {
   it("records a new topic root without starting an agent", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
@@ -150,6 +161,7 @@ describe("issue tracker", () => {
       const raw = create[create.indexOf("--json") + 1]!;
       assert.match(raw, /登录后偶发闪退/);
       assert.match(raw, /"话题ID":"omt_topic_1"/);
+      assert.match(raw, /"类型":\["问题"\]/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -341,6 +353,51 @@ describe("issue tracker", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it("backfills only empty types and leaves manual ones alone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      let update: Record<string, Record<string, unknown>> | null = null;
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return {
+            ok: true,
+            data: {
+              fields: ["标题", "类型"],
+              data: [
+                ["登录后偶发闪退", []],
+                ["加个导出按钮", ["需求"]],
+                ["余额不足无法支付", []],
+              ],
+              record_id_list: ["rec_1", "rec_2", "rec_3"],
+              has_more: false,
+            },
+          };
+        }
+        if (args.includes("+record-batch-update")) {
+          const raw = args[args.indexOf("--json") + 1]!;
+          update = (JSON.parse(raw) as { update_records: Record<string, Record<string, unknown>> })
+            .update_records;
+          return { ok: true, data: {} };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "bases.json"),
+        run: fake.run,
+      });
+      const count = await tracker.backfillTypes(values(), CHAT);
+      assert.equal(count, 2);
+      assert.deepEqual(update, {
+        rec_1: { 类型: ["问题"] },
+        rec_3: { 类型: ["问题"] },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("uses each chat's own Base and keeps old records on their original Base", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
     try {
