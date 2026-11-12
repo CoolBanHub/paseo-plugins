@@ -1847,7 +1847,7 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!detail?.chatId || detail.senderOpenId !== botOpenId) return;
     const topicKey = detail.rootId || detail.threadId || reaction.messageId;
     const record = tracker.recordForTopic(detail.chatId, topicKey);
-    if (!record || record.status !== "待验收") return;
+    if (!record) return;
     if (!record.requesterOpenId || record.requesterOpenId !== reaction.operatorOpenId) return;
     const updated = await tracker.accept(record.recordId, reaction.operatorOpenId, values);
     if (!updated) return;

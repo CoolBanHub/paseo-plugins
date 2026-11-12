@@ -867,6 +867,41 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     );
   }
 
+  /** Read the authoritative status from the Base (local mapping may be stale). */
+  async function readRecordStatus(
+    values: BotValues,
+    record: IssueRecord,
+  ): Promise<IssueStatus | null> {
+    const config =
+      record.baseToken && record.tableId
+        ? { baseToken: record.baseToken, tableId: record.tableId }
+        : await loadConfig(values, record.chatId);
+    if (!config) return null;
+    const payload = await call(
+      values,
+      [
+        "base",
+        "+record-get",
+        "--base-token",
+        config.baseToken,
+        "--table-id",
+        config.tableId,
+        "--record-id",
+        record.recordId,
+        "--field-id",
+        "状态",
+        "--as",
+        "bot",
+        "--format",
+        "json",
+      ],
+      "读取问题状态",
+    );
+    const { fields, rows } = parseRecordMatrix(payload);
+    if (!rows[0]) return null;
+    return cellStatus(cell(rows[0], fields, "状态"));
+  }
+
   async function setStatus(
     values: BotValues,
     record: IssueRecord,
@@ -1210,7 +1245,11 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   async function accept(recordId: string, operatorOpenId: string, values?: BotValues): Promise<IssueRecord | null> {
     const current = await valuesFor(values);
     const record = byRecord.get(recordId);
-    if (!record || record.status !== "待验收") return null;
+    if (!record) return null;
+    // The Base is authoritative: a manual status change or a stale local
+    // mapping must not let an old card/reaction accept a closed record.
+    const status = await readRecordStatus(current, record);
+    if (status !== "待验收") return null;
     const fields: Record<string, unknown> = {
       状态: ["已修复"],
       验收人: operatorOpenId.startsWith("ou_") ? [{ id: operatorOpenId }] : [],

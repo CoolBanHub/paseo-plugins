@@ -195,6 +195,37 @@ describe("issue tracker", () => {
     }
   });
 
+  it("accepts from the Base status even when the local mapping is stale", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        if (args.includes("+record-get")) {
+          return { ok: true, data: { fields: ["状态"], data: [["待验收"]], record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "base.json"),
+        run: fake.run,
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+      // Local mapping is still 待处理; the Base already says 待验收.
+      const accepted = await tracker.accept("rec_1", USER, values());
+      assert.equal(accepted?.status, "已修复");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("moves 待处理 → 处理中 → 待验收 → 已修复 → 已发布", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
     try {
@@ -204,6 +235,9 @@ describe("issue tracker", () => {
         }
         if (args.includes("+record-batch-create")) {
           return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        if (args.includes("+record-get")) {
+          return { ok: true, data: { fields: ["状态"], data: [["待验收"]], record_id_list: ["rec_1"] } };
         }
         return { ok: true, data: {} };
       });
