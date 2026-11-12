@@ -24,6 +24,22 @@ export type ReplyFormat = z.output<typeof replyFormatSchema>;
 export const issueTrackingSchema = z.enum(["off", "auto"]);
 export type IssueTracking = z.output<typeof issueTrackingSchema>;
 
+/** Emoji reactions accepted as "the requester approves the fix". */
+export const DEFAULT_ISSUE_REACTION_EMOJIS = [
+  "OK",
+  "THUMBSUP",
+  "THANKS",
+  "DONE",
+  "YES",
+  "Yes",
+  "CheckMark",
+  "JIAYI",
+] as const;
+
+/** Who may accept a 待验收 record via card or reaction. */
+export const issueAcceptModeSchema = z.enum(["requester", "requester_or_allowlist"]);
+export type IssueAcceptMode = z.output<typeof issueAcceptModeSchema>;
+
 /**
  * Who to @ after a turn finishes. Mentions are sent as a separate plain-text
  * message because Feishu only fires mention notifications for `text` messages
@@ -267,6 +283,12 @@ export const chatBindingSchema = z.object({
   issueBaseToken: z.string().default(""),
   issueTableId: z.string().default(""),
   issueBaseUrl: z.string().default(""),
+  /** Whether OK-like reactions on bot messages count as acceptance. */
+  issueReactionAccept: z.boolean().default(true),
+  /** Emoji ids accepted; empty disables reaction acceptance. */
+  issueReactionEmojis: z.array(z.string()).default([...DEFAULT_ISSUE_REACTION_EMOJIS]),
+  /** Requester only (default), or requester plus the binding allowlist. */
+  issueAcceptMode: issueAcceptModeSchema.default("requester"),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;

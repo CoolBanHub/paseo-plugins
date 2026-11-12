@@ -84,6 +84,9 @@ const binding: ChatBinding = {
   issueBaseToken: "",
   issueTableId: "",
   issueBaseUrl: "",
+  issueReactionAccept: true,
+  issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
+  issueAcceptMode: "requester",
   rewriteIgnoreStyle: false,
 };
 

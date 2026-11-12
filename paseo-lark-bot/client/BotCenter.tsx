@@ -14,6 +14,7 @@ import {
 } from "../shared/contracts.ts";
 import {
   ACK_MODE_OPTIONS,
+  DEFAULT_ISSUE_REACTION_EMOJIS,
   botValuesSchema,
   larkBotSettingsRpc,
   type BotValues,
@@ -291,6 +292,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               issueBaseToken: "",
               issueTableId: "",
               issueBaseUrl: "",
+              issueReactionAccept: true,
+              issueReactionEmojis: [...DEFAULT_ISSUE_REACTION_EMOJIS],
+              issueAcceptMode: "requester",
             },
           ],
         };
@@ -1057,6 +1061,55 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                           onChangeText={(text) => patchBinding(chat.chatId, { issueTableId: text })}
                           style={inputStyle()}
                         />
+                        <ToggleRow
+                          label="允许用表情验收"
+                          hint="提出人对机器人在本话题里的回复/验收卡片点认可的 emoji，记录为待验收时直接变已修复"
+                          value={chat.issueReactionAccept}
+                          onChange={(value) =>
+                            patchBinding(chat.chatId, { issueReactionAccept: value })
+                          }
+                        />
+                        <FieldLabel text="认可的 emoji（逗号分隔，区分大小写）" />
+                        <TextInput
+                          value={chat.issueReactionEmojis.join(", ")}
+                          placeholder="OK, THUMBSUP, DONE, CheckMark"
+                          placeholderTextColor={colors().foregroundMuted}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          onChangeText={(text) =>
+                            patchBinding(chat.chatId, {
+                              issueReactionEmojis: text
+                                .split(/[,，\s]+/u)
+                                .map((emoji) => emoji.trim())
+                                .filter(Boolean),
+                            })
+                          }
+                          style={inputStyle()}
+                        />
+                        <FieldLabel text="谁可以验收" />
+                        <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+                          <ChoicePill
+                            label="仅提出人"
+                            active={chat.issueAcceptMode === "requester"}
+                            onPress={() =>
+                              patchBinding(chat.chatId, { issueAcceptMode: "requester" })
+                            }
+                          />
+                          <ChoicePill
+                            label="提出人或白名单"
+                            active={chat.issueAcceptMode === "requester_or_allowlist"}
+                            onPress={() =>
+                              patchBinding(chat.chatId, {
+                                issueAcceptMode: "requester_or_allowlist",
+                              })
+                            }
+                          />
+                        </View>
+                        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                          表情验收需要开发者后台开启事件 im.message.reaction.created_v1 并发布版本；白名单模式在 allowedUsers
+                          为空时等于所有人可验收。不知道 emoji_type 时先点一次，插件日志会打印「忽略未配置的验收表情：XXX」，把
+                          XXX 填进来即可。
+                        </Text>
                         <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
                           <PrimaryButton
                             label={busy ? "处理中…" : "创建跟踪表"}
@@ -1382,6 +1435,16 @@ function normalize(values: BotValues): BotValues {
       issueBaseToken: chat.issueBaseToken.trim(),
       issueTableId: chat.issueTableId.trim(),
       issueBaseUrl: chat.issueBaseUrl.trim(),
+      issueReactionEmojis: (() => {
+        const seen = new Set<string>();
+        return chat.issueReactionEmojis
+          .map((emoji) => emoji.trim())
+          .filter((emoji) => {
+            if (!emoji || seen.has(emoji)) return false;
+            seen.add(emoji);
+            return true;
+          });
+      })(),
     })),
   };
 }

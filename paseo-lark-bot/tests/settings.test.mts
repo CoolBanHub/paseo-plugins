@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { botValuesSchema, isDshProvider, larkBotSettings, replyStyleInstruction } from "../shared/settings.ts";
+import {
+  DEFAULT_ISSUE_REACTION_EMOJIS,
+  botValuesSchema,
+  isDshProvider,
+  larkBotSettings,
+  replyStyleInstruction,
+} from "../shared/settings.ts";
 
 describe("chat binding schema", () => {
   it("fills the new model/thinking/permission/allowlist fields for old settings", () => {
@@ -24,6 +30,9 @@ describe("chat binding schema", () => {
     assert.equal(binding.rewriteIgnoreStyle, false);
     assert.equal(binding.allowAgentDelegation, false);
     assert.equal(binding.replyFormat, "markdown");
+    assert.equal(binding.issueReactionAccept, true);
+    assert.deepEqual(binding.issueReactionEmojis, [...DEFAULT_ISSUE_REACTION_EMOJIS]);
+    assert.equal(binding.issueAcceptMode, "requester");
   });
 
   it("accepts explicit AI rewrite modes and an independent model", () => {

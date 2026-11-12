@@ -255,17 +255,6 @@ const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
-/** OK-like reactions that count as the requester accepting a fix. */
-const ISSUE_ACCEPT_REACTIONS = new Set([
-  "OK",
-  "THUMBSUP",
-  "THANKS",
-  "DONE",
-  "YES",
-  "Yes",
-  "CheckMark",
-  "JIAYI",
-]);
 
 const MAX_PENDING_QUESTIONS = 200;
 
@@ -1822,18 +1811,26 @@ export function createDispatcher(options: DispatcherOptions) {
     removePendingQuestion(event.requestId);
   }
 
+  function canAcceptIssue(binding: ChatBinding, record: IssueRecord, operatorOpenId: string): boolean {
+    if (record.requesterOpenId && operatorOpenId === record.requesterOpenId) return true;
+    return (
+      binding.issueAcceptMode === "requester_or_allowlist" &&
+      isSenderAllowed(binding, operatorOpenId)
+    );
+  }
+
   function handleReaction(event: LarkReactionEvent): void {
     const reaction = normalizeReactionEvent(event);
-    if (!reaction || !ISSUE_ACCEPT_REACTIONS.has(reaction.emojiType)) return;
+    if (!reaction) return;
     void processReaction(reaction).catch((error) =>
-      log("处理 OK 表情验收失败", error instanceof Error ? error.message : String(error)),
+      log("处理表情验收失败", error instanceof Error ? error.message : String(error)),
     );
   }
 
   /**
    * The requester often reacts ✅/OK to the bot's final reply instead of
-   * clicking the card. Treat an OK-like reaction on a bot message in the same
-   * topic as acceptance, but only while the record is 待验收.
+   * clicking the card. The accepted emoji list and the allowed operator are
+   * per-binding; the Base status remains authoritative.
    */
   async function processReaction(reaction: NormalizedReactionEvent): Promise<void> {
     const tracker = options.issueTracker;
@@ -1845,16 +1842,31 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!botOpenId) return;
     const detail = await readMessageDetail(cliPath, reaction.messageId);
     if (!detail?.chatId || detail.senderOpenId !== botOpenId) return;
+    const binding = values.chats.find((chat) => chat.chatId === detail.chatId);
+    if (!binding || binding.issueTracking !== "auto" || !binding.issueReactionAccept) return;
+    const emojis = new Set(
+      binding.issueReactionEmojis.map((emoji) => emoji.trim()).filter(Boolean),
+    );
+    if (!emojis.has(reaction.emojiType)) {
+      log(`忽略未配置的验收表情：${reaction.emojiType}`);
+      return;
+    }
     const topicKey = detail.rootId || detail.threadId || reaction.messageId;
     const record = tracker.recordForTopic(detail.chatId, topicKey);
     if (!record) return;
-    if (!record.requesterOpenId || record.requesterOpenId !== reaction.operatorOpenId) return;
+    if (!canAcceptIssue(binding, record, reaction.operatorOpenId)) {
+      log("忽略非验收人的表情回执");
+      return;
+    }
     const updated = await tracker.accept(record.recordId, reaction.operatorOpenId, values);
-    if (!updated) return;
+    if (!updated) {
+      log("表情验收未生效：Base 状态不是待验收或读取失败");
+      return;
+    }
     await send(
       cliPath,
       reaction.messageId,
-      "✅ 已收到你的 OK 表情，状态改为「已修复」。发布后发 `/issue release` 标记「已发布」。",
+      "✅ 已收到你的验收表情，状态改为「已修复」。发布后发 `/issue release` 标记「已发布」。",
       values,
       "text",
     );
@@ -2029,10 +2041,8 @@ export function createDispatcher(options: DispatcherOptions) {
       await send(cliPath, event.message_id, "这条问题记录已不存在，可能已被删除；请到跟踪表查看。", values, "text");
       return;
     }
-    const authorized =
-      event.operator_id === record.requesterOpenId || isSenderAllowed(binding, event.operator_id);
-    if (!authorized) {
-      await send(cliPath, event.message_id, "只有提出人或该会话白名单内的成员可以验收这个问题。", values, "text");
+    if (!canAcceptIssue(binding, record, event.operator_id)) {
+      await send(cliPath, event.message_id, "只有提出人或获准的成员可以验收这个问题。", values, "text");
       return;
     }
     if (action.action === "accept") {
