@@ -15,6 +15,7 @@ import {
   type EventConsumer,
   type LarkCardActionEvent,
   type LarkMessageEvent,
+  type LarkReactionEvent,
 } from "./server/lark-events.ts";
 import {
   applyAppCredentials,
@@ -72,6 +73,8 @@ let consumer: EventConsumer | null = null;
 let consumerCli: string | null = null;
 let cardConsumer: EventConsumer | null = null;
 let cardConsumerCli: string | null = null;
+let reactionConsumer: EventConsumer | null = null;
+let reactionConsumerCli: string | null = null;
 /** appId + secret fingerprint confirmed in this plugin lifetime. */
 let appliedCredentialKey: string | null = null;
 let currentAppIdCache: string | null = null;
@@ -81,6 +84,9 @@ const MAX_PENDING_EVENTS = 50;
 /** Card actions that arrived before the dispatcher; replayed on capture. */
 const pendingCardActions: LarkCardActionEvent[] = [];
 const MAX_PENDING_CARD_ACTIONS = 20;
+/** Reaction events that arrived before the dispatcher; replayed on capture. */
+const pendingReactions: LarkReactionEvent[] = [];
+const MAX_PENDING_REACTIONS = 20;
 /** provider → provider/<default-model>, filled lazily per daemon lifetime. */
 const providerModelCache = new Map<string, string>();
 /** All plugin-owned state (stores, media, outbox, helper) lives here. */
@@ -219,6 +225,10 @@ function ensureDispatcher(
     const replayCards = pendingCardActions.splice(0);
     for (const event of replayCards) void dispatcher.handleCardAction(event);
   }
+  if (pendingReactions.length > 0) {
+    const replayReactions = pendingReactions.splice(0);
+    for (const event of replayReactions) dispatcher.handleReaction(event);
+  }
   return dispatcher;
 }
 
@@ -341,6 +351,27 @@ export default function contribute(server: PluginServerContext) {
     cardConsumer.start();
   };
 
+  const startReactionConsumer = async (cliPath: string): Promise<void> => {
+    if (reactionConsumer && reactionConsumerCli === cliPath) {
+      reactionConsumer.start();
+      return;
+    }
+    await reactionConsumer?.stop();
+    if (disposed) return;
+    reactionConsumerCli = cliPath;
+    reactionConsumer = createEventConsumer<LarkReactionEvent>({
+      cliPath,
+      eventKey: "im.message.reaction.created_v1",
+      fatalErrorPattern: /not subscribed|failed_precondition|event.*not found/i,
+      accept: (parsed) => {
+        const body = parsed as { event?: { message_id?: unknown }; message_id?: unknown };
+        return typeof (body.event?.message_id ?? body.message_id) === "string";
+      },
+      onEvent: deliverReaction,
+    });
+    reactionConsumer.start();
+  };
+
   const stopConsumers = async (): Promise<void> => {
     await consumer?.stop();
     consumer = null;
@@ -348,6 +379,9 @@ export default function contribute(server: PluginServerContext) {
     await cardConsumer?.stop();
     cardConsumer = null;
     cardConsumerCli = null;
+    await reactionConsumer?.stop();
+    reactionConsumer = null;
+    reactionConsumerCli = null;
   };
 
   // Start or stop the event consumers to match the current bindings; a changed
@@ -373,6 +407,7 @@ export default function contribute(server: PluginServerContext) {
     if (consumer && consumerCli === cliPath) {
       consumer.start();
       await startCardConsumer(cliPath);
+      await startReactionConsumer(cliPath);
       return;
     }
     await stopConsumers();
@@ -381,6 +416,7 @@ export default function contribute(server: PluginServerContext) {
     consumer = createEventConsumer({ cliPath, onEvent: deliverEvent });
     consumer.start();
     await startCardConsumer(cliPath);
+    await startReactionConsumer(cliPath);
   };
 
   /** Serialize settings saves so concurrent syncs cannot leak a consumer. */
@@ -415,6 +451,15 @@ export default function contribute(server: PluginServerContext) {
     // the answer.
     if (pendingCardActions.length >= MAX_PENDING_CARD_ACTIONS) pendingCardActions.shift();
     pendingCardActions.push(event);
+  };
+
+  const deliverReaction = (event: LarkReactionEvent): void => {
+    if (dispatcher) {
+      dispatcher.handleReaction(event);
+      return;
+    }
+    if (pendingReactions.length >= MAX_PENDING_REACTIONS) pendingReactions.shift();
+    pendingReactions.push(event);
   };
 
   // One-click app creation. The CLI owns the device flow and writes the new
@@ -729,8 +774,12 @@ export default function contribute(server: PluginServerContext) {
     await cardConsumer?.stop();
     cardConsumer = null;
     cardConsumerCli = null;
+    await reactionConsumer?.stop();
+    reactionConsumer = null;
+    reactionConsumerCli = null;
     pendingEvents.length = 0;
     pendingCardActions.length = 0;
+    pendingReactions.length = 0;
     appliedCredentialKey = null;
     currentAppIdCache = null;
   };

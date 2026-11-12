@@ -18,6 +18,57 @@ export interface LarkMessageEvent {
   create_time?: string;
 }
 
+/**
+ * im.message.reaction.created_v1. lark-cli emits the raw Feishu envelope
+ * (nested `event`), while some versions flatten it; normalize both shapes.
+ */
+export interface LarkReactionEvent {
+  event?: {
+    message_id?: string;
+    reaction_type?: { emoji_type?: string } | string;
+    operator_type?: string;
+    user_id?: { open_id?: string; union_id?: string; user_id?: string };
+    action_time?: string;
+    app_id?: string;
+  };
+  header?: { event_id?: string; event_type?: string; create_time?: string };
+  message_id?: string;
+  reaction_type?: { emoji_type?: string } | string;
+  operator_type?: string;
+  user_id?: { open_id?: string };
+}
+
+export interface NormalizedReactionEvent {
+  messageId: string;
+  emojiType: string;
+  operatorOpenId: string;
+  eventId: string | null;
+}
+
+/** Reduce the nested/flat reaction payload to the fields the plugin needs. */
+export function normalizeReactionEvent(event: LarkReactionEvent): NormalizedReactionEvent | null {
+  const body = (event.event ?? event) as Record<string, unknown>;
+  const messageId = body.message_id;
+  const reaction = body.reaction_type;
+  const emojiType =
+    typeof reaction === "string"
+      ? reaction
+      : reaction && typeof reaction === "object"
+        ? (reaction as { emoji_type?: unknown }).emoji_type
+        : undefined;
+  const user = body.user_id as { open_id?: unknown } | undefined;
+  const operatorOpenId = user?.open_id;
+  if (typeof messageId !== "string" || !messageId) return null;
+  if (typeof emojiType !== "string" || !emojiType) return null;
+  if (typeof operatorOpenId !== "string" || !operatorOpenId) return null;
+  return {
+    messageId,
+    emojiType,
+    operatorOpenId,
+    eventId: event.header?.event_id ?? null,
+  };
+}
+
 /** Flattened card.action.trigger payload as emitted by lark-cli. */
 export interface LarkCardActionEvent {
   type?: string;
@@ -73,7 +124,7 @@ const STOP_TIMEOUT_MS = 10_000;
  * stdin EOF as an exit signal, so the pipe stays open for the whole lifetime
  * and stop() closes it / sends SIGTERM.
  */
-export function createEventConsumer<T extends { chat_id?: string; message_id?: string } = LarkMessageEvent>(options: {
+export function createEventConsumer<T = LarkMessageEvent>(options: {
   cliPath: string;
   /** Defaults to im.message.receive_v1; card actions use card.action.trigger. */
   eventKey?: string;
@@ -83,6 +134,11 @@ export function createEventConsumer<T extends { chat_id?: string; message_id?: s
    * console subscription is a stable "failed_precondition" response.
    */
   fatalErrorPattern?: RegExp;
+  /**
+   * Optional event-shape guard. Message/card events are flat with chat_id +
+   * message_id; reaction events carry a nested `event` envelope.
+   */
+  accept?: (parsed: unknown) => boolean;
   onEvent: (event: T) => void;
   deps?: SpawnDeps;
 }): EventConsumer {
@@ -198,10 +254,16 @@ export function createEventConsumer<T extends { chat_id?: string; message_id?: s
   function emitEventLine(line: string): void {
     if (!line.startsWith("{")) return;
     try {
-      const parsed = JSON.parse(line) as T;
-      if (parsed && typeof parsed.chat_id === "string" && typeof parsed.message_id === "string") {
-        options.onEvent(parsed);
-      }
+      const parsed = JSON.parse(line) as unknown;
+      const accepted =
+        options.accept?.(parsed) ??
+        Boolean(
+          parsed &&
+            typeof parsed === "object" &&
+            typeof (parsed as { chat_id?: unknown }).chat_id === "string" &&
+            typeof (parsed as { message_id?: unknown }).message_id === "string",
+        );
+      if (accepted) options.onEvent(parsed as T);
     } catch {
       // Skip malformed lines; the stream stays usable.
     }

@@ -240,6 +240,41 @@ describe("issue tracker", () => {
     }
   });
 
+  it("moves a 待验收 record back to 处理中 when the topic is asked again", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "base.json"),
+        run: fake.run,
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+      await tracker.markDone({
+        chatId: CHAT,
+        topicKey: THREAD,
+        summary: "已改完",
+        values: values(),
+      });
+      assert.equal(tracker.recordForTopic(CHAT, THREAD)?.status, "待验收");
+
+      tracker.markWorking(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD)?.status === "处理中");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not reopen a closed record when someone @s again", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
     try {

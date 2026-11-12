@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 import {
   createEventConsumer,
+  normalizeReactionEvent,
   type LarkCardActionEvent,
   type LarkMessageEvent,
 } from "../server/lark-events.ts";
@@ -282,5 +283,36 @@ describe("createEventConsumer", () => {
     await stopping;
     assert.equal(h.processes[0].stdinEnded, true);
     assert.deepEqual(h.processes[0].kills, ["SIGTERM"]);
+  });
+});
+
+describe("reaction event normalization", () => {
+  it("reads the nested Feishu envelope", () => {
+    const normalized = normalizeReactionEvent({
+      event: {
+        message_id: "om_reply",
+        reaction_type: { emoji_type: "OK" },
+        user_id: { open_id: "ou_user" },
+      },
+      header: { event_id: "evt_1" },
+    });
+    assert.deepEqual(normalized, {
+      messageId: "om_reply",
+      emojiType: "OK",
+      operatorOpenId: "ou_user",
+      eventId: "evt_1",
+    });
+  });
+
+  it("reads a flattened payload and rejects incomplete events", () => {
+    assert.equal(
+      normalizeReactionEvent({
+        message_id: "om_reply",
+        reaction_type: { emoji_type: "THUMBSUP" },
+        user_id: { open_id: "ou_user" },
+      })?.emojiType,
+      "THUMBSUP",
+    );
+    assert.equal(normalizeReactionEvent({ message_id: "om_reply" }), null);
   });
 });

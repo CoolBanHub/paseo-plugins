@@ -256,6 +256,10 @@ export interface MessageDetail {
   text: string | null;
   senderOpenId: string | null;
   senderName: string | null;
+  chatId?: string | null;
+  rootId?: string | null;
+  threadId?: string | null;
+  senderType?: string | null;
 }
 
 /** Fetch one message (thread roots) with its pre-rendered text and sender. */
@@ -270,11 +274,15 @@ export async function readMessageDetail(cliPath: string, messageId: string): Pro
   if (!first || typeof first !== "object") return null;
   const record = first as Record<string, unknown>;
   const content = record.content;
-  const sender = record.sender as { id?: unknown; name?: unknown } | undefined;
+  const sender = record.sender as { id?: unknown; name?: unknown; sender_type?: unknown } | undefined;
   return {
     text: typeof content === "string" && content.trim() ? content.trim() : null,
     senderOpenId: typeof sender?.id === "string" ? sender.id : null,
     senderName: typeof sender?.name === "string" && sender.name ? sender.name : null,
+    chatId: typeof record.chat_id === "string" ? record.chat_id : null,
+    rootId: typeof record.root_id === "string" ? record.root_id : null,
+    threadId: typeof record.thread_id === "string" ? record.thread_id : null,
+    senderType: typeof sender?.sender_type === "string" ? sender.sender_type : null,
   };
 }
 

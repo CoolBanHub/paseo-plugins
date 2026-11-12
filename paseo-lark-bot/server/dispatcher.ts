@@ -1,5 +1,6 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
-import type { LarkCardActionEvent, LarkMessageEvent } from "./lark-events.ts";
+import type { LarkCardActionEvent, LarkMessageEvent, LarkReactionEvent } from "./lark-events.ts";
+import { normalizeReactionEvent, type NormalizedReactionEvent } from "./lark-events.ts";
 import {
   addReaction,
   listChatBots,
@@ -254,6 +255,17 @@ const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
+/** OK-like reactions that count as the requester accepting a fix. */
+const ISSUE_ACCEPT_REACTIONS = new Set([
+  "OK",
+  "THUMBSUP",
+  "THANKS",
+  "DONE",
+  "YES",
+  "Yes",
+  "CheckMark",
+  "JIAYI",
+]);
 
 const MAX_PENDING_QUESTIONS = 200;
 
@@ -1810,6 +1822,44 @@ export function createDispatcher(options: DispatcherOptions) {
     removePendingQuestion(event.requestId);
   }
 
+  function handleReaction(event: LarkReactionEvent): void {
+    const reaction = normalizeReactionEvent(event);
+    if (!reaction || !ISSUE_ACCEPT_REACTIONS.has(reaction.emojiType)) return;
+    void processReaction(reaction).catch((error) =>
+      log("处理 OK 表情验收失败", error instanceof Error ? error.message : String(error)),
+    );
+  }
+
+  /**
+   * The requester often reacts ✅/OK to the bot's final reply instead of
+   * clicking the card. Treat an OK-like reaction on a bot message in the same
+   * topic as acceptance, but only while the record is 待验收.
+   */
+  async function processReaction(reaction: NormalizedReactionEvent): Promise<void> {
+    const tracker = options.issueTracker;
+    if (!tracker) return;
+    const values = await currentValues();
+    const cliPath = cliPathFor(values);
+    if (!cliPath) return;
+    const botOpenId = await ensureBotOpenId(cliPath);
+    if (!botOpenId) return;
+    const detail = await readMessageDetail(cliPath, reaction.messageId);
+    if (!detail?.chatId || detail.senderOpenId !== botOpenId) return;
+    const topicKey = detail.rootId || detail.threadId || reaction.messageId;
+    const record = tracker.recordForTopic(detail.chatId, topicKey);
+    if (!record || record.status !== "待验收") return;
+    if (!record.requesterOpenId || record.requesterOpenId !== reaction.operatorOpenId) return;
+    const updated = await tracker.accept(record.recordId, reaction.operatorOpenId, values);
+    if (!updated) return;
+    await send(
+      cliPath,
+      reaction.messageId,
+      "✅ 已收到你的 OK 表情，状态改为「已修复」。发布后发 `/issue release` 标记「已发布」。",
+      values,
+      "text",
+    );
+  }
+
   function handleCardAction(event: LarkCardActionEvent): void {
     if (event.event_id) {
       if (seenCardEventIds.has(event.event_id)) return;
@@ -2750,6 +2800,7 @@ export function createDispatcher(options: DispatcherOptions) {
     handlePermission,
     handlePermissionResolved,
     handleCardAction,
+    handleReaction,
     resetIdentity,
     /** Test hooks: drive the outbox and cron schedulers deterministically. */
     drainOutbox: () => outboxWatcher?.tick() ?? Promise.resolve(),

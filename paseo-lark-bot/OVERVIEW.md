@@ -55,6 +55,7 @@ dsh ask_user_question → 开启 questionCards 后以交互卡片发到话题，
     - `im:message.group_msg` 或 `im:message.group_msg:readonly`（敏感权限）：接收未 @ 的群消息。没有它时机器人根本收不到未 @ 的话题，只能跟踪 @ 过机器人的话题；
     - `base:app:create`、`base:record:create/read/update`、`base:field:read`、`docs:permission.member:create`：机器人创建/读写跟踪表、给群授权；
     - 使用已有表时，把机器人加为该 Base 的**可编辑协作者**；scope 只代表“能调 API”，协作者才代表“能进这张表”。
+    - 表情验收（可选）：开发者后台开启事件 `im.message.reaction.created_v1`，并授予 `im:message.reactions:read`（通常还需要 `im:message:readonly`）；没开启时只是点表情不生效，不影响卡片验收。
 - 扫码创建的应用会自动带上机器人能力、WebSocket 长连接、`im.message.receive_v1`、`card.action.trigger` 和上表列出的基础/群聊/媒体权限，并自带 `contact:contact.base:readonly`；但**不包含**敏感权限 `im:message.group_msg`、可选的 `im:chat.members:read`、单聊部门/组织所需的通讯录字段权限、表情回复和资源上传权限，需要时去开发者后台手动补。
 - 机器人已被拉进目标群（单聊则需用户能搜到该机器人）。
 
@@ -178,9 +179,11 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 - **状态流**：
   - 新话题根消息 → `待处理`（不创建 agent）
   - 首次 @ → `处理中`（复用记录；已修复/已发布/已关闭不自动重开）
+  - `待验收` 时有人再次 @ → `处理中`，继续处理/答疑；该轮完成后再回到 `待验收`
   - 轮次完成 → 自动转 `待验收`，在话题里发验收卡片并 @ 提出人；不再依赖模型记得调用 helper
   - 智能体主动调用 `lark-bot-issue done --summary "…"` 或人工 `/issue done` 只作为补充/兜底，不是唯一路径
   - 提出人点「验收通过」→ `已修复`；点「还没修好」→ 回 `处理中`
+  - 提出人对机器人在该话题里的回复/验收卡片点 `OK`、`THUMBSUP`、`DONE`、`CheckMark` 等表情，且记录处于 `待验收` → `已修复`；需要开启 `im.message.reaction.created_v1` 事件
   - `/issue release` → `已发布`；任意状态 `/issue close` → `已关闭`
 - **助手 helper**：仅当绑定开启问题跟踪时，默认 systemPrompt 才追加 `lark-bot-issue` 用法；helper 把请求写入 `outbox/issues/`，插件轮询后更新 Base，不把 Base token 暴露给模型。自定义 `systemPrompt` 不会自动追加，需要自己写。**现在轮次完成会自动转待验收，helper 只用于补充摘要，不再作为状态推进的必要条件。**
 - **幂等与节流**：`issue-records.json` 按根消息/话题 id 保存 `recordId`；重复事件先查本地映射和 Base 再决定是否创建。普通回复不逐条写 Base，`最后活跃` 最多 10 分钟写一次。Base 写入失败只写日志/重试，不影响聊天回复；Base 更新是异步的，写入成功不要立刻读回校验。
@@ -252,6 +255,7 @@ npm run typecheck
 - 扫码创建依赖 `lark-cli ≥ 1.0.98`；旧版本会提示升级。租户不允许成员创建自建应用时，扫码页会拒绝，插件无法绕过。
 - **问题跟踪依赖敏感权限**：没有 `im:message.group_msg`（或 readonly）时，机器人收不到未 @ 的话题，只能跟踪 @ 过机器人的话题；这不是代码能绕过的。只应对话题群开启 `issueTracking`，普通群会把每条消息当新话题。
 - **问题跟踪的边界**：上线前已存在的话题不会自动回填；一个话题对应一条记录，多个问题建议拆话题；Base 字段被人工改名/删除后写入会失败，可在设置页点「测试连接」检查；插件只在自己预期的前置状态推进，人工改过的已修复/已发布/已关闭不会被自动重开。文档配置跟会话绑定走：一个会话最多一个文档，多个会话可填相同的 Base；记录会记住创建时的 Base，之后改绑会话不会把旧记录写到新表。
+- **表情验收的边界**：只认提出人本人，且只认机器人消息（最终回复或验收卡片）上的 `OK` / `THUMBSUP` / `THANKS` / `DONE` / `YES` / `Yes` / `CheckMark` / `JIAYI`，记录必须处于 `待验收`；其他表情、其他成员或已修复/已关闭记录都不会改状态。需要开发者后台开启 `im.message.reaction.created_v1` 事件并发布版本，否则表情只停留在消息上，仍可用卡片验收。
 - **自动创建的 Base 归机器人应用**：Base 在应用空间，不在个人「我的空间」，通过链接和该会话的群协作者访问；需要归个人时请在飞书里手动建表并使用已有表，或把所有权转给个人。创建过程中插件重启可能留下未登记的 Base；可在设置页重新创建，或手动把已有表填进会话配置。
 - 扫码创建的应用默认不含 `im:message.group_msg`（敏感）和 `im:chat.members:read`：前者影响话题根消息/群历史/群媒体，后者影响「读取群成员」和单聊名字解析；需要时到开发者后台手动补。问题跟踪还需要 `base:app:create` / `base:record:*` / `docs:permission.member:create`，使用已有表时需要把机器人加为 Base 协作者。
 - 指令只处理 text / post；`file` 会下载并列出路径，语音、表情、卡片等非文本类型仍只记占位（不做 STT）。post 的入站文本由 lark-cli 预渲染，排版细节以实际渲染为准。
