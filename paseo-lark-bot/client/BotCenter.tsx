@@ -291,6 +291,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               rewriteIgnoreStyle: false,
               issueTracking: "off",
               issueAiClassify: true,
+              issueAiStatusReview: true,
               issueBaseToken: "",
               issueTableId: "",
               issueBaseUrl: "",
@@ -1073,6 +1074,14 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                         value={chat.issueAiClassify}
                         onChange={(value) =>
                           patchBinding(chat.chatId, { issueAiClassify: value })
+                        }
+                      />
+                      <ToggleRow
+                        label="AI 判断评论是否可验收"
+                        hint="评论出现已修复/已上线等词时，AI 读话题最近评论；只会把处理中自动推进到待验收，已修复/已发布仍需人确认"
+                        value={chat.issueAiStatusReview}
+                        onChange={(value) =>
+                          patchBinding(chat.chatId, { issueAiStatusReview: value })
                         }
                       />
                       <SelectRow

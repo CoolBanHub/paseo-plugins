@@ -278,6 +278,8 @@ export const chatBindingSchema = z.object({
   issueTracking: issueTrackingSchema.default("off"),
   /** Run a one-shot model gate before recording a new topic. */
   issueAiClassify: z.boolean().default(true),
+  /** Let the model advance 处理中 → 待验收 from ambient comments. */
+  issueAiStatusReview: z.boolean().default(true),
   /**
    * The one ledger this chat may use. Empty means "not configured"; the
    * plugin can create one with the bot identity and store the coordinates in

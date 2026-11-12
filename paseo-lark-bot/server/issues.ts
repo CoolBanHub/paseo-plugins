@@ -1329,7 +1329,25 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     const current = await valuesFor(input.values);
     const record = find(input.chatId, input.topicKey);
     if (!record) return null;
-    if (record.status === "已修复" || record.status === "已发布" || record.status === "已关闭") return record;
+    if (record.status === "已修复" || record.status === "已发布" || record.status === "已关闭") {
+      return null;
+    }
+    // A manual Base change may be ahead of the local mapping; never regress a
+    // human-confirmed fix/release back to 待验收. A failed read falls back to
+    // the local status instead of blocking the normal turn-end flow.
+    let baseStatus: IssueStatus | null = null;
+    try {
+      baseStatus = await readRecordStatus(current, record);
+    } catch (error) {
+      log("读取 Base 状态失败，按本地状态继续", errorDetail(error));
+    }
+    if (
+      baseStatus === "已修复" ||
+      baseStatus === "已发布" ||
+      baseStatus === "已关闭"
+    ) {
+      return null;
+    }
     const summary = clip(input.summary ?? "", 500) || "已处理完成，等待验收";
     const fields: Record<string, unknown> = {
       状态: ["待验收"],

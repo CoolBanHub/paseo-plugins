@@ -1,6 +1,7 @@
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { LarkCardActionEvent, LarkMessageEvent, LarkReactionEvent } from "./lark-events.ts";
 import { normalizeReactionEvent, type NormalizedReactionEvent } from "./lark-events.ts";
+import { reviewIssueStatusWithModel } from "./issue-status-reviewer.ts";
 import {
   addReaction,
   listChatBots,
@@ -255,6 +256,9 @@ const ACK_TEXT = "✅ 收到，正在处理，完成后在本话题回复。";
 const EMPTY_PROMPT_HINT = "收到，但没有读到文字内容。";
 const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
+/** Cheap local prefilter before spending a model call on a comment. */
+const ISSUE_STATUS_HINT =
+  /(已修复|修复了|修好了|改好了|已改好|已解决|解决了|已完成|完成了|已上线|上线了|已发布|发布了|可以了|没问题|验证通过|验收通过|fixed|resolved|deployed|released)/iu;
 
 const MAX_PENDING_QUESTIONS = 200;
 
@@ -449,6 +453,8 @@ export function createDispatcher(options: DispatcherOptions) {
   const filesByMessage = new Map<string, TopicFile[]>();
   /** Dedupe acceptance cards when helper and auto-review race. */
   const issueReviewSent = new Set<string>();
+  /** Avoid concurrent model reviews for the same record. */
+  const issueStatusReviewing = new Set<string>();
 
   const sessions = createSessionRegistry({
     paseo: options.paseo,
@@ -1052,6 +1058,82 @@ export function createDispatcher(options: DispatcherOptions) {
 
   /** Run a chat command under the same allowlist as a normal turn. */
   /**
+   * Ambient (non-@) comments can indicate that an external fix is finished.
+   * A local keyword prefilter bounds model calls; the model may only advance
+   * 处理中 → 待验收. 已修复/已发布 still require a human acceptance/release.
+   */
+  async function maybeReviewIssueStatus(
+    cliPath: string,
+    values: BotValues,
+    binding: ChatBinding,
+    event: LarkMessageEvent,
+  ): Promise<void> {
+    const tracker = options.issueTracker;
+    if (!tracker || binding.issueTracking !== "auto" || !binding.issueAiStatusReview) return;
+    if (event.chat_type !== "group" || event.sender_type === "bot") return;
+    if (event.message_type === "system" || !event.root_id) return;
+    const text = extractPrompt(event).trim();
+    if (!text || text.startsWith("/") || !ISSUE_STATUS_HINT.test(text)) return;
+    const topicKey = topicKeyFor(event);
+    const record = tracker.recordForTopic(event.chat_id, topicKey);
+    if (!record || record.status !== "处理中" || issueStatusReviewing.has(record.recordId)) return;
+    issueStatusReviewing.add(record.recordId);
+    try {
+      const cwd = resolveCwd(binding.cwd);
+      const provider = options.resolveProvider
+        ? await options.resolveProvider(binding.provider, binding.model)
+        : binding.provider;
+      const workspace = await helperWorkspace(binding.chatId, binding.chatName, cwd, "问题状态判断");
+      const rootDetail = await readThreadRootDetail(cliPath, record.rootMessageId).catch(
+        () => null,
+      );
+      const history = (topicHistory.get(topicKey) ?? []).slice(-10);
+      const comments = history
+        .filter((entry) => entry.text.trim() && !entry.text.trim().startsWith("/"))
+        .map((entry) => ({
+          sender:
+            entry.senderType === "机器人"
+              ? "机器人"
+              : entry.senderId === record.requesterOpenId
+                ? "提出人"
+                : "成员",
+          text: entry.text,
+        }));
+      if (comments.length === 0) return;
+      const review = await reviewIssueStatusWithModel({
+        paseo: options.paseo,
+        workspace,
+        provider,
+        cwd,
+        chatId: binding.chatId,
+        topicKey,
+        rootText: rootDetail?.text ?? record.title,
+        currentStatus: record.status,
+        comments,
+        log,
+      });
+      if (!review) return;
+      if (!review.done) {
+        log(`AI 判断暂不可验收：${review.reason || "无依据"}`);
+        return;
+      }
+      const updated = await tracker.markDone({
+        chatId: record.chatId,
+        topicKey,
+        summary: review.summary ?? text,
+        values,
+      });
+      if (!updated) return;
+      log(`AI 判断可验收：${review.summary || review.reason || "评论显示已完成"}`);
+      await sendIssueAcceptanceCard(cliPath, values, updated, topicKey, review.summary ?? text);
+    } catch (error) {
+      log("AI 判断问题状态失败", error instanceof Error ? error.message : String(error));
+    } finally {
+      issueStatusReviewing.delete(record.recordId);
+    }
+  }
+
+  /**
    * Send the acceptance card back into the topic. The card callback carries
    * the record id and topic key; the click handler re-reads the record, so a
    * stale card cannot move an item that was already closed elsewhere.
@@ -1364,6 +1446,9 @@ export function createDispatcher(options: DispatcherOptions) {
       }
 
       recordHistory(event);
+      if (!triggered && allowed) {
+        void maybeReviewIssueStatus(cliPath, values, binding, event);
+      }
       if (blocked && event.sender_type !== "bot") {
         // Reply first so a slow media download never delays the rejection.
         log(`会话 ${event.chat_id} 收到未授权成员 ${event.sender_id} 的 @，已拒绝处理`);

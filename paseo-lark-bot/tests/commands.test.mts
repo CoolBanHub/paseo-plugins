@@ -24,6 +24,7 @@ const binding: ChatBinding = {
   allowAgentDelegation: false,
   issueTracking: "off",
   issueAiClassify: true,
+    issueAiStatusReview: true,
   issueBaseToken: "",
   issueTableId: "",
   issueBaseUrl: "",

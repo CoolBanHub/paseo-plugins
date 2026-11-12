@@ -44,6 +44,7 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     rewriteIgnoreStyle: false,
     issueTracking: "auto",
     issueAiClassify: true,
+    issueAiStatusReview: true,
     issueBaseToken: "bascnTest",
     issueTableId: "tblTest",
     issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
@@ -345,6 +346,46 @@ describe("issue tracker", () => {
 
       const statuses = updates(fake.calls).map((fields) => fields["状态"]);
       assert.deepEqual(statuses, [["处理中"], ["待验收"], ["已修复"], ["已发布"]]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not regress a Base-confirmed 已修复 record to 待验收", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        if (args.includes("+record-get")) {
+          return { ok: true, data: { fields: ["状态"], data: [["已修复"]], record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "base.json"),
+        run: fake.run,
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+
+      const done = await tracker.markDone({
+        chatId: CHAT,
+        topicKey: THREAD,
+        summary: "不应覆盖人工结论",
+        values: values(),
+      });
+      assert.equal(done, null);
+      assert.equal(
+        fake.calls.some((args) => args.includes("+record-batch-update")),
+        false,
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
