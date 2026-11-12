@@ -270,7 +270,7 @@ npm run typecheck
 - **轮次重试是 at-least-once**：失败发生前如果智能体已经执行过工具操作，重跑同一段 prompt 可能重复执行。涉及写文件、发请求等副作用的场景，请在 prompt/工具侧做幂等，或把这类任务放到 Paseo 客户端手动执行。
 - 进程关闭/插件 reload 时会停止重试与看门狗定时器，并立即写入话题映射与正在跑的 pending-turn 标记（不等 5 秒去抖），避免卸载后仍有延迟通知或在旧进程里覆盖新映射。
 - **重启恢复是尽力而为**：pending-turn 在轮次开始时同步写入，但 SIGKILL/断电可能丢最后一次写；手动在 Paseo 给 agent 发消息产生的轮次如果恰好在重启后结束，也可能被当作恢复轮次补发到飞书。
-- 与 lark-notify 同时启用时，本插件创建的会话轮次结束也会触发 lark-notify 的私聊通知（可在 lark-notify 设置里关闭）；一次性命名（`title`）与 AI 改写（`rewrite`）会话都带 `lark-bot-purpose` 标签，lark-notify 会自动跳过它们的通知。
+- 一次性命名（`title`）与 AI 改写（`rewrite`）会话都带 `lark-bot-purpose` 标签，伴生插件可据此跳过这些辅助会话的生命周期通知。
 - 共享 workspace 的目录取**首次创建时**绑定的 `cwd`：之后再修改绑定 `cwd`、或存在多个不同 `cwd` 的绑定，都不会产生新的「飞书任务」workspace——所有话题 agent 仍落在第一个 workspace（工作目录以它为准）。开启 `workspacePerBinding` 可让每个绑定独立，但同一绑定之后的 `cwd` 修改仍需归档旧 workspace 才会重建。
 - **进度卡片不是可靠通道**：卡片 PATCH 受飞书限流与 30KB 上限影响，失败时只写日志并保留旧卡；最终答案始终单独发送，不依赖卡片。卡片更新不会推送，完成提示依赖 `DONE` 表情或最终回复。
 - `/stop` 只能清空本地排队；Paseo 插件 API 目前没有 `cancelAgent`，已在执行的轮次不会被中断，完成后仍会回复。
