@@ -132,6 +132,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [issueErrors, setIssueErrors] = useState<Record<string, string | null>>({});
   /** Which chat's issue-base row is expanded; error states start expanded. */
   const [openIssueFields, setOpenIssueFields] = useState<Record<string, boolean>>({});
+  const [openIssueModelFields, setOpenIssueModelFields] = useState<Record<string, boolean>>({});
   const [selection, setSelection] = useState<Selection>({ kind: "none" });
   const wide = useWindowDimensions().width >= WIDE_MIN_WIDTH;
 
@@ -305,6 +306,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               issueTracking: "off",
               issueAiClassify: true,
               issueAiStatusReview: true,
+              issueAiProvider: "",
+              issueAiModel: "",
               issueBaseToken: "",
               issueTableId: "",
               issueBaseUrl: "",
@@ -1068,6 +1071,23 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                         ? { text: "未验证", tone: "warning" as const }
                         : { text: "未配置", tone: "muted" as const };
               const rowTone = issueState.tone === "success" ? "default" : issueState.tone;
+              const issueAiProviderInfo = chat.issueAiProvider
+                ? providers.find((candidate) => candidate.id === chat.issueAiProvider)
+                : undefined;
+              const unknownIssueAiProvider =
+                chat.issueAiProvider && !issueAiProviderInfo ? chat.issueAiProvider : null;
+              const unknownIssueAiModel =
+                chat.issueAiModel && !issueAiProviderInfo?.models.some((model) => model.id === chat.issueAiModel)
+                  ? chat.issueAiModel
+                  : null;
+              const issueAiModelValue = !chat.issueAiProvider
+                ? "跟随绑定主模型"
+                : `${issueAiProviderInfo?.label ?? chat.issueAiProvider} · ${
+                    !chat.issueAiModel
+                      ? "默认"
+                      : issueAiProviderInfo?.models.find((model) => model.id === chat.issueAiModel)?.label ??
+                        `${unknownIssueAiModel}（未在列表）`
+                  }`;
               const memberCatalog = memberCatalogs[chat.chatId];
               const addableAcceptUsers = (memberCatalog?.members ?? []).filter(
                 (member) => !chat.issueAcceptUsers.some((user) => user.openId === member.openId),
@@ -1110,7 +1130,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                       ) : null}
                       <ToggleRow
                         label="AI 判断是否纳入并分类"
-                        hint="新话题先用本会话绑定的模型判断是否属于问题/需求并给出类型；模型失败时回退关键词。每个新话题多一次小模型调用"
+                        hint="新话题先用「跟踪 AI 模型」（未单独配置时用绑定主模型）判断是否属于问题/需求并给出类型；模型失败时回退关键词。每个新话题多一次小模型调用"
                         value={chat.issueAiClassify}
                         onChange={(value) =>
                           patchBinding(chat.chatId, { issueAiClassify: value })
@@ -1124,6 +1144,77 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                           patchBinding(chat.chatId, { issueAiStatusReview: value })
                         }
                       />
+                      {chat.issueAiClassify || chat.issueAiStatusReview ? (
+                        <SelectRow
+                          label="跟踪 AI 模型"
+                          value={issueAiModelValue}
+                          tone={unknownIssueAiProvider || unknownIssueAiModel ? "warning" : "default"}
+                          expanded={openIssueModelFields[chat.chatId] ?? false}
+                          onPress={() =>
+                            setOpenIssueModelFields((current) => ({
+                              ...current,
+                              [chat.chatId]: !(current[chat.chatId] ?? false),
+                            }))
+                          }
+                        >
+                          {providers.length > 0 ? (
+                            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                              <ChoicePill
+                                label="跟随绑定主模型"
+                                active={!chat.issueAiProvider}
+                                onPress={() => patchBinding(chat.chatId, { issueAiProvider: "", issueAiModel: "" })}
+                              />
+                              {providers.map((candidate) => (
+                                <ChoicePill
+                                  key={candidate.id}
+                                  label={candidate.label}
+                                  active={chat.issueAiProvider === candidate.id}
+                                  onPress={() => patchBinding(chat.chatId, { issueAiProvider: candidate.id, issueAiModel: "" })}
+                                />
+                              ))}
+                              {unknownIssueAiProvider ? (
+                                <ChoicePill
+                                  label={`${unknownIssueAiProvider}（未在列表）`}
+                                  active
+                                  onPress={() => patchBinding(chat.chatId, { issueAiProvider: "", issueAiModel: "" })}
+                                />
+                              ) : null}
+                            </View>
+                          ) : (
+                            <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                              未获取到 provider 列表；留空跟随绑定主模型。
+                            </Text>
+                          )}
+                          {chat.issueAiProvider &&
+                          ((issueAiProviderInfo?.models.length ?? 0) > 0 || unknownIssueAiModel) ? (
+                            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                              <ChoicePill
+                                label="默认"
+                                active={!chat.issueAiModel}
+                                onPress={() => patchBinding(chat.chatId, { issueAiModel: "" })}
+                              />
+                              {issueAiProviderInfo?.models.map((model) => (
+                                <ChoicePill
+                                  key={model.id}
+                                  label={model.label + (model.isDefault ? "（默认）" : "")}
+                                  active={chat.issueAiModel === model.id}
+                                  onPress={() => patchBinding(chat.chatId, { issueAiModel: model.id })}
+                                />
+                              ))}
+                              {unknownIssueAiModel ? (
+                                <ChoicePill
+                                  label={`${unknownIssueAiModel}（未在列表）`}
+                                  active
+                                  onPress={() => patchBinding(chat.chatId, { issueAiModel: "" })}
+                                />
+                              ) : null}
+                            </View>
+                          ) : null}
+                          <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
+                            上面两个 AI 判断都用这个模型；分类只是取舍与打标，适合选便宜快的小模型。不选则跟随绑定主模型。
+                          </Text>
+                        </SelectRow>
+                      ) : null}
                       <SelectRow
                         label="跟踪表"
                         value={
@@ -1594,6 +1685,8 @@ function normalize(values: BotValues): BotValues {
       replyStylePrompt: chat.replyStylePrompt.trim(),
       rewriteProvider: chat.rewriteProvider.trim(),
       rewriteModel: chat.rewriteModel.trim(),
+      issueAiProvider: chat.issueAiProvider.trim(),
+      issueAiModel: chat.issueAiModel.trim(),
       issueBaseToken: chat.issueBaseToken.trim(),
       issueTableId: chat.issueTableId.trim(),
       issueBaseUrl: chat.issueBaseUrl.trim(),

@@ -25,6 +25,8 @@ const binding: ChatBinding = {
   issueTracking: "off",
   issueAiClassify: true,
     issueAiStatusReview: true,
+    issueAiProvider: "",
+    issueAiModel: "",
   issueBaseToken: "",
   issueTableId: "",
   issueBaseUrl: "",

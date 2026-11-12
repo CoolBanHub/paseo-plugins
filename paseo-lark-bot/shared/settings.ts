@@ -280,6 +280,10 @@ export const chatBindingSchema = z.object({
   issueAiClassify: z.boolean().default(true),
   /** Let the model advance 处理中 → 待验收 from ambient comments. */
   issueAiStatusReview: z.boolean().default(true),
+  /** Provider for the issue AI passes; empty follows the main binding. */
+  issueAiProvider: z.string().default(""),
+  /** Model for the issue AI passes; empty means that provider's default. */
+  issueAiModel: z.string().default(""),
   /**
    * The one ledger this chat may use. Empty means "not configured"; the
    * plugin can create one with the bot identity and store the coordinates in

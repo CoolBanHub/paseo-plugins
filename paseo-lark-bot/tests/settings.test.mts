@@ -32,6 +32,8 @@ describe("chat binding schema", () => {
     assert.equal(binding.replyFormat, "markdown");
     assert.equal(binding.issueAiClassify, true);
     assert.equal(binding.issueAiStatusReview, true);
+    assert.equal(binding.issueAiProvider, "");
+    assert.equal(binding.issueAiModel, "");
     assert.equal(binding.issueReactionAccept, true);
     assert.deepEqual(binding.issueReactionEmojis, [...DEFAULT_ISSUE_REACTION_EMOJIS]);
     assert.equal(binding.issueAcceptRequester, true);
@@ -58,6 +60,21 @@ describe("chat binding schema", () => {
     }).chats[0];
     assert.equal(binding.rewriteProvider, "codex");
     assert.equal(binding.rewriteModel, "gpt-5-mini");
+  });
+
+  it("accepts an independent model for the issue AI passes", () => {
+    const binding = botValuesSchema.parse({
+      chats: [
+        {
+          chatId: "oc_group",
+          provider: "dsh",
+          issueAiProvider: "codex",
+          issueAiModel: "gpt-5-mini",
+        },
+      ],
+    }).chats[0];
+    assert.equal(binding.issueAiProvider, "codex");
+    assert.equal(binding.issueAiModel, "gpt-5-mini");
   });
 
   it("maps reply-style presets to prompt text and trims custom text", () => {

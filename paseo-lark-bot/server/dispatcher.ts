@@ -100,6 +100,7 @@ import {
 import {
   createIssueOutboxWatcher,
   formatIssueList,
+  issueAiModelChoice,
   issueRecordUrl,
   type IssueHelperRequest,
   type IssueRecord,
@@ -1081,9 +1082,10 @@ export function createDispatcher(options: DispatcherOptions) {
     issueStatusReviewing.add(record.recordId);
     try {
       const cwd = resolveCwd(binding.cwd);
+      const issueAi = issueAiModelChoice(binding);
       const provider = options.resolveProvider
-        ? await options.resolveProvider(binding.provider, binding.model)
-        : binding.provider;
+        ? await options.resolveProvider(issueAi.provider, issueAi.model)
+        : issueAi.provider;
       const workspace = await helperWorkspace(binding.chatId, binding.chatName, cwd, "问题状态判断");
       const rootDetail = await readThreadRootDetail(cliPath, record.rootMessageId).catch(
         () => null,

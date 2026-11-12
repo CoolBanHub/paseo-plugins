@@ -34,6 +34,7 @@ import { ensureWorkspace, workspaceTitleFor } from "./server/workspace.ts";
 import {
   createIssueTracker,
   installIssueHelper,
+  issueAiModelChoice,
   type IssueTracker,
 } from "./server/issues.ts";
 import { resolveCwd, type SessionPaseoApi } from "./server/sessions.ts";
@@ -176,7 +177,8 @@ function ensureDispatcher(
         console.log("[lark-bot] " + message, detail === undefined ? "" : detail),
       classify: async ({ text, binding, values, topicKey }) => {
         try {
-          const provider = await resolveProviderModel(binding.provider, binding.model);
+          const issueAi = issueAiModelChoice(binding);
+          const provider = await resolveProviderModel(issueAi.provider, issueAi.model);
           const cwd = resolveCwd(binding.cwd);
           const workspace = await ensureWorkspace({
             paseo: api,

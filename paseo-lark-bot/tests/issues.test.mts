@@ -8,6 +8,7 @@ import {
   createIssueTracker,
   formatIssueList,
   ISSUE_FIELD_NAMES,
+  issueAiModelChoice,
   issueRecordUrl,
 } from "../server/issues.ts";
 import { buildIssueCard, parseIssueAction } from "../server/issue-card.ts";
@@ -45,6 +46,8 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     issueTracking: "auto",
     issueAiClassify: true,
     issueAiStatusReview: true,
+    issueAiProvider: "",
+    issueAiModel: "",
     issueBaseToken: "bascnTest",
     issueTableId: "tblTest",
     issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
@@ -127,6 +130,21 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+describe("issue AI model choice", () => {
+  it("follows the main binding when the dedicated fields are unset", () => {
+    assert.deepEqual(issueAiModelChoice(binding()), { provider: "dsh", model: "" });
+    assert.deepEqual(issueAiModelChoice(binding({ model: "glm-4.7" })), { provider: "dsh", model: "glm-4.7" });
+  });
+
+  it("prefers the dedicated provider and model", () => {
+    assert.deepEqual(
+      issueAiModelChoice(binding({ issueAiProvider: "codex", issueAiModel: "gpt-5-mini" })),
+      { provider: "codex", model: "gpt-5-mini" },
+    );
+    assert.deepEqual(issueAiModelChoice(binding({ issueAiProvider: "codex" })), { provider: "codex", model: "" });
+  });
+});
 
 describe("issue type classifier", () => {
   it("separates problems, requirements and questions", () => {

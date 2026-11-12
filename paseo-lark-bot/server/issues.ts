@@ -30,6 +30,16 @@ export const ISSUE_TYPES = ["问题", "需求", "咨询"] as const;
 export type IssueType = (typeof ISSUE_TYPES)[number];
 
 /**
+ * Provider/model for the issue AI passes (classify + status review). Dedicated
+ * fields win; when unset both AI passes follow the binding's main model.
+ */
+export function issueAiModelChoice(binding: ChatBinding): { provider: string; model: string } {
+  return binding.issueAiProvider
+    ? { provider: binding.issueAiProvider, model: binding.issueAiModel }
+    : { provider: binding.provider, model: binding.model };
+}
+
+/**
  * Cheap first-pass classification for topic titles. It is deliberately local
  * (no model call) and only fills an empty type; humans can correct it via the
  * Base or `/issue type`.
