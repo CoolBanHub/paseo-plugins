@@ -1679,6 +1679,10 @@ export function createSessionRegistry(options: {
     return agentToTopic.get(agentId) ?? null;
   }
 
+  function agentIdForTopic(topicKey: string): string | null {
+    return topics.get(topicKey)?.agentId ?? null;
+  }
+
   /** Reply target for notices about this agent (its own topic, not the chat). */
   function targetForAgent(agentId: string): string | null {
     const topicKey = agentToTopic.get(agentId);
@@ -1799,6 +1803,7 @@ export function createSessionRegistry(options: {
     ownsAgent,
     chatIdForAgent,
     topicKeyForAgent,
+    agentIdForTopic,
     targetForAgent,
     needsRebuild,
     latestTopicKey,

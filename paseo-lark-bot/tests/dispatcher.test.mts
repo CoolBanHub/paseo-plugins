@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createDispatcher } from "../server/dispatcher.ts";
+import type { IssueRecord, IssueTracker } from "../server/issues.ts";
 import type { LarkCardActionEvent, LarkMessageEvent } from "../server/lark-events.ts";
 import type {
   SessionAgentHandle,
@@ -2170,6 +2171,51 @@ describe("reply splitting and receipts", () => {
     await flush();
     assert.equal(h.removedReactions.length, 1);
     assert.ok(h.reactions.some((reaction) => reaction.emojiType === "DONE"));
+  });
+});
+
+describe("issue acceptance card ordering", () => {
+  it("sends the final answer before moving to 待验收 and sending the card", async () => {
+    const order: string[] = [];
+    const record: IssueRecord = {
+      recordId: "rec_1",
+      chatId: "oc_group",
+      rootMessageId: "om_1",
+      threadId: "omt_1",
+      requesterOpenId: "ou_user",
+      title: "测试问题",
+      status: "处理中",
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      updatedAt: 1,
+    };
+    const tracker = {
+      observe: () => {},
+      recordForTopic: () => record,
+      markDone: async () => {
+        order.push("markDone");
+        return { ...record, status: "待验收" as const };
+      },
+      updateProgress: () => {},
+    } as unknown as IssueTracker;
+    const h = makeHarness(baseValues(), {
+      issueTracker: tracker,
+      reply: async () => {
+        order.push("reply");
+        return null;
+      },
+      replyCard: async () => {
+        order.push("card");
+        return "om_card_1";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "已处理并部署到 TEST。"));
+    await flush();
+    assert.deepEqual(order, ["reply", "markDone", "card"]);
   });
 });
 

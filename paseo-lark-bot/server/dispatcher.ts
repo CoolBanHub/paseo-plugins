@@ -1180,6 +1180,54 @@ export function createDispatcher(options: DispatcherOptions) {
     return sent;
   }
 
+  /**
+   * Called only after the final answer has actually been sent, so the card
+   * asking for acceptance never appears above the explanation. Idempotent:
+   * markDone/sendIssueAcceptanceCard dedupe and the Base guard prevents a
+   * human-confirmed fix from being regressed.
+   */
+  async function finalizeIssueAfterReply(
+    chatId: string,
+    topicKey: string,
+    text: string | null,
+    outcome: TurnOutcome,
+  ): Promise<void> {
+    if (outcome.outcome !== "completed") return;
+    const tracker = options.issueTracker;
+    const current = tracker?.recordForTopic(chatId, topicKey) ?? null;
+    if (!tracker || !current) return;
+    const agentId = sessions.agentIdForTopic(topicKey);
+    if (
+      current.status === "待验收" ||
+      current.status === "已修复" ||
+      current.status === "已发布" ||
+      current.status === "已关闭"
+    ) {
+      const values = await currentValues();
+      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+      return;
+    }
+    try {
+      const values = await currentValues();
+      const cliPath = cliPathFor(values);
+      if (!cliPath) return;
+      const updated = await tracker.markDone({
+        chatId,
+        topicKey,
+        summary: text,
+        agentId,
+        values,
+      });
+      if (updated) {
+        await sendIssueAcceptanceCard(cliPath, values, updated, topicKey, text);
+      }
+    } catch (error) {
+      log("自动转待验收失败", error instanceof Error ? error.message : String(error));
+      const values = await currentValues();
+      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+    }
+  }
+
   async function issueStatusText(record: IssueRecord | null, values: BotValues): Promise<string> {
     if (!record) {
       return "本话题还没有登记到问题跟踪表。确认是问题或需求后，管理员可在设置里开启采集，或直接到跟踪表补录。";
@@ -1736,52 +1784,6 @@ export function createDispatcher(options: DispatcherOptions) {
       if (item && item.type === "assistant_message" && item.text.trim()) {
         lastText = item.text.trim();
         break;
-      }
-    }
-    if (event.outcome.kind === "completed") {
-      const topicKey = sessions.topicKeyForAgent(event.agent.id);
-      const chatId = sessions.chatIdForAgent(event.agent.id);
-      if (topicKey && chatId) {
-        const tracker = options.issueTracker;
-        const current = tracker?.recordForTopic(chatId, topicKey) ?? null;
-        // Reliability: do not depend on the model remembering the helper. A
-        // completed turn in a tracked topic moves to 待验收; the human still
-        // has to accept it before it becomes 已修复.
-        const canReview =
-          current !== null &&
-          current.status !== "待验收" &&
-          current.status !== "已修复" &&
-          current.status !== "已发布" &&
-          current.status !== "已关闭";
-        if (tracker && canReview) {
-          void (async () => {
-            try {
-              const values = await currentValues();
-              const cliPath = cliPathFor(values);
-              if (!cliPath) return;
-              const updated = await tracker.markDone({
-                chatId,
-                topicKey,
-                summary: lastText,
-                agentId: event.agent.id,
-                values,
-              });
-              if (updated) {
-                await sendIssueAcceptanceCard(cliPath, values, updated, topicKey, lastText);
-              }
-            } catch (error) {
-              log("自动转待验收失败", error instanceof Error ? error.message : String(error));
-              tracker.updateProgress({ chatId, topicKey, summary: lastText, agentId: event.agent.id });
-            }
-          })();
-        } else {
-          tracker?.updateProgress({
-            chatId,
-            topicKey,
-            summary: lastText,
-            agentId: event.agent.id,
-          });
-        }
       }
     }
     void sessions.handleTurnEnded(event.agent.id, {
@@ -2607,6 +2609,10 @@ export function createDispatcher(options: DispatcherOptions) {
         messageId,
         outcome: meta.outcome,
       });
+    }
+    const issueTopicKey = meta?.topicKey ?? topicKey;
+    if (sent && meta && issueTopicKey) {
+      await finalizeIssueAfterReply(chatId, issueTopicKey, text, meta.outcome);
     }
     if (meta) {
       await finishReceipt(cliPath, messageId, sent && meta.outcome.outcome !== "failed" && meta.outcome.outcome !== "canceled");
