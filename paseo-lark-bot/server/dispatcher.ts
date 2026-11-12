@@ -262,6 +262,34 @@ const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以�
 const ISSUE_STATUS_HINT =
   /(已修复|修复了|修好了|改好了|已改好|已解决|解决了|已完成|完成了|已上线|上线了|已发布|发布了|可以了|没问题|验证通过|验收通过|fixed|resolved|deployed|released)/iu;
 
+/**
+ * A completed turn is not always a completed fix. For multi-step work the
+ * agent may first confirm the requirement and ask the requester to reply
+ * "开始实施" before it creates a worktree or touches code. Treating that turn
+ * as done sends a premature acceptance card. Keep 处理中 while the answer is
+ * still asking for a start decision; a later turn that reports a real result
+ * advances the record. A false negative only costs a manual `/issue done`,
+ * while a false positive notifies the requester before anything was fixed.
+ */
+const CONFIRM_BEFORE_WORK = [
+  /(?:回复|请|需要|等你|等待|待你|你|您)[^。！？\n]{0,16}(?:确认|同意|授权)[^。！？\n]{0,16}(?:开始|实施|执行|动工|动手|动代码|开发)/u,
+  /回复[^。！？\n]{0,8}(?:开始实施|开始开发|开始动工|开始执行)/u,
+  /(?:确认|同意)[^。！？\n]{0,8}(?:后|之后|再|就|便)[^。！？\n]{0,8}(?:开始|实施|执行|动工|动手|动代码|开发)/u,
+  /(?:是否|要不要|能否)(?:现在)?(?:开始|继续|实施|执行|动工|动手|开发)/u,
+  /(?:尚未|还未|还没|还没有)(?:开始|动工|动手|实施|改代码|写代码)/u,
+] as const;
+
+/** True when the final answer still waits for the user to approve the start. */
+function replyAwaitsConfirmation(text: string | null | undefined): boolean {
+  const value = text?.trim();
+  if (!value) return false;
+  // Only the tail matters: a long report may quote the plan while its
+  // conclusion already reports the finished fix.
+  const tail = value.slice(-800);
+  if (/[?？]\s*$/u.test(tail)) return true;
+  return CONFIRM_BEFORE_WORK.some((pattern) => pattern.test(tail));
+}
+
 const MAX_PENDING_QUESTIONS = 200;
 
 /**
@@ -1184,6 +1212,7 @@ export function createDispatcher(options: DispatcherOptions) {
     topicKey: string,
     text: string | null,
     outcome: TurnOutcome,
+    awaitingConfirmation: boolean,
   ): Promise<void> {
     if (outcome.outcome !== "completed") return;
     const tracker = options.issueTracker;
@@ -1196,6 +1225,15 @@ export function createDispatcher(options: DispatcherOptions) {
       current.status === "已发布" ||
       current.status === "已关闭"
     ) {
+      const values = await currentValues();
+      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+      return;
+    }
+    if (awaitingConfirmation) {
+      // The turn only confirmed the requirement and asked for approval to
+      // start; there is nothing to accept yet. Keep 处理中 and let the next
+      // completed turn (the actual implementation) send the card.
+      log(`本轮仅在等待用户确认，保持处理中：${text?.slice(0, 60) ?? ""}`);
       const values = await currentValues();
       tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
       return;
@@ -2433,6 +2471,8 @@ export function createDispatcher(options: DispatcherOptions) {
     topicKey: string | null;
     messageId: string;
     outcome: TurnOutcome;
+    /** The answer still asks the user to approve the start, not a fix. */
+    awaitingConfirmation?: boolean;
   }): Promise<void> {
     const mode = options.binding.mentionOnReply;
     if (mode === "off") return;
@@ -2501,7 +2541,9 @@ export function createDispatcher(options: DispatcherOptions) {
         ? "本轮处理失败，原因见上方回复。"
         : options.outcome.outcome === "canceled"
           ? "本轮处理已取消。"
-          : "已完成，结果见上方回复。";
+          : options.awaitingConfirmation
+            ? "已回复，结果见上方回复。"
+            : "已完成，结果见上方回复。";
     const ok = await send(
       options.cliPath,
       options.messageId,
@@ -2579,6 +2621,8 @@ export function createDispatcher(options: DispatcherOptions) {
       format = "text";
       body = stripMentionTags(body) + "\n\n" + RELAY_NOTE;
     }
+    const awaitingConfirmation =
+      meta?.outcome.outcome === "completed" && replyAwaitsConfirmation(body);
     let footer: string | undefined;
     if (values.replyFooter && binding && meta) {
       const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
@@ -2601,11 +2645,18 @@ export function createDispatcher(options: DispatcherOptions) {
         topicKey: meta.topicKey ?? topicKey,
         messageId,
         outcome: meta.outcome,
+        awaitingConfirmation,
       });
     }
     const issueTopicKey = meta?.topicKey ?? topicKey;
     if (sent && meta && issueTopicKey) {
-      await finalizeIssueAfterReply(chatId, issueTopicKey, text, meta.outcome);
+      await finalizeIssueAfterReply(
+        chatId,
+        issueTopicKey,
+        text,
+        meta.outcome,
+        awaitingConfirmation,
+      );
     }
     if (meta) {
       await finishReceipt(cliPath, messageId, sent && meta.outcome.outcome !== "failed" && meta.outcome.outcome !== "canceled");

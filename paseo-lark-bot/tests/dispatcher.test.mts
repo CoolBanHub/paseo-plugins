@@ -2222,6 +2222,58 @@ describe("issue acceptance card ordering", () => {
     await flush();
     assert.deepEqual(order, ["reply", "markDone", "card"]);
   });
+
+  it("keeps 处理中 when the turn only asks the user to confirm the start", async () => {
+    const record: IssueRecord = {
+      recordId: "rec_confirm",
+      chatId: "oc_group",
+      rootMessageId: "om_1",
+      threadId: "omt_1",
+      requesterOpenId: "ou_user",
+      title: "测试需求",
+      status: "处理中",
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      mediaSynced: [],
+      updatedAt: 1,
+    };
+    let markDoneCalls = 0;
+    const progress: (string | null)[] = [];
+    const tracker = {
+      observe: () => {},
+      markWorking: () => {},
+      recordForTopic: () => record,
+      markDone: async () => {
+        markDoneCalls += 1;
+        return { ...record, status: "待验收" as const };
+      },
+      updateProgress: (input: { summary: string | null }) => {
+        progress.push(input.summary);
+      },
+    } as unknown as IssueTracker;
+    const h = makeHarness(baseValues(), {
+      issueTracker: tracker,
+      reply: async () => "om_reply_1",
+      replyCard: async () => "om_card_1",
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(
+      turnEnded(
+        "agent-1",
+        "需求已确认，Linear 任务已创建（XMS-1012）。按仓库流程，issue 创建后需等确认再动代码。回复「开始实施」，我会创建独立 worktree，完成实现、验证并部署到 TEST。",
+      ),
+    );
+    await flush();
+    assert.equal(markDoneCalls, 0, "planning turn must not move the record to 待验收");
+    assert.equal(h.cards.length, 0, "no acceptance card before implementation");
+    assert.ok(
+      progress.some((summary) => summary?.includes("开始实施")),
+      "the confirmation reply is kept as the latest progress",
+    );
+  });
 });
 
 describe("progress card", () => {
@@ -2425,6 +2477,26 @@ describe("completion mentions", () => {
     assert.equal(h.replies[1]?.format, "text");
     assert.match(h.replies[1]?.text ?? "", /<at user_id="ou_user">张三<\/at>/);
     assert.match(h.replies[1]?.text ?? "", /已完成/);
+  });
+
+  it("says 已回复 instead of 已完成 when the turn awaits approval", async () => {
+    const h = makeHarness(mentionValues("sender"), {
+      readThreadRootDetail: async () => ({
+        text: null,
+        senderOpenId: "ou_user",
+        senderName: "张三",
+      }),
+    });
+    await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_confirm" }));
+    await flush();
+    h.dispatch.handleTurnEnded(
+      turnEnded("agent-1", "需求已确认。回复「开始实施」，我再创建 worktree 并改代码。"),
+    );
+    await flush();
+
+    assert.equal(h.replies.length, 2, "answer + completion mention");
+    assert.match(h.replies[1]?.text ?? "", /已回复/);
+    assert.ok(!h.replies[1]?.text.includes("已完成"), "must not claim completion before the work starts");
   });
 
   it("mentions the topic starter rather than a later replier", async () => {
