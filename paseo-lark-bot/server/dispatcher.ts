@@ -1074,6 +1074,10 @@ export function createDispatcher(options: DispatcherOptions) {
     const topicKey = topicKeyFor(event);
     const record = tracker.recordForTopic(event.chat_id, topicKey);
     if (!record || record.status !== "处理中" || issueStatusReviewing.has(record.recordId)) return;
+    // A running/queued turn will answer and advance the status itself; do not
+    // send an acceptance card before that answer.
+    const session = sessions.sessionInfo(topicKey, event.chat_id);
+    if (session.busy || session.queued > 0) return;
     issueStatusReviewing.add(record.recordId);
     try {
       const cwd = resolveCwd(binding.cwd);
