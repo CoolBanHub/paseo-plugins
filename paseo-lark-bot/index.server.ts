@@ -533,12 +533,19 @@ export default function contribute(server: PluginServerContext) {
   server.handle(larkBotChatsRpc, async (_input, context) => {
     capture(context.paseo);
     const cliPath = resolveLarkCli((await readValues()).larkCliPath);
-    if (!cliPath) return { chats: [], error: "找不到 lark-cli" };
-    try {
-      return { chats: await listChats(cliPath), error: null };
-    } catch (error) {
-      return { chats: [], error: error instanceof Error ? error.message : String(error) };
-    }
+    const unmatched = dispatcher?.status().unmatched ?? [];
+    if (!cliPath) return { chats: [], unmatched, error: "找不到 lark-cli" };
+    // Peer contact lookups are slow (several lark-cli calls per unbound p2p
+    // chat). They belong to the "add chat" picker, not the status card, so
+    // resolve them here in parallel with the group list.
+    const [catalog, enriched] = await Promise.all([
+      listChats(cliPath).then(
+        (chats) => ({ chats, error: null as string | null }),
+        (error: unknown) => ({ chats: [], error: error instanceof Error ? error.message : String(error) }),
+      ),
+      enrichUnmatchedChats(cliPath, unmatched).catch(() => unmatched),
+    ]);
+    return { chats: catalog.chats, unmatched: enriched, error: catalog.error };
   });
 
   server.handle(larkBotProvidersRpc, async (_input, context) => {
@@ -603,7 +610,6 @@ export default function contribute(server: PluginServerContext) {
     if (cliPath && currentAppIdCache === null) {
       currentAppIdCache = await readCurrentAppId(cliPath).catch(() => null);
     }
-    const unmatched = await enrichUnmatchedChats(cliPath, status?.unmatched ?? []);
     return {
       consumerState: consumer?.status().state ?? "stopped",
       lastError: consumer?.status().lastError ?? null,
@@ -614,7 +620,6 @@ export default function contribute(server: PluginServerContext) {
       enabled: values.enabled,
       botOpenId: status?.botOpenId ?? null,
       sessions: status?.sessions ?? [],
-      unmatched,
       cron: status?.cron ?? [],
       pendingQuestions: status?.pendingQuestions ?? 0,
     };

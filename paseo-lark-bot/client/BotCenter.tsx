@@ -11,6 +11,7 @@ import {
   type LarkBotChatMember,
   type LarkBotIssueBase,
   type LarkBotProviderInfo,
+  type LarkBotUnmatchedChat,
 } from "../shared/contracts.ts";
 import {
   ACK_MODE_OPTIONS,
@@ -64,15 +65,6 @@ interface StatusState {
   enabled: boolean;
   botOpenId: string | null;
   sessions: { chatId: string; topicKey: string; agentId: string | null; busy: boolean; queued: number }[];
-  unmatched: {
-    chatId: string;
-    chatType: string;
-    lastSeenAt: number;
-    peerOpenId?: string;
-    peerName?: string;
-    peerDepartment?: string;
-    peerOrganization?: string;
-  }[];
   cron: {
     id: string;
     expression: string;
@@ -129,6 +121,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const savingRef = useRef(false);
   const [confirmingUnbind, setConfirmingUnbind] = useState(false);
   const [chatCatalog, setChatCatalog] = useState<{ chatId: string; name: string }[]>([]);
+  const [unmatchedChats, setUnmatchedChats] = useState<LarkBotUnmatchedChat[]>([]);
   const [providers, setProviders] = useState<LarkBotProviderInfo[]>([]);
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
   const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
@@ -165,25 +158,45 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
 
   const refreshStatus = useCallback(async () => {
     try {
-      const [chats, providerList, current] = await Promise.all([
-        chatsRpc({}),
-        providersRpc({}),
-        statusRpc({}),
-      ]);
-      setChatCatalog(chats.chats);
-      setProviders(providerList.providers);
-      setStatus(current);
+      setStatus(await statusRpc({}));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     }
-  }, [chatsRpc, providersRpc, statusRpc, toast]);
+  }, [statusRpc, toast]);
+
+  const refreshChats = useCallback(async () => {
+    try {
+      const result = await chatsRpc({});
+      setChatCatalog(result.chats);
+      setUnmatchedChats(result.unmatched);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  }, [chatsRpc, toast]);
+
+  const refreshProviders = useCallback(async () => {
+    try {
+      const result = await providersRpc({});
+      setProviders(result.providers);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  }, [providersRpc, toast]);
+
+  const refreshAll = useCallback(() => {
+    // Load independently: the status card must not wait for the group list or
+    // provider discovery, both of which can take several seconds.
+    void refreshStatus();
+    void refreshChats();
+    void refreshProviders();
+  }, [refreshChats, refreshProviders, refreshStatus]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
   useEffect(() => {
-    void refreshStatus();
-  }, [refreshStatus]);
+    refreshAll();
+  }, [refreshAll]);
 
   const loadIssueBase = useCallback(
     async (chatId: string, action: "status" | "create" | "test" | "clear" = "status") => {
@@ -592,11 +605,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const cardConsumer = status
     ? (CARD_CONSUMER_LABELS[status.cardConsumerState] ?? { text: status.cardConsumerState, tone: "muted" as const })
     : null;
+  const statusPending = status === null;
   const addableChats = [
     ...chatCatalog
       .filter((chat) => !boundIds.has(chat.chatId))
       .map((chat) => ({ chatId: chat.chatId, label: chat.name || chat.chatId, chatName: chat.name })),
-    ...(status?.unmatched ?? [])
+    ...unmatchedChats
       .filter((chat) => !boundIds.has(chat.chatId))
       .map((chat) => {
         const peerName = chat.peerName?.trim() ?? "";
@@ -669,7 +683,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       <View style={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8, gap: 6 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <Text style={{ fontSize: 18, fontWeight: "700", color: colors().foreground, flex: 1 }}>飞书机器人</Text>
-          <PrimaryButton label="刷新" onPress={() => void refreshStatus()} subtle />
+          <PrimaryButton label="刷新" onPress={refreshAll} subtle />
         </View>
         {consumer ? <Pill text={consumer.text} tone={consumer.tone} /> : null}
         <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
@@ -708,7 +722,11 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         {navRow(
           "status",
           "运行状态",
-          consumer ? consumer.text + (status?.sessions.length ? ` · ${status.sessions.length} 个话题` : "") : "未知",
+          status
+            ? consumer
+              ? consumer.text + (status.sessions.length ? ` · ${status.sessions.length} 个话题` : "")
+              : "未知"
+            : "正在检查…",
           selection.kind === "status",
           () => setSelection({ kind: "status" }),
           <View style={{
@@ -724,7 +742,9 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
         {navRow(
           "credentials",
           "应用凭证",
-          !draft.enabled ? "已停止 · 未启用" : draft.appId.trim() || status?.currentAppId || "未配置（沿用 lark-cli）",
+          !draft.enabled
+            ? "已停止 · 未启用"
+            : draft.appId.trim() || (status ? status.currentAppId ?? "未配置（沿用 lark-cli）" : "正在检查…"),
           selection.kind === "credentials",
           () => setSelection({ kind: "credentials" }),
         )}
@@ -817,45 +837,65 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
             <CardTitle text="连接与身份" hint="插件与飞书、lark-cli 的连接状态" />
             <InfoRow
               label="事件监听"
-              value={consumer ? consumer.text + (status?.enabled && status.lastError ? `（${status.lastError}）` : "") : "未知"}
+              value={
+                statusPending
+                  ? "正在检查…"
+                  : consumer
+                    ? consumer.text + (status.enabled && status.lastError ? `（${status.lastError}）` : "")
+                    : "未知"
+              }
             />
             <InfoRow
               label="问题卡片回调"
               value={
-                cardConsumer
-                  ? cardConsumer.text + (status?.enabled && status.cardLastError ? `（${status.cardLastError}）` : "")
-                  : "未知"
+                statusPending
+                  ? "正在检查…"
+                  : cardConsumer
+                    ? cardConsumer.text + (status.enabled && status.cardLastError ? `（${status.cardLastError}）` : "")
+                    : "未知"
               }
             />
-            <InfoRow label="待答问题" value={String(status?.pendingQuestions ?? 0)} muted={(status?.pendingQuestions ?? 0) === 0} />
-            <InfoRow label="lark-cli" value={status?.cliPath ?? "未找到（请在全局设置填写路径）"} muted={!status?.cliPath} />
-            <InfoRow label="当前应用" value={status?.currentAppId ?? "未知"} />
-            <InfoRow label="机器人身份" value={status?.botOpenId ?? "尚未读取"} />
+            <InfoRow
+              label="待答问题"
+              value={status === null ? "正在检查…" : String(status.pendingQuestions)}
+              muted={status?.pendingQuestions === 0}
+            />
+            <InfoRow
+              label="lark-cli"
+              value={status === null ? "正在检查…" : status.cliPath ?? "未找到（请在全局设置填写路径）"}
+              muted={status !== null && !status.cliPath}
+            />
+            <InfoRow label="当前应用" value={status === null ? "正在检查…" : status.currentAppId ?? "未知"} />
+            <InfoRow label="机器人身份" value={status === null ? "正在检查…" : status.botOpenId ?? "尚未读取"} />
           </Card>
           <Card>
             <CardTitle
-              text={`话题会话（${(status?.sessions ?? []).length}）`}
+              text={status === null ? "话题会话（正在检查…）" : `话题会话（${status.sessions.length}）`}
               hint="群聊里一个话题一个智能体会话；显示当前映射的会话与排队情况"
             />
-            {(status?.sessions ?? []).length === 0 ? (
+            {status === null ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>正在读取状态…</Text>
+            ) : status.sessions.length === 0 ? (
               <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>暂无进行中的话题会话。</Text>
             ) : (
-              (status?.sessions ?? []).map((session) => (
+              status.sessions.map((session) => (
                 <SessionRow key={session.topicKey} session={session} />
               ))
             )}
           </Card>
           <Card>
             <CardTitle
-              text={`定时任务（${(status?.cron ?? []).length}）`}
+              text={status === null ? "定时任务（正在检查…）" : `定时任务（${status.cron.length}）`}
               hint="在会话里用 /cron 管理，这里只读展示。每次运行使用新会话，结果发到绑定会话"
             />
-            {(status?.cron ?? []).length === 0 ? (
+            {status === null ? (
+              <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>正在读取状态…</Text>
+            ) : status.cron.length === 0 ? (
               <Text style={{ color: colors().foregroundMuted, fontSize: 13 }}>
                 暂无定时任务。可在会话里发送 /cron add 0 6 * * * 总结 GitHub trending。
               </Text>
             ) : (
-              (status?.cron ?? []).map((job) => <CronJobRow key={job.id} job={job} />)
+              status.cron.map((job) => <CronJobRow key={job.id} job={job} />)
             )}
           </Card>
         </ScrollView>

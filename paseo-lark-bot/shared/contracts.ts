@@ -1,12 +1,32 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
+/**
+ * A recently seen chat without a binding. Peer fields are filled by the
+ * chats RPC (not the status RPC) so opening the status page never waits for
+ * contact lookups.
+ */
+const unmatchedChatSchema = z.object({
+  chatId: z.string(),
+  chatType: z.string(),
+  lastSeenAt: z.number(),
+  /** P2p peer open_id, from the last inbound message or member lookup. */
+  peerOpenId: z.string().optional(),
+  peerName: z.string().optional(),
+  /** Department path when contact scopes expose it. */
+  peerDepartment: z.string().optional(),
+  /** Tenant display name when the app may read it. */
+  peerOrganization: z.string().optional(),
+});
+
 /** Group chats the bot has joined (lark-cli im +chat-list). */
 export const larkBotChatsRpc = defineRpc({
   name: "lark-bot.chats.list",
   input: z.object({}).strict(),
   output: z.object({
     chats: z.array(z.object({ chatId: z.string(), name: z.string() })),
+    /** Recently seen unbound chats, enriched for the "add chat" picker. */
+    unmatched: z.array(unmatchedChatSchema),
     error: z.string().nullable(),
   }),
 });
@@ -59,6 +79,7 @@ export const larkBotChatMembersRpc = defineRpc({
 
 export type LarkBotProviderInfo = z.output<typeof larkBotProvidersRpc.output>["providers"][number];
 export type LarkBotChatMember = z.output<typeof larkBotChatMembersRpc.output>["members"][number];
+export type LarkBotUnmatchedChat = z.output<typeof unmatchedChatSchema>;
 
 /**
  * One-click Feishu app creation (`lark-cli config init --new`). A single RPC
@@ -132,21 +153,6 @@ export const larkBotStatusRpc = defineRpc({
         agentId: z.string().nullable(),
         busy: z.boolean(),
         queued: z.number(),
-      }),
-    ),
-    /** Recently seen chats without a binding, offered as one-click additions. */
-    unmatched: z.array(
-      z.object({
-        chatId: z.string(),
-        chatType: z.string(),
-        lastSeenAt: z.number(),
-        /** P2p peer open_id, from the last inbound message or member lookup. */
-        peerOpenId: z.string().optional(),
-        peerName: z.string().optional(),
-        /** Department path when contact scopes expose it. */
-        peerDepartment: z.string().optional(),
-        /** Tenant display name when the app may read it. */
-        peerOrganization: z.string().optional(),
       }),
     ),
     /** Scheduled prompts managed with /cron (read-only on the status page). */
