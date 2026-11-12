@@ -655,11 +655,12 @@ describe("issue card", () => {
     };
     const card = buildIssueCard({ record, summary: "已修复", topicKey: THREAD });
     const body = card.body as { elements: Array<Record<string, unknown>> };
-    const actions = body.elements.find((element) => element.tag === "action") as {
-      actions: Array<{ behaviors: Array<{ value: unknown }> }>;
-    };
-    const values = actions.actions.map((action) => action.behaviors[0]?.value);
+    const buttons = body.elements.filter(
+      (element) => element.tag === "button",
+    ) as Array<{ behaviors: Array<{ value: unknown }> }>;
+    const values = buttons.map((action) => action.behaviors[0]?.value);
     assert.equal(values.length, 2);
+    assert.equal(body.elements.some((element) => element.tag === "action"), false);
     const accept = parseIssueAction(JSON.stringify(values[0]));
     assert.equal(accept?.action, "accept");
     assert.equal(accept?.recordId, "rec_1");

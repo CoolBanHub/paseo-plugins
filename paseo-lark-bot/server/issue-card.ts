@@ -38,6 +38,7 @@ function button(
     tag: "button",
     text: { tag: "plain_text", content: label },
     type,
+    width: "fill",
     behaviors: [{ type: "callback", value }],
   };
 }
@@ -75,13 +76,8 @@ export function buildIssueCard(options: {
       padding: "12px 12px 20px 12px",
       elements: [
         { tag: "markdown", content: lines.join("\n") },
-        {
-          tag: "action",
-          actions: [
-            button("验收通过", "primary", payload("accept")),
-            button("还没修好", "danger", payload("reject")),
-          ],
-        },
+        button("验收通过", "primary", payload("accept")),
+        button("还没修好", "danger", payload("reject")),
         {
           tag: "markdown",
           content: "验收通过后状态变为「已修复」；发布上线后在话题里发送 `/issue release` 标记为「已发布」。",
