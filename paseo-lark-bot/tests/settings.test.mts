@@ -32,7 +32,8 @@ describe("chat binding schema", () => {
     assert.equal(binding.replyFormat, "markdown");
     assert.equal(binding.issueReactionAccept, true);
     assert.deepEqual(binding.issueReactionEmojis, [...DEFAULT_ISSUE_REACTION_EMOJIS]);
-    assert.equal(binding.issueAcceptMode, "requester");
+    assert.equal(binding.issueAcceptRequester, true);
+    assert.deepEqual(binding.issueAcceptUsers, []);
   });
 
   it("accepts explicit AI rewrite modes and an independent model", () => {

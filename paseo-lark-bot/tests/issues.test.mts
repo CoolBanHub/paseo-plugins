@@ -47,7 +47,8 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
     issueReactionAccept: true,
     issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
-    issueAcceptMode: "requester",
+    issueAcceptRequester: true,
+  issueAcceptUsers: [],
     ...overrides,
   };
 }
@@ -499,7 +500,8 @@ describe("issue tracker", () => {
             issueBaseUrl: "https://example.feishu.cn/base/bascnOther",
             issueReactionAccept: true,
             issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
-            issueAcceptMode: "requester",
+            issueAcceptRequester: true,
+  issueAcceptUsers: [],
           }),
         ],
       });

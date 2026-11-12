@@ -37,8 +37,9 @@ export const DEFAULT_ISSUE_REACTION_EMOJIS = [
 ] as const;
 
 /** Who may accept a 待验收 record via card or reaction. */
-export const issueAcceptModeSchema = z.enum(["requester", "requester_or_allowlist"]);
-export type IssueAcceptMode = z.output<typeof issueAcceptModeSchema>;
+// Acceptors are configured per binding: the requester (optional) plus an
+// explicit list of users. This is intentionally separate from allowedUsers,
+// which gates who may trigger the bot.
 
 /**
  * Who to @ after a turn finishes. Mentions are sent as a separate plain-text
@@ -288,7 +289,10 @@ export const chatBindingSchema = z.object({
   /** Emoji ids accepted; empty disables reaction acceptance. */
   issueReactionEmojis: z.array(z.string()).default([...DEFAULT_ISSUE_REACTION_EMOJIS]),
   /** Requester only (default), or requester plus the binding allowlist. */
-  issueAcceptMode: issueAcceptModeSchema.default("requester"),
+  /** Whether the topic root sender may accept. */
+  issueAcceptRequester: z.boolean().default(true),
+  /** Additional people allowed to accept; names are display-only. */
+  issueAcceptUsers: z.array(allowedUserSchema).default([]),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;

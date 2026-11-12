@@ -132,6 +132,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [providers, setProviders] = useState<LarkBotProviderInfo[]>([]);
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
   const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
+  const [acceptDrafts, setAcceptDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<StatusState | null>(null);
   const [issueBases, setIssueBases] = useState<Record<string, LarkBotIssueBase>>({});
   const [issueBusy, setIssueBusy] = useState<Record<string, boolean>>({});
@@ -294,7 +295,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               issueBaseUrl: "",
               issueReactionAccept: true,
               issueReactionEmojis: [...DEFAULT_ISSUE_REACTION_EMOJIS],
-              issueAcceptMode: "requester",
+              issueAcceptRequester: true,
+              issueAcceptUsers: [],
             },
           ],
         };
@@ -377,6 +379,58 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       setAllowedDrafts((current) => ({ ...current, [chatId]: "" }));
     },
     [addAllowedUser, allowedDrafts, draft, memberCatalogs, toast],
+  );
+
+  const addAcceptUser = useCallback((chatId: string, user: { openId: string; name: string }) => {
+    setDraft((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        chats: current.chats.map((chat) => {
+          if (chat.chatId !== chatId || chat.issueAcceptUsers.some((entry) => entry.openId === user.openId)) {
+            return chat;
+          }
+          return { ...chat, issueAcceptUsers: [...chat.issueAcceptUsers, user] };
+        }),
+      };
+    });
+  }, []);
+
+  const removeAcceptUser = useCallback((chatId: string, openId: string) => {
+    setDraft((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        chats: current.chats.map((chat) =>
+          chat.chatId === chatId
+            ? { ...chat, issueAcceptUsers: chat.issueAcceptUsers.filter((entry) => entry.openId !== openId) }
+            : chat,
+        ),
+      };
+    });
+  }, []);
+
+  const addAcceptFromText = useCallback(
+    (chatId: string) => {
+      const text = (acceptDrafts[chatId] ?? "").trim();
+      if (!text) return;
+      const tokens = text.split(/[\s,，;；]+/u).map((token) => token.trim()).filter(Boolean);
+      const invalid = tokens.find((token) => !token.startsWith("ou_"));
+      if (invalid) {
+        toast.error(`open_id 应以 ou_ 开头：${invalid}`);
+        return;
+      }
+      const names = new Map<string, string>();
+      for (const chat of draft?.chats ?? []) {
+        for (const user of chat.issueAcceptUsers) names.set(user.openId, user.name);
+      }
+      for (const member of memberCatalogs[chatId]?.members ?? []) names.set(member.openId, member.name);
+      for (const openId of new Set(tokens)) {
+        addAcceptUser(chatId, { openId, name: names.get(openId) ?? "" });
+      }
+      setAcceptDrafts((current) => ({ ...current, [chatId]: "" }));
+    },
+    [acceptDrafts, addAcceptUser, draft, memberCatalogs, toast],
   );
 
   const loadMembers = useCallback(
@@ -972,6 +1026,10 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                         ? { text: "未验证", tone: "warning" as const }
                         : { text: "未配置", tone: "muted" as const };
               const rowTone = issueState.tone === "success" ? "default" : issueState.tone;
+              const memberCatalog = memberCatalogs[chat.chatId];
+              const addableAcceptUsers = (memberCatalog?.members ?? []).filter(
+                (member) => !chat.issueAcceptUsers.some((user) => user.openId === member.openId),
+              );
               return (
                 <Card key={chat.chatId}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
@@ -1086,29 +1144,82 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                           }
                           style={inputStyle()}
                         />
-                        <FieldLabel text="谁可以验收" />
-                        <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-                          <ChoicePill
-                            label="仅提出人"
-                            active={chat.issueAcceptMode === "requester"}
-                            onPress={() =>
-                              patchBinding(chat.chatId, { issueAcceptMode: "requester" })
+                        <ToggleRow
+                          label="提出人默认可验收"
+                          hint="关闭后只有下面额外验收人可以点卡片/表情；关闭且列表为空时，只能到 Base 手动改状态"
+                          value={chat.issueAcceptRequester}
+                          onChange={(value) =>
+                            patchBinding(chat.chatId, { issueAcceptRequester: value })
+                          }
+                        />
+                        <FieldLabel text="额外验收人（open_id）" />
+                        {chat.issueAcceptUsers.length === 0 ? (
+                          <Text style={{ color: colors().foregroundMuted, fontSize: 12 }}>
+                            未配置额外验收人；当前由提出人验收。
+                          </Text>
+                        ) : (
+                          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                            {chat.issueAcceptUsers.map((user) => (
+                              <ChoicePill
+                                key={user.openId}
+                                label={`${user.name || user.openId} ×`}
+                                active
+                                onPress={() => removeAcceptUser(chat.chatId, user.openId)}
+                              />
+                            ))}
+                          </View>
+                        )}
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                          <TextInput
+                            value={acceptDrafts[chat.chatId] ?? ""}
+                            placeholder="ou_xxx，多个用逗号分隔"
+                            placeholderTextColor={colors().foregroundMuted}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            returnKeyType="done"
+                            onSubmitEditing={() => addAcceptFromText(chat.chatId)}
+                            onChangeText={(text) =>
+                              setAcceptDrafts((current) => ({ ...current, [chat.chatId]: text }))
                             }
+                            style={inputStyle({ flex: 1 })}
                           />
-                          <ChoicePill
-                            label="提出人或白名单"
-                            active={chat.issueAcceptMode === "requester_or_allowlist"}
-                            onPress={() =>
-                              patchBinding(chat.chatId, {
-                                issueAcceptMode: "requester_or_allowlist",
-                              })
-                            }
+                          <PrimaryButton
+                            label="添加"
+                            onPress={() => addAcceptFromText(chat.chatId)}
+                            subtle
+                          />
+                          <PrimaryButton
+                            label={memberCatalog?.loading ? "读取中…" : "读取群成员"}
+                            onPress={() => void loadMembers(chat.chatId)}
+                            subtle
                           />
                         </View>
+                        {memberCatalog?.error ? (
+                          <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
+                            读取群成员失败：{memberCatalog.error}。仍可手动填写 open_id。
+                          </Text>
+                        ) : null}
+                        {addableAcceptUsers.length > 0 ? (
+                          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                            {addableAcceptUsers.slice(0, 50).map((member) => (
+                              <ChoicePill
+                                key={member.openId}
+                                label={member.name || member.openId}
+                                active={false}
+                                onPress={() =>
+                                  addAcceptUser(chat.chatId, {
+                                    openId: member.openId,
+                                    name: member.name,
+                                  })
+                                }
+                              />
+                            ))}
+                          </View>
+                        ) : null}
                         <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-                          表情验收需要开发者后台开启事件 im.message.reaction.created_v1 并发布版本；白名单模式在 allowedUsers
-                          为空时等于所有人可验收。不知道 emoji_type 时先点一次，插件日志会打印「忽略未配置的验收表情：XXX」，把
-                          XXX 填进来即可。
+                          验收人按 open_id 配置，与「允许 @ 的成员」相互独立；提出人由话题根消息发送者识别。
+                          表情验收需要开发者后台开启事件 im.message.reaction.created_v1 并发布版本；不知道 emoji_type
+                          时先点一次，插件日志会打印「忽略未配置的验收表情：XXX」，把 XXX 填进上面的列表即可。
                         </Text>
                         <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
                           <PrimaryButton
@@ -1445,6 +1556,13 @@ function normalize(values: BotValues): BotValues {
             return true;
           });
       })(),
+      issueAcceptUsers: chat.issueAcceptUsers
+        .map((user) => ({ openId: user.openId.trim(), name: user.name.trim() }))
+        .filter(
+          (user, index, users) =>
+            user.openId.length > 0 &&
+            users.findIndex((candidate) => candidate.openId === user.openId) === index,
+        ),
     })),
   };
 }

@@ -1812,11 +1812,14 @@ export function createDispatcher(options: DispatcherOptions) {
   }
 
   function canAcceptIssue(binding: ChatBinding, record: IssueRecord, operatorOpenId: string): boolean {
-    if (record.requesterOpenId && operatorOpenId === record.requesterOpenId) return true;
-    return (
-      binding.issueAcceptMode === "requester_or_allowlist" &&
-      isSenderAllowed(binding, operatorOpenId)
-    );
+    if (
+      binding.issueAcceptRequester &&
+      record.requesterOpenId &&
+      operatorOpenId === record.requesterOpenId
+    ) {
+      return true;
+    }
+    return binding.issueAcceptUsers.some((user) => user.openId === operatorOpenId);
   }
 
   function handleReaction(event: LarkReactionEvent): void {
