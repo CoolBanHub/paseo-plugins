@@ -2,7 +2,7 @@ import type { SessionPaseoApi, SessionWorkspaceHandle } from "./sessions.ts";
 import { createHelperAgent } from "./workspace.ts";
 
 export interface IssueStatusReview {
-  /** Ready to move from 处理中 to 待验收. Never means 已修复/已发布. */
+  /** Ready to move from 待处理/处理中 to 待验收. Never means 已修复/已发布. */
   done: boolean;
   summary: string | null;
   reason: string;
@@ -15,8 +15,8 @@ const MAX_COMMENTS = 10;
 
 /**
  * Review the recent thread context when an ambient comment hints that the
- * issue may be finished. The model may only advance 处理中 → 待验收; human
- * acceptance is still required for 已修复/已发布.
+ * issue may be finished. The model may only advance 待处理/处理中 → 待验收;
+ * human acceptance is still required for 已修复/已发布.
  *
  * Failure resolves to null (leave the status untouched).
  */
@@ -48,9 +48,12 @@ export async function reviewIssueStatusWithModel(options: {
     "",
     "注意：",
     "- 你只能判断「是否可验收」；「已修复」「已发布」必须由人确认，不在这里判断。",
-    "- 只有评论明确表示“已修复/已改好/已上线/已验证/已完成/没问题”，或机器人明确给出完成结论且没有人提出异议时，才 done=true。",
+    "- 记录状态可能是「待处理」（机器人还没被 @ 过）或「处理中」；状态本身不代表没完成，以评论里报告的事实为准。",
+    "- 只有评论明确表示已经修复、改好、新增、添加、实现、补充、调整、上线、验证通过或完成，且指向根消息要求的内容时，才 done=true。",
+    "- 「已新增/已添加/已实现/已补充」如果是在说根消息要求的功能或修改已经做完，可以视为可验收；如果只是新增了另一个问题、需求或讨论，不算。",
     "- 疑问句（“修好了吗？”）、否定（“还没/有问题/仍异常”）、讨论、计划、稍后处理、测试中，都必须 done=false。",
-    "- 不确定时 done=false；不要为了推进状态而猜测。",
+    "- 有人对完成结论提出异议（“还有问题/没修好/再改一下”）时，done=false。",
+    "- 评论只说“快好了/应该没问题/正在改”，或没有明确结论时，done=false；不要为了推进状态而猜测。",
     "",
     "只输出一个 JSON 对象，不要 markdown、不要解释：",
     '{"done": true, "summary": "一句话说明当前完成情况", "reason": "一句话依据"}',

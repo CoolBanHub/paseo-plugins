@@ -2276,6 +2276,159 @@ describe("issue acceptance card ordering", () => {
   });
 });
 
+describe("ambient issue status review", () => {
+  function ambientValues(): BotValues {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0]!,
+      issueTracking: "auto",
+      issueAiStatusReview: true,
+      issueBaseToken: "bascnTest",
+      issueTableId: "tblTest",
+    };
+    return values;
+  }
+
+  function issueRecord(status: IssueRecord["status"]): IssueRecord {
+    return {
+      recordId: "rec_ambient",
+      chatId: "oc_group",
+      rootMessageId: "om_root",
+      threadId: "omt_1",
+      requesterOpenId: "ou_requester",
+      title: "打赏鸡腿后老板和打手的订单详细页面加提示",
+      status,
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 2,
+      mediaSynced: [],
+      updatedAt: 1,
+    };
+  }
+
+  function statusReviewHarness(options: {
+    status?: IssueRecord["status"];
+    lastMessage: string;
+  }) {
+    const record = issueRecord(options.status ?? "待处理");
+    const prompts: string[] = [];
+    let markDoneCalls = 0;
+    const paseo = {
+      agents: {
+        create: async () => ({
+          id: "helper-1",
+          send: async () => {},
+          run: async (text: string) => {
+            prompts.push(text);
+            return { status: "idle" as const, error: null, lastMessage: options.lastMessage };
+          },
+        }),
+        ref: () => {
+          throw new Error("unexpected agent ref");
+        },
+      },
+    } as unknown as SessionPaseoApi;
+    const tracker = {
+      observe: () => {},
+      recordForTopic: () => record,
+      markDone: async () => {
+        markDoneCalls += 1;
+        return { ...record, status: "待验收" as const };
+      },
+    } as unknown as IssueTracker;
+    const h = makeHarness(ambientValues(), {
+      paseo,
+      issueTracker: tracker,
+      readThreadRootDetail: async () => ({
+        text: "打赏鸡腿后老板和打手的订单详细页面加提示，可以参考以下例图",
+        senderOpenId: "ou_requester",
+        senderName: "李丁",
+      }),
+    });
+    return { h, prompts, markDoneCalls: () => markDoneCalls };
+  }
+
+  it("moves a 待处理 record to 待验收 when an ambient reply says 已新增", async () => {
+    const { h, prompts, markDoneCalls } = statusReviewHarness({
+      lastMessage:
+        '{"done":true,"summary":"订单头部已新增显示已打赏金额的提示","reason":"成员明确回复已新增"}',
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_added",
+        root_id: "om_root",
+        sender_id: "ou_dev",
+        content: "已新增 1. 订单头部 显示已打赏金额",
+        mentions: [],
+      }),
+    );
+    await flush();
+    assert.equal(prompts.length, 1, "the completion hint should reach the model");
+    assert.match(prompts[0]!, /已新增/);
+    assert.equal(markDoneCalls(), 1, "the record should advance to 待验收");
+    assert.equal(h.cards.length, 1, "an acceptance card should be sent");
+    assert.match(JSON.stringify(h.cards[0]?.card), /待验收/);
+  });
+
+  it("does not call the model for a comment without a completion hint", async () => {
+    const { h, prompts, markDoneCalls } = statusReviewHarness({
+      lastMessage: '{"done":true,"summary":"x","reason":"y"}',
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_plan",
+        root_id: "om_root",
+        sender_id: "ou_dev",
+        content: "上线前还要补一张图，明天处理",
+        mentions: [],
+      }),
+    );
+    await flush();
+    assert.equal(prompts.length, 0);
+    assert.equal(markDoneCalls(), 0);
+    assert.equal(h.cards.length, 0);
+  });
+
+  it("keeps the record when the model is not convinced", async () => {
+    const { h, prompts, markDoneCalls } = statusReviewHarness({
+      lastMessage: '{"done":false,"summary":"","reason":"只是在描述新增内容"}',
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_unclear",
+        root_id: "om_root",
+        sender_id: "ou_dev",
+        content: "已新增 1. 订单头部 显示已打赏金额",
+        mentions: [],
+      }),
+    );
+    await flush();
+    assert.equal(prompts.length, 1);
+    assert.equal(markDoneCalls(), 0);
+    assert.equal(h.cards.length, 0);
+  });
+
+  it("does not review records that have already reached 待验收", async () => {
+    const { h, prompts, markDoneCalls } = statusReviewHarness({
+      status: "待验收",
+      lastMessage: '{"done":true,"summary":"x","reason":"y"}',
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_reviewed",
+        root_id: "om_root",
+        sender_id: "ou_dev",
+        content: "已新增 1. 订单头部 显示已打赏金额",
+        mentions: [],
+      }),
+    );
+    await flush();
+    assert.equal(prompts.length, 0);
+    assert.equal(markDoneCalls(), 0);
+  });
+});
+
 describe("progress card", () => {
   it("starts a card and finalizes it on completion", async () => {
     const values = baseValues({ progressCard: true });

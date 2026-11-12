@@ -278,7 +278,7 @@ export const chatBindingSchema = z.object({
   issueTracking: issueTrackingSchema.default("off"),
   /** Run a one-shot model gate before recording a new topic. */
   issueAiClassify: z.boolean().default(true),
-  /** Let the model advance 处理中 → 待验收 from ambient comments. */
+  /** Let the model advance 待处理/处理中 → 待验收 from ambient comments. */
   issueAiStatusReview: z.boolean().default(true),
   /** Provider for the issue AI passes; empty follows the main binding. */
   issueAiProvider: z.string().default(""),

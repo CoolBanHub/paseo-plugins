@@ -260,7 +260,15 @@ const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
 /** Cheap local prefilter before spending a model call on a comment. */
 const ISSUE_STATUS_HINT =
-  /(已修复|修复了|修好了|改好了|已改好|已解决|解决了|已完成|完成了|已上线|上线了|已发布|发布了|可以了|没问题|验证通过|验收通过|fixed|resolved|deployed|released)/iu;
+  /((?:已|已经)(?:修复|修好|改好|解决|完成|上线|发布|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)|(?:修复|修好|改好|解决|完成|上线|发布|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)了|可以了|没问题|验证通过|验收通过|fixed|resolved|deployed|released|implemented|completed)/iu;
+
+/**
+ * Records an ambient completion comment may advance. A "待处理" topic never
+ * had an @, so the bot never started a turn; an external developer can still
+ * report the work as done in a plain reply. "处理中" is the normal case, and
+ * later statuses (待验收/已修复/已发布/已关闭) must not be moved backwards.
+ */
+const ISSUE_STATUS_REVIEWABLE = new Set(["待处理", "处理中"]);
 
 /**
  * A completed turn is not always a completed fix. For multi-step work the
@@ -1073,7 +1081,7 @@ export function createDispatcher(options: DispatcherOptions) {
   /**
    * Ambient (non-@) comments can indicate that an external fix is finished.
    * A local keyword prefilter bounds model calls; the model may only advance
-   * 处理中 → 待验收. 已修复/已发布 still require a human acceptance/release.
+   * 待处理/处理中 → 待验收. 已修复/已发布 still require human acceptance/release.
    */
   async function maybeReviewIssueStatus(
     cliPath: string,
@@ -1089,7 +1097,13 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!text || text.startsWith("/") || !ISSUE_STATUS_HINT.test(text)) return;
     const topicKey = topicKeyFor(event);
     const record = tracker.recordForTopic(event.chat_id, topicKey);
-    if (!record || record.status !== "处理中" || issueStatusReviewing.has(record.recordId)) return;
+    if (
+      !record ||
+      !ISSUE_STATUS_REVIEWABLE.has(record.status) ||
+      issueStatusReviewing.has(record.recordId)
+    ) {
+      return;
+    }
     // A running/queued turn will answer and advance the status itself; do not
     // send an acceptance card before that answer.
     const session = sessions.sessionInfo(topicKey, event.chat_id);
