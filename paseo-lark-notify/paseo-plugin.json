@@ -1,7 +1,0 @@
-{
-  "id": "lark-notify",
-  "name": "飞书通知",
-  "requirements": {
-    "paseo": ">=0.15.3"
-  }
-}
