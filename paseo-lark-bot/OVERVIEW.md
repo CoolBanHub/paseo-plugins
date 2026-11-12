@@ -92,7 +92,7 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 | `questionCards` | `true` | 把 dsh 的 ask_user_question 以 Card 2.0 发到话题，点选项/多选后提交即可回答；需要飞书后台开启 `card.action.trigger` 回调。关闭后问题只能在 Paseo 处理 |
 | `issueAutoCreate` | `true` | 某个会话开启采集但还没配置文档时，首个话题触发自动创建；已配置时不会重复创建 |
 | `issueBaseName` | `问题跟踪` | 自动创建的 Base 名称 |
-| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyRewrite`、`rewriteProvider`、`rewriteModel`、`rewriteIgnoreStyle`、`replyFormat`、`mentionOnReply`、`allowAgentDelegation`、`issueTracking`、`issueBaseToken`、`issueTableId`、`issueBaseUrl`、`issueReactionAccept`、`issueReactionEmojis`、`issueAcceptRequester`、`issueAcceptUsers` |
+| `chats[]` | `[]` | 会话绑定列表，每项含 `chatId`、`chatName`、`provider`、`model`、`thinkingOptionId`、`permission`、`allowedUsers`、`cwd`、`systemPrompt`、`replyStyle`、`replyStylePrompt`、`replyRewrite`、`rewriteProvider`、`rewriteModel`、`rewriteIgnoreStyle`、`replyFormat`、`mentionOnReply`、`allowAgentDelegation`、`issueTracking`、`issueAiClassify`、`issueBaseToken`、`issueTableId`、`issueBaseUrl`、`issueReactionAccept`、`issueReactionEmojis`、`issueAcceptRequester`、`issueAcceptUsers` |
 
 - 绑定列表为空时事件监听不启动；保存设置即生效（监听进程随绑定列表启停）。设置保存会串行执行，避免并发 stop/start。
 - 每条绑定可选择**模型**、**思考深度**和**权限**：模型列表来自 Paseo provider 快照，留空使用 provider 默认模型；思考深度来自所选模型的 thinking options，留空使用模型默认（dsh 留空仍为最深 `max`）；权限在 Claude/Codex/ZCode 等 provider 上对应 provider mode（如 plan / acceptEdits / bypass、Codex default / full-access），在 dsh 上对应权限预设（仅可查看 / 工作区内修改 / 完全权限），留空时 dsh 沿用旧的 `danger-full-access`。
@@ -138,6 +138,7 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 | `/issue release` | 把「待验收/已修复」的记录标记为「已发布」 |
 | `/issue close [原因]` | 关闭当前话题的记录 |
 | `/issue type 问题\|需求\|咨询` | 修正当前话题的问题类型 |
+| `/issue track` | 强制把当前话题登记到跟踪表，跳过 AI 纳入判断 |
 
 - `/model`、`/mode`、`/thinking` 写的是**当前话题的覆盖**，只在该话题下一条消息的新会话生效，不会改动全局绑定；`/reset` 清除。群聊里优先把命令发在目标话题内（或在话题中回复）；主消息流里发送的命令作用于**最近活跃的话题**，没有活跃话题时才按新话题处理。模型与权限列表来自 Paseo provider 快照，列表不可用时仍可直接传 id。
 - 中文别名可用：`/帮助`、`/我是谁`、`/状态`、`/新会话`、`/重置`、`/停止`、`/模型`、`/模式`、`/权限`、`/思考`、`/定时`、`/诊断`、`/机器人`、`/成员`、`/智能体`、`/委派`、`/问题列表`、`/问题`；英文 `/permission` 与 `/mode` 等价。
@@ -175,9 +176,10 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 - **表结构**（固定）：`标题`、`状态`、`类型`、`提出人`、`提出人ID`、`群`、`群ID`、`根消息ID`、`话题ID`、`最近进展`、`处理人`、`Paseo 会话`、`最后活跃`、`是否跟踪`、`验收人`、`验收时间`、`创建时间`、`更新时间`。状态为 `待处理 / 处理中 / 待验收 / 已修复 / 已发布 / 已关闭`。
 - **已修复 ≠ 已发布**：机器人只把状态推进到「待验收」；提出人在卡片上点「验收通过」才变「已修复」；发布上线后在话题里发 `/issue release` 才变「已发布」。这样「已修复待发布」是可见的独立状态。
 - **视图**：创建时自动建「问题看板」（按状态分栏）、「待验收」、「已修复待发布」、「未关闭」。已有表不会自动补视图，但字段检查会提示缺字段。
-- **类型**：创建记录时按标题做本地关键词分类（问题 / 需求 / 咨询），不额外调用模型；已有表里类型为空的记录会在该群下一次消息时批量补齐。分类只是初判，可在 Base 里改，或在话题里发 `/issue type 问题|需求|咨询` 修正当前记录。
+- **AI 纳入判断 + 类型**：每个新话题根消息先跑一次一次性模型轮次，返回 `{track, type}`。`track=false` 的话题（例如介绍机器人/文档、群设置、公告、闲聊、测试消息）不建记录，只把 topic 记入 `issue-records.json` 的 `skipped`，之后即使有人 @ 也不会自动补建；`track=true` 的类型直接用模型结果。每个会话可用 `issueAiClassify` 关闭（默认开），关闭或模型失败时回退为「全部纳入 + 本地关键词分类」，避免因模型故障漏掉真实问题。已有表里类型为空的记录仍按关键词批量补齐；人工改过的类型不会被覆盖。模型判断也可能误判，可在话题里发 `/issue track` 强制登记，或发 `/issue type` / 在 Base 里改类型。
+- **AI 纳入判断的边界**：判断发生在建记录之前，用该会话绑定的 provider/model 跑一次一次性轮次（默认 20 秒超时）；失败/超时/返回无法解析时按「纳入」处理并回退关键词，不会因为模型故障丢问题。判断只看话题根消息文本（最多约 1200 字），图片/附件里的信息看不到；误判时用 `/issue track` 强制登记，或关闭该会话的 `issueAiClassify`。跳过的话题会持久化，重启后不会重新判断/补建；需要恢复时在话题里发 `/issue track`。
 - **状态流**：
-  - 新话题根消息 → `待处理`（不创建 agent）
+  - 新话题根消息 → AI 判断是否纳入；纳入则 `待处理`（不创建 agent），不纳入则不建记录
   - 首次 @ → `处理中`（复用记录；已修复/已发布/已关闭不自动重开）
   - `待验收` 时有人再次 @ → `处理中`，继续处理/答疑；该轮完成后再回到 `待验收`
   - 轮次完成 → 自动转 `待验收`，在话题里发验收卡片并 @ 提出人；不再依赖模型记得调用 helper
@@ -188,8 +190,8 @@ host 级设置（`lark_bot`，version 2），在 Paseo 侧边栏的「飞书机�
 - **助手 helper**：仅当绑定开启问题跟踪时，默认 systemPrompt 才追加 `lark-bot-issue` 用法；helper 把请求写入 `outbox/issues/`，插件轮询后更新 Base，不把 Base token 暴露给模型。自定义 `systemPrompt` 不会自动追加，需要自己写。**现在轮次完成会自动转待验收，helper 只用于补充摘要，不再作为状态推进的必要条件。**
 - **幂等与节流**：`issue-records.json` 按根消息/话题 id 保存 `recordId`；重复事件先查本地映射和 Base 再决定是否创建。普通回复不逐条写 Base，`最后活跃` 最多 10 分钟写一次。Base 写入失败只写日志/重试，不影响聊天回复；Base 更新是异步的，写入成功不要立刻读回校验。
 - **人工修改优先**：插件只在预期前置状态推进；已修复/已发布/已关闭不会被自动重开。Base 里被删除的记录会在下次操作时重建并写日志。
-- **权限与隐私**：采集依赖 `im:message.group_msg`（或 readonly）；机器人会看到群里所有消息。表里只存标题、提出人、话题 id、短进展等台账信息，不存聊天全文；Base 的可见范围由协作者/高级权限决定。多个会话可以指向同一个 Base（彼此可见），也可以各用各的；不要把不信任的群配到同一个表，需要隔离就分开建。
-- **限制**：只对话题群有意义（根消息需带 `thread_id`）；普通群开启会把每条消息当新话题。一个话题对应一条记录，多个问题建议拆话题。类型是本地关键词初判，可能误判，用 `/issue type` 或 Base 手动改；历史话题回填、每日 digest 不在当前版本内。
+- **权限与隐私**：采集依赖 `im:message.group_msg`（或 readonly）；机器人会看到群里所有消息。表里只存标题、提出人、话题 id、短进展等台账信息，不存聊天全文；Base 的可见范围由协作者/高级权限决定。多个会话可以指向同一个 Base（彼此可见），也可以各用各的；不要把不信任的群配到同一个表，需要隔离就分开建。**AI 纳入判断会把话题根消息文本发给该会话绑定的模型 provider**；对敏感群可关闭 `issueAiClassify`，只用本地关键词/人工分类。
+- **限制**：只对话题群有意义（根消息需带 `thread_id`）；普通群开启会把每条消息当新话题。一个话题对应一条记录，多个问题建议拆话题。AI 纳入判断只看根消息文本，可能误判（例如一句话既有闲聊又有需求），可用 `/issue track` 强制登记、`/issue type` 改类型，或关闭该会话的 `issueAiClassify` 回退为全部纳入；历史话题回填、每日 digest 不在当前版本内。
 
 ## 行为细节
 

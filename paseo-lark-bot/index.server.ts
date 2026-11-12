@@ -29,12 +29,14 @@ import {
 import { createAppCreationController } from "./server/app-creation.ts";
 import { createDispatcher, type Dispatcher } from "./server/dispatcher.ts";
 import { enrichUnmatchedChats } from "./server/peer.ts";
+import { classifyIssueWithModel } from "./server/issue-classifier.ts";
+import { ensureWorkspace, workspaceTitleFor } from "./server/workspace.ts";
 import {
   createIssueTracker,
   installIssueHelper,
   type IssueTracker,
 } from "./server/issues.ts";
-import type { SessionPaseoApi } from "./server/sessions.ts";
+import { resolveCwd, type SessionPaseoApi } from "./server/sessions.ts";
 import { lastAssistantText } from "./server/timeline.ts";
 import { resolveFfmpeg } from "./server/media.ts";
 import { installMembersHelper, installOutboxHelper } from "./server/attachments.ts";
@@ -172,6 +174,34 @@ function ensureDispatcher(
       baseStorePath: join(PLUGIN_DATA_ROOT, "issue-bases.json"),
       log: (message, detail) =>
         console.log("[lark-bot] " + message, detail === undefined ? "" : detail),
+      classify: async ({ text, binding, values, topicKey }) => {
+        try {
+          const provider = await resolveProviderModel(binding.provider, binding.model);
+          const cwd = resolveCwd(binding.cwd);
+          const workspace = await ensureWorkspace({
+            paseo: api,
+            title: workspaceTitleFor(binding.chatId, binding.chatName, values.workspacePerBinding),
+            directory: cwd,
+            failureMessage: "问题分类 workspace 不可用：",
+            log: (message) => console.log("[lark-bot] " + message),
+          });
+          return await classifyIssueWithModel({
+            paseo: api,
+            workspace,
+            provider,
+            cwd,
+            chatId: binding.chatId,
+            topicKey,
+            text,
+          });
+        } catch (error) {
+          console.log(
+            "[lark-bot] 问题分类调用失败，回退关键词",
+            error instanceof Error ? error.message : String(error),
+          );
+          return null;
+        }
+      },
     });
     dispatcher = createDispatcher({
       dedupStorePath: join(PLUGIN_DATA_ROOT, "seen-message-ids.json"),

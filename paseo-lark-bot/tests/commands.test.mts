@@ -23,6 +23,7 @@ const binding: ChatBinding = {
   mentionOnReply: "off",
   allowAgentDelegation: false,
   issueTracking: "off",
+  issueAiClassify: true,
   issueBaseToken: "",
   issueTableId: "",
   issueBaseUrl: "",
@@ -261,6 +262,10 @@ describe("command handlers", () => {
         calls.push(`type:${type}`);
         return "type";
       },
+      track: async () => {
+        calls.push("track");
+        return "track";
+      },
     };
     const issues = context({ command: { name: "issues", args: "pending" }, issue });
     await runCommand(issues.value);
@@ -277,7 +282,11 @@ describe("command handlers", () => {
     const type = context({ command: { name: "issue", args: "type 需求" }, issue });
     await runCommand(type.value);
     assert.equal(type.replies[0], "type");
-    assert.deepEqual(calls, ["query:pending", "done:已改完", "close:重复问题", "type:需求"]);
+
+    const track = context({ command: { name: "issue", args: "track" }, issue });
+    await runCommand(track.value);
+    assert.equal(track.replies[0], "track");
+    assert.deepEqual(calls, ["query:pending", "done:已改完", "close:重复问题", "type:需求", "track"]);
 
     const missing = context({ command: { name: "issues", args: "" } });
     await runCommand(missing.value);

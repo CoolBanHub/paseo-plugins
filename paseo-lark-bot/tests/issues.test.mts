@@ -11,6 +11,7 @@ import {
   issueRecordUrl,
 } from "../server/issues.ts";
 import { buildIssueCard, parseIssueAction } from "../server/issue-card.ts";
+import { parseIssueClassification } from "../server/issue-classifier.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
 import { DEFAULT_BOT_VALUES, type BotValues, type ChatBinding } from "../shared/settings.ts";
 import type { LarkPayload } from "../server/lark.ts";
@@ -42,13 +43,14 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     allowAgentDelegation: false,
     rewriteIgnoreStyle: false,
     issueTracking: "auto",
+    issueAiClassify: true,
     issueBaseToken: "bascnTest",
     issueTableId: "tblTest",
     issueBaseUrl: "https://example.feishu.cn/base/bascnTest",
     issueReactionAccept: true,
     issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
     issueAcceptRequester: true,
-  issueAcceptUsers: [],
+    issueAcceptUsers: [],
     ...overrides,
   };
 }
@@ -132,6 +134,76 @@ describe("issue type classifier", () => {
     assert.equal(classifyIssueType("组队单群聊老板信息后面加个老板提示"), "需求");
     assert.equal(classifyIssueType("客服页面新增【发送】按钮"), "需求");
     assert.equal(classifyIssueType("这个功能怎么用？"), "咨询");
+  });
+});
+
+describe("issue classification gate", () => {
+  it("parses the model JSON and tolerates code fences", () => {
+    assert.deepEqual(parseIssueClassification('```json\n{"track":true,"type":"需求","reason":"加功能"}\n```'), {
+      track: true,
+      type: "需求",
+      reason: "加功能",
+    });
+    assert.equal(parseIssueClassification('{"track":"yes"}'), null);
+    assert.equal(parseIssueClassification("not json"), null);
+  });
+
+  it("skips a topic when the model says it is not an issue", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "base.json"),
+        run: fake.run,
+        classify: async () => ({ track: false, type: null, reason: "关于机器人的说明" }),
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(tracker.recordForTopic(CHAT, THREAD), null);
+      assert.equal(fake.calls.some((args) => args.includes("+record-batch-create")), false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the model type when the topic is tracked", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lark-issue-"));
+    try {
+      let created: Record<string, unknown> | null = null;
+      const fake = fakeRun((args) => {
+        if (args.includes("+record-list")) {
+          return { ok: true, data: { fields: [], data: [], record_id_list: [] } };
+        }
+        if (args.includes("+record-batch-create")) {
+          const raw = args[args.indexOf("--json") + 1] ?? "{}";
+          created = (JSON.parse(raw) as { create_records?: Record<string, unknown>[] }).create_records?.[0] ?? null;
+          return { ok: true, data: { record_id_list: ["rec_1"] } };
+        }
+        return { ok: true, data: {} };
+      });
+      const tracker = createIssueTracker({
+        readValues: async () => values(),
+        storePath: join(dir, "records.json"),
+        baseStorePath: join(dir, "base.json"),
+        run: fake.run,
+        classify: async () => ({ track: true, type: "需求", reason: "功能需求" }),
+      });
+      tracker.observe(rootEvent(), binding(), values());
+      await waitFor(() => tracker.recordForTopic(CHAT, THREAD) !== null);
+      assert.deepEqual(created?.["类型"], ["需求"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -501,7 +573,7 @@ describe("issue tracker", () => {
             issueReactionAccept: true,
             issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
             issueAcceptRequester: true,
-  issueAcceptUsers: [],
+    issueAcceptUsers: [],
           }),
         ],
       });

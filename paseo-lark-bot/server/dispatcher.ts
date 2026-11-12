@@ -1235,6 +1235,12 @@ export function createDispatcher(options: DispatcherOptions) {
                 ? `类型已改为「${type.trim()}」。`
                 : "类型只能是「问题」「需求」或「咨询」。";
             },
+            track: async () => {
+              const updated = await options.issueTracker!.registerTopic(event, binding, values);
+              return updated
+                ? "已强制登记到问题跟踪表（跳过 AI 判断）。"
+                : "登记失败：无法创建/访问跟踪表，请检查 Base 配置。";
+            },
           }
         : undefined,
       listBots: async () =>

@@ -7,6 +7,7 @@ import type { BotValues, ChatBinding } from "../shared/settings.ts";
 import type { LarkMessageEvent } from "./lark-events.ts";
 import { parseLarkJson, resolveLarkCli, type LarkPayload } from "./lark.ts";
 import { sanitizeTopicText } from "./format.ts";
+import type { IssueClassification } from "./issue-classifier.ts";
 
 const execFileAsync = promisify(execFile);
 const CLI_TIMEOUT_MS = 30_000;
@@ -197,9 +198,17 @@ const issueRecordSchema = z.object({
 });
 export type IssueRecord = z.output<typeof issueRecordSchema>;
 
+const skippedTopicSchema = z.object({
+  chatId: z.string().min(1),
+  topicKey: z.string().min(1),
+  reason: z.string().default(""),
+  at: z.number().default(0),
+});
+
 const recordStoreSchema = z.object({
   version: z.number().default(RECORD_STORE_VERSION),
   records: z.array(issueRecordSchema).default([]),
+  skipped: z.array(skippedTopicSchema).default([]),
 });
 
 export interface IssueQueryItem {
@@ -232,6 +241,13 @@ export interface IssueTrackerOptions {
   log?: (message: string, detail?: unknown) => void;
   /** Injectable lark-cli runner for tests. */
   run?: (cliPath: string, args: string[], label: string) => Promise<LarkPayload>;
+  /** Optional one-shot model gate; null means fall back to keyword/track all. */
+  classify?: (input: {
+    text: string;
+    binding: ChatBinding;
+    values: BotValues;
+    topicKey: string;
+  }) => Promise<IssueClassification | null>;
 }
 
 export interface IssueTracker {
@@ -239,6 +255,8 @@ export interface IssueTracker {
   observe(event: LarkMessageEvent, binding: ChatBinding, values?: BotValues): void;
   /** First @ in a topic: 待处理 → 处理中 (never reopens a closed item). */
   markWorking(event: LarkMessageEvent, binding: ChatBinding, values?: BotValues): void;
+  /** Force-register the current topic, bypassing the AI gate. */
+  registerTopic(event: LarkMessageEvent, binding: ChatBinding, values?: BotValues): Promise<IssueRecord | null>;
   /** A turn finished: update the progress column, leave the status alone. */
   updateProgress(input: {
     chatId: string;
@@ -447,6 +465,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   const lastActivityWrite = new Map<string, number>();
   const backfilledChats = new Set<string>();
   const backfillInFlight = new Set<string>();
+  const skipped = new Map<string, { chatId: string; topicKey: string; reason: string; at: number }>();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let warnedMissingBase = false;
 
@@ -454,6 +473,9 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   if (stored) {
     for (const record of stored.records.slice(-MAX_RECORDS)) {
       register(record, false);
+    }
+    for (const entry of stored.skipped.slice(-MAX_RECORDS)) {
+      skipped.set(`${entry.chatId}:${entry.topicKey}`, entry);
     }
   }
 
@@ -495,6 +517,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     writeJsonAtomic(options.storePath, {
       version: RECORD_STORE_VERSION,
       records: [...records.values()].slice(-MAX_RECORDS),
+      skipped: [...skipped.values()].slice(-MAX_RECORDS),
     });
   }
 
@@ -503,6 +526,28 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       if (record && record.chatId === chatId) return record;
     }
     return null;
+  }
+
+  function isSkipped(chatId: string, keys: Array<string | null | undefined>): boolean {
+    return keys.some((key) => key && skipped.has(`${chatId}:${key}`));
+  }
+
+  function markSkipped(chatId: string, topicKey: string, reason: string): void {
+    skipped.set(`${chatId}:${topicKey}`, { chatId, topicKey, reason, at: now() });
+    while (skipped.size > MAX_RECORDS) {
+      const oldest = skipped.keys().next().value;
+      if (!oldest) break;
+      skipped.delete(oldest);
+    }
+    scheduleSave();
+  }
+
+  function clearSkipped(chatId: string, keys: Array<string | null | undefined>): void {
+    let changed = false;
+    for (const key of keys) {
+      if (key && skipped.delete(`${chatId}:${key}`)) changed = true;
+    }
+    if (changed) scheduleSave();
   }
 
   function allForChat(chatId: string): IssueRecord[] {
@@ -638,12 +683,14 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
       title: string;
       senderOpenId: string | null;
       at: number;
+      /** Model type when available; keyword fallback otherwise. */
+      type?: IssueType;
     },
   ): Promise<IssueRecord | null> {
     const fields: Record<string, unknown> = {
       标题: input.title,
       状态: ["待处理"],
-      类型: [classifyIssueType(input.title)],
+      类型: [input.type ?? classifyIssueType(input.title)],
       提出人ID: input.senderOpenId ?? "",
       群: input.chatName,
       群ID: input.chatId,
@@ -708,18 +755,49 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     return record;
   }
 
+  async function classifyTopic(
+    text: string,
+    binding: ChatBinding,
+    values: BotValues,
+    topicKey: string,
+  ): Promise<{ skip: boolean; type?: IssueType }> {
+    if (!binding.issueAiClassify || !options.classify) return { skip: false };
+    const classification = await options.classify({
+      text,
+      binding,
+      values,
+      topicKey,
+    });
+    if (!classification) return { skip: false };
+    if (!classification.track) {
+      markSkipped(binding.chatId, topicKey, classification.reason);
+      log(`AI 判断不纳入问题跟踪：${clip(text, 60)}`);
+      return { skip: true };
+    }
+    return { skip: false, type: classification.type ?? undefined };
+  }
+
   async function ensureRecord(
     event: LarkMessageEvent,
     binding: ChatBinding,
     values: BotValues,
+    mode: { force?: boolean } = {},
   ): Promise<IssueRecord | null> {
     const existing = find(event.chat_id, event.thread_id || event.root_id || event.message_id);
     if (existing) return existing;
-    const config = await ensureBase(values, event.chat_id);
-    if (!config) return null;
     const rootMessageId = event.root_id || event.message_id;
     const threadId = event.thread_id || null;
     const key = threadId || rootMessageId;
+    if (!mode.force && isSkipped(event.chat_id, [threadId, rootMessageId, event.message_id])) {
+      return null;
+    }
+    const title = sanitizeTopicText(event.content, 60) || "未命名话题";
+    const gate = mode.force
+      ? { skip: false, type: undefined as IssueType | undefined }
+      : await classifyTopic(sanitizeTopicText(event.content, 1200), binding, values, key);
+    if (gate.skip) return null;
+    const config = await ensureBase(values, event.chat_id);
+    if (!config) return null;
     if (creating.has(key)) return null;
     creating.add(key);
     try {
@@ -742,7 +820,6 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
         register(record);
         return record;
       }
-      const title = sanitizeTopicText(event.content, 60) || "未命名话题";
       return await createRecord(values, config, {
         chatId: event.chat_id,
         chatName: binding.chatName,
@@ -751,6 +828,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
         title,
         senderOpenId: event.sender_id.startsWith("ou_") ? event.sender_id : null,
         at: now(),
+        ...(gate.type ? { type: gate.type } : {}),
       });
     } catch (error) {
       log("登记话题失败", errorDetail(error));
@@ -765,14 +843,30 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     binding: ChatBinding,
     values: BotValues,
     rootMessageId: string,
+    mode: { force?: boolean } = {},
   ): Promise<IssueRecord | null> {
     const existing = find(event.chat_id, rootMessageId);
     if (existing) return existing;
+    if (
+      !mode.force &&
+      isSkipped(event.chat_id, [rootMessageId, event.thread_id, event.message_id])
+    ) {
+      return null;
+    }
     try {
       const cli = await cliPath(values);
       const { readMessageDetail } = await import("./lark.ts");
       const detail = await readMessageDetail(cli, rootMessageId);
       const title = sanitizeTopicText(detail?.text ?? "", 60) || "未命名话题";
+      const gate = mode.force
+        ? { skip: false, type: undefined as IssueType | undefined }
+        : await classifyTopic(
+            sanitizeTopicText(detail?.text ?? "", 1200),
+            binding,
+            values,
+            rootMessageId,
+          );
+      if (gate.skip) return null;
       const config = await ensureBase(values, event.chat_id);
       if (!config) return null;
       const found = await findBaseRecord(values, config, rootMessageId, event.thread_id ?? null);
@@ -802,11 +896,27 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
         title,
         senderOpenId: detail?.senderOpenId ?? null,
         at: now(),
+        ...(gate.type ? { type: gate.type } : {}),
       });
     } catch (error) {
       log("补建话题记录失败", errorDetail(error));
       return null;
     }
+  }
+
+  async function registerTopic(
+    event: LarkMessageEvent,
+    binding: ChatBinding,
+    values?: BotValues,
+  ): Promise<IssueRecord | null> {
+    const current = await valuesFor(values);
+    const rootMessageId = event.root_id || event.message_id;
+    const threadId = event.thread_id || null;
+    clearSkipped(event.chat_id, [threadId, rootMessageId, event.message_id]);
+    if (event.root_id) {
+      return ensureFromRootMessage(event, binding, current, event.root_id, { force: true });
+    }
+    return ensureRecord(event, binding, current, { force: true });
   }
 
   async function noteActivity(
@@ -1396,6 +1506,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
   return {
     observe,
     markWorking,
+    registerTopic,
     updateProgress,
     markDone,
     accept,

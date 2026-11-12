@@ -290,6 +290,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               allowAgentDelegation: false,
               rewriteIgnoreStyle: false,
               issueTracking: "off",
+              issueAiClassify: true,
               issueBaseToken: "",
               issueTableId: "",
               issueBaseUrl: "",
@@ -1066,6 +1067,14 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                           缺少字段：{state.missingFields.join("、")}。可到 Base 里补齐，或删掉重建。
                         </Text>
                       ) : null}
+                      <ToggleRow
+                        label="AI 判断是否纳入并分类"
+                        hint="新话题先用本会话绑定的模型判断是否属于问题/需求并给出类型；模型失败时回退关键词。每个新话题多一次小模型调用"
+                        value={chat.issueAiClassify}
+                        onChange={(value) =>
+                          patchBinding(chat.chatId, { issueAiClassify: value })
+                        }
+                      />
                       <SelectRow
                         label="跟踪表"
                         value={

@@ -276,6 +276,8 @@ export const chatBindingSchema = z.object({
   allowAgentDelegation: z.boolean().default(false),
   /** Capture every new topic in this chat into its issue Base. */
   issueTracking: issueTrackingSchema.default("off"),
+  /** Run a one-shot model gate before recording a new topic. */
+  issueAiClassify: z.boolean().default(true),
   /**
    * The one ledger this chat may use. Empty means "not configured"; the
    * plugin can create one with the bot identity and store the coordinates in
