@@ -297,6 +297,10 @@ interface TurnState {
   firstContentAt?: number;
   /** Most recent generated content of the open decode window. */
   lastContentAt?: number;
+  /** Earliest known start of the model request currently streaming. */
+  requestAnchorAt?: number;
+  /** Earliest known start of the turn's first model request. */
+  firstAnchorAt?: number;
   /** Summed generated-content time across this turn's model requests. */
   decodeMs: number;
   /** Generated-content time of the model request that is currently streaming. */
@@ -848,8 +852,11 @@ const MAX_PLAUSIBLE_TPS = 1000;
  * idle tail between the last content frame and the closing event is idle time,
  * not decoding, so it stays outside the window.
  */
-function decodeTokPerSec(outputTokens: number | undefined, decodeMs: number): number | undefined {
-  if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
+function decodeTokPerSec(
+  outputTokens: number | undefined,
+  decodeMs: number | undefined,
+): number | undefined {
+  if (outputTokens === undefined || outputTokens <= 0 || decodeMs === undefined || decodeMs <= 0) return undefined;
   const tps = outputTokens / (decodeMs / 1000);
   if (!Number.isFinite(tps) || tps <= 0 || tps > MAX_PLAUSIBLE_TPS) return undefined;
   return tps;
@@ -862,6 +869,8 @@ function formatTokPerSec(tps: number): string {
 function openDecodeWindow(turn: TurnState, at: number): void {
   if (turn.firstContentAt === undefined) turn.firstContentAt = at;
   turn.lastContentAt = at;
+  turn.requestAnchorAt ??= at;
+  turn.firstAnchorAt ??= at;
   turn.stepSawStream = true;
 }
 
@@ -971,11 +980,19 @@ function emitStepUsage(
   state: SessionState,
   turn: TurnState,
   usage: Record<string, unknown>,
+  at: number,
 ): void {
   closeDecodeWindow(turn);
   const fields = readUsageFields(usage);
-  const speed = decodeTokPerSec(fields.outputTokens, turn.stepDecodeMs);
+  // Requests the app-server batched into a burst of frames compress the
+  // content span to nothing; fall back to the request's wall span (anchored
+  // at its start frame, the previous commit or the turn start) so the row
+  // still reports honest end-to-end throughput instead of dropping the speed.
+  const wallMs = turn.requestAnchorAt === undefined ? undefined : at - turn.requestAnchorAt;
+  const speed = decodeTokPerSec(fields.outputTokens, turn.stepDecodeMs)
+    ?? decodeTokPerSec(fields.outputTokens, wallMs);
   turn.stepDecodeMs = 0;
+  turn.requestAnchorAt = at;
   if (!hasUsageTokens(fields)) return;
   // The app-server re-broadcasts the final request's usage snapshot when the
   // turn settles: identical numbers with no model streaming since the last row
@@ -1000,10 +1017,14 @@ function emitTurnUsage(
   state: SessionState,
   turn: TurnState,
   usage: Record<string, unknown>,
+  at: number,
 ): void {
   const fields = readUsageFields(usage);
   if (!hasUsageTokens(fields)) return;
-  const speed = decodeTokPerSec(fields.outputTokens, turn.decodeMs);
+  const anchor = turn.firstAnchorAt ?? turn.requestAnchorAt;
+  const wallMs = anchor === undefined ? undefined : at - anchor;
+  const speed = decodeTokPerSec(fields.outputTokens, turn.decodeMs)
+    ?? decodeTokPerSec(fields.outputTokens, wallMs);
   if (speed === undefined) return;
   const item = usageNoticeItem(state.paseoSessionId, turn.turnId, undefined, fields, speed);
   if (!item) return;
@@ -1750,6 +1771,8 @@ export function createZcodeProvider(): ProviderRegistration {
             // duplicate user_message here would show the prompt twice.
             if (event.turnId) {
               turn!.started = true;
+              turn!.requestAnchorAt ??= event.timestamp;
+              turn!.firstAnchorAt ??= event.timestamp;
               emit({ type: "session.turn", sessionId: state.paseoSessionId, turnId: event.turnId, state: "started" });
               const clientMessageId = state.pendingClientMessageId;
               if (clientMessageId) {
@@ -1775,6 +1798,8 @@ export function createZcodeProvider(): ProviderRegistration {
               turn.lastContentAt = undefined;
               turn.stepDecodeMs = 0;
               turn.stepSawStream = true;
+              turn.requestAnchorAt = event.timestamp;
+              turn.firstAnchorAt ??= event.timestamp;
             } else if (kind === "finish" || kind === "error") {
               closeDecodeWindow(turn);
               turn.stepSawStream = true;
@@ -1856,7 +1881,7 @@ export function createZcodeProvider(): ProviderRegistration {
               ? payload.usage as Record<string, unknown>
               : undefined;
             if (usage && turn.started && isMainTurnModelUsage(payload)) {
-              emitStepUsage(emit, state, turn, usage);
+              emitStepUsage(emit, state, turn, usage, event.timestamp);
               emitUsageContext(emit, state, contextTokensFromUsage(readUsageFields(usage)), state.contextWindow);
             }
             break;
@@ -1992,7 +2017,7 @@ export function createZcodeProvider(): ProviderRegistration {
             // committed; the total is only needed for older app-servers that
             // never pushed a per-request usage snapshot.
             closeDecodeWindow(turn);
-            if (turn.usageRows === 0) emitTurnUsage(emit, state, turn, usage);
+            if (turn.usageRows === 0) emitTurnUsage(emit, state, turn, usage, event.timestamp);
             const totals = readUsageFields(usage);
             emit({
               type: "session.turn",

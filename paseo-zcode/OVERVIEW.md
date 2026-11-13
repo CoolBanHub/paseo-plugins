@@ -64,11 +64,13 @@ local ZCode sessions are listed in Paseo's session picker.
   generated-content time (first → last content frame; the idle tail up to the
   closing event is not decoding), the same decode-only definition ZCode's own
   `tokensPerSecond` uses. Because the app-server forwards only delta frames, a
-  tool call, the model commit or the turn completion closes each segment, and a
-  request without content timing omits only the speed. Frames the app-server
-  batched into a burst compress the arrival span to milliseconds; any figure
-  beyond 1000 tok/s is such a forwarding artifact, and the row omits the speed
-  rather than report it. Older app-server
+  tool call, the model commit or the turn completion closes each segment.
+  Frames the app-server batched into a burst compress the arrival span to
+  milliseconds; such requests fall back to the request's wall span (anchored
+  at its start frame, the previous commit or the turn start), which includes
+  queueing and thinking and therefore understates rather than inflates. A
+  figure beyond 1000 tok/s is a forwarding artifact either way, and the row
+  omits the speed rather than report it. Older app-server
   versions that never push per-request usage fall back to one row at turn
   completion. A snapshot with identical numbers and no model streaming since
   the last row is the app-server re-broadcasting the final request's usage as
