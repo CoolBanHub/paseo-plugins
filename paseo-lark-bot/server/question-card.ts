@@ -186,33 +186,79 @@ export function parseFormAnswer(
   }
 }
 
-function optionText(option: QuestionOption): string {
-  return option.description ? `${option.label} — ${option.description}` : option.label;
+const MAX_OPTION_LABEL = 400;
+const MAX_OPTION_DESCRIPTION = 600;
+
+/** Flatten a label/description so an option always renders as one block. */
+function clipOptionText(value: string, max: number): string {
+  const flat = value.replace(/\s+/g, " ").trim();
+  return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
 }
 
-function singleSelectButtons(
+/**
+ * Option text as wrapping Markdown. Feishu button text is plain text on a
+ * single line, which clips long Chinese labels at roughly a dozen characters
+ * on a phone. Keep every label and description here instead, and use a short
+ * fixed button caption next to it.
+ */
+function optionMarkdown(option: QuestionOption): string {
+  const label = clipOptionText(option.label, MAX_OPTION_LABEL) || "未命名选项";
+  if (!option.description) return `**${label}**`;
+  return `**${label}**\n${clipOptionText(option.description, MAX_OPTION_DESCRIPTION)}`;
+}
+
+function optionRow(
+  option: QuestionOption,
+  control: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    horizontal_spacing: "small",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 4,
+        vertical_align: "center",
+        elements: [{ tag: "markdown", content: optionMarkdown(option) }],
+      },
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        vertical_align: "center",
+        elements: [control],
+      },
+    ],
+  };
+}
+
+function singleSelectElements(
   requestId: string,
   question: QuestionForm,
   questionIndex: number,
 ): Record<string, unknown>[] {
-  const buttons: Record<string, unknown>[] = question.options.map((option, optionIndex) => ({
-    tag: "button",
-    text: { tag: "plain_text", content: clipButtonText(optionText(option)) },
-    type: optionIndex === 0 ? "primary" : "default",
-    width: "fill",
-    behaviors: [
-      {
-        type: "callback",
-        value: {
-          requestId,
-          questionIndex,
-          optionIndex,
-        } satisfies QuestionActionPayload,
-      },
-    ],
-  }));
+  const elements: Record<string, unknown>[] = question.options.map((option, optionIndex) =>
+    optionRow(option, {
+      tag: "button",
+      text: { tag: "plain_text", content: "选择" },
+      type: "default",
+      width: "fill",
+      behaviors: [
+        {
+          type: "callback",
+          value: {
+            requestId,
+            questionIndex,
+            optionIndex,
+          } satisfies QuestionActionPayload,
+        },
+      ],
+    }),
+  );
   if (question.allowEmpty || question.options.length === 0) {
-    buttons.push({
+    elements.push({
       tag: "button",
       text: { tag: "plain_text", content: "跳过" },
       type: "default",
@@ -225,7 +271,7 @@ function singleSelectButtons(
       ],
     });
   }
-  return buttons;
+  return elements;
 }
 
 function otherAnswerForm(questionIndex: number, token: string): Record<string, unknown> {
@@ -257,12 +303,14 @@ function multiSelectForm(
   questionIndex: number,
   token: string,
 ): Record<string, unknown> {
-  const elements: Record<string, unknown>[] = question.options.map((option, optionIndex) => ({
-    tag: "checker",
-    name: `q${questionIndex}_opt${optionIndex}`,
-    checked: false,
-    text: { tag: "plain_text", content: clipButtonText(optionText(option)) },
-  }));
+  const elements: Record<string, unknown>[] = question.options.map((option, optionIndex) =>
+    optionRow(option, {
+      tag: "checker",
+      name: `q${questionIndex}_opt${optionIndex}`,
+      checked: false,
+      text: { tag: "plain_text", content: "选择" },
+    }),
+  );
   if (question.allowOther) {
     elements.push({
       tag: "input",
@@ -287,9 +335,10 @@ function multiSelectForm(
 }
 
 /**
- * Build a Card 2.0 question form. Option buttons and the multi-select/other
- * forms are root body elements because Feishu only allows `form` at that
- * level.
+ * Build a Card 2.0 question form. Options are two-column rows: wrapping text on
+ * the left so nothing is cut off on a phone, a short control on the right.
+ * Multi-select and other-answer forms stay root body elements because Feishu
+ * only allows `form` at that level.
  */
 export function buildQuestionCard(options: {
   requestId: string;
@@ -310,12 +359,12 @@ export function buildQuestionCard(options: {
       elements.push(multiSelectForm(question, index, options.token));
       return;
     }
-    elements.push(...singleSelectButtons(options.requestId, question, index));
+    elements.push(...singleSelectElements(options.requestId, question, index));
     if (question.allowOther) elements.push(otherAnswerForm(index, options.token));
   });
   elements.push({
     tag: "markdown",
-    content: "点击选项即提交，提交后不能修改；多选问题勾选后点「提交选择」。也可以在 Paseo 客户端处理。",
+    content: "单选项点「选择」即提交；多选问题勾选后点「提交选择」。提交后不能修改。也可以在 Paseo 客户端处理。",
   });
 
   return {

@@ -39,6 +39,23 @@ const SAMPLE_INPUT = {
   ],
 };
 
+/** Recursively collect every nested card element with the given tag. */
+function collectElements(node: unknown, tag: string): Record<string, unknown>[] {
+  const found: Record<string, unknown>[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    if (record.tag === tag) found.push(record);
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(node);
+  return found;
+}
+
 describe("parseQuestionForms", () => {
   it("preserves headers, options, flags and dsh's duplicate suffix", () => {
     const forms = parseQuestionForms(SAMPLE_INPUT);
@@ -77,7 +94,7 @@ describe("buildQuestionCard", () => {
     assert.equal(card.schema, "2.0");
     const body = card.body as { elements: Record<string, unknown>[] };
     assert.ok(body.elements.length > 0);
-    const buttons = body.elements.filter((element) => element.tag === "button");
+    const buttons = collectElements(card, "button");
     const first = buttons[0] as {
       behaviors: { value: Record<string, unknown> }[];
     };
@@ -86,6 +103,87 @@ describe("buildQuestionCard", () => {
       questionIndex: 0,
       optionIndex: 0,
     });
+  });
+
+  it("renders option text as wrapping markdown and keeps buttons short", () => {
+    const longLabel = "手动调整展示顺序（推荐）";
+    const longDescription = "在服务管理里拖动已经上架的商品，自己决定它们展示的先后顺序";
+    const longForms = parseQuestionForms({
+      questions: [
+        {
+          header: "确认排序方式",
+          question: "具体指哪一种？",
+          options: [
+            { label: longLabel, description: longDescription },
+            { label: "两者都要", description: "既支持手动调整，也支持按价格/销量排序" },
+          ],
+        },
+      ],
+    });
+    const longCard = buildQuestionCard({
+      requestId: "permission:paseo-question-q-long",
+      token,
+      title: "确认排序方式",
+      questions: longForms,
+    });
+    const markdown = collectElements(longCard, "markdown")
+      .map((element) => String(element.content ?? ""))
+      .join("\n");
+    assert.match(markdown, new RegExp(longLabel));
+    assert.match(markdown, new RegExp(longDescription));
+    assert.match(markdown, /既支持手动调整/);
+    assert.match(markdown, /按价格\/销量排序/);
+
+    const optionButtons = collectElements(longCard, "button");
+    assert.deepEqual(
+      optionButtons.map((button) => (button.text as { content?: string }).content),
+      ["选择", "选择"],
+    );
+    const firstRow = (longCard.body as { elements: Record<string, unknown>[] }).elements.find(
+      (element) => element.tag === "column_set",
+    ) as { columns: { weight?: number; elements: { tag: string }[] }[] };
+    assert.equal(firstRow.columns.length, 2);
+    assert.deepEqual(firstRow.columns.map((column) => column.weight), [4, 1]);
+    assert.deepEqual(firstRow.columns.map((column) => column.elements[0]?.tag), [
+      "markdown",
+      "button",
+    ]);
+  });
+
+  it("keeps multi-select labels readable next to compact checkers", () => {
+    const multiForms = parseQuestionForms({
+      questions: [
+        {
+          header: "多选",
+          question: "选哪些？",
+          options: [
+            { label: "手动调整展示顺序", description: "自己拖动排序" },
+            { label: "按价格排序" },
+          ],
+          multiSelect: true,
+          allowOther: false,
+          allowEmpty: false,
+        },
+      ],
+    });
+    const multiCard = buildQuestionCard({
+      requestId: "permission:paseo-question-q-multi-long",
+      token,
+      title: "多选",
+      questions: multiForms,
+    });
+    const checkers = collectElements(multiCard, "checker");
+    assert.equal(checkers.length, 2);
+    assert.deepEqual(
+      checkers.map((checker) => (checker.text as { content?: string }).content),
+      ["选择", "选择"],
+    );
+    const markdown = collectElements(multiCard, "markdown")
+      .map((element) => String(element.content ?? ""))
+      .join("\n");
+    assert.match(markdown, /手动调整展示顺序/);
+    assert.match(markdown, /自己拖动排序/);
+    assert.match(markdown, /按价格排序/);
   });
 
   it("adds the request token to form submit names", () => {
@@ -97,7 +195,7 @@ describe("buildQuestionCard", () => {
     assert.ok(formsInCard.some((form) => form.name === `other_0_${token}`));
     assert.ok(formsInCard.some((form) => form.name === `multi_1_${token}`));
     const submits = formsInCard.flatMap((form) =>
-      form.elements.filter((element) => element.tag === "button" && element.name),
+      collectElements(form, "button").filter((element) => element.name),
     );
     assert.ok(submits.some((button) => button.name === `submit_other_0_${token}`));
     assert.ok(submits.some((button) => button.name === `submit_multi_1_${token}`));
@@ -105,10 +203,8 @@ describe("buildQuestionCard", () => {
 
   it("adds a skip button for an empty question", () => {
     const body = card.body as { elements: Record<string, unknown>[] };
-    const skipButtons = body.elements.filter(
-      (element) =>
-        element.tag === "button" &&
-        (element.text as { content?: string } | undefined)?.content === "跳过",
+    const skipButtons = collectElements(card, "button").filter(
+      (element) => (element.text as { content?: string } | undefined)?.content === "跳过",
     );
     assert.equal(skipButtons.length, 1);
   });
