@@ -73,48 +73,22 @@ export const MENTION_ON_REPLY_OPTIONS: ReadonlyArray<{
 ];
 
 /**
- * Reply-style presets are appended to the agent's system prompt. They are
- * instructions to the main turn only — no second model call, no extra cost.
+ * Legacy v2 reply-style preset texts. Kept only for the settings migration:
+ * bindings stored under version ≤ 2 fold their `replyStyle` choice into the
+ * equivalent `replyInstruction` prompt text.
  */
-export const replyStyleSchema = z.enum(["default", "concise", "plain", "custom"]);
-export type ReplyStyle = z.output<typeof replyStyleSchema>;
+const LEGACY_CONCISE_INSTRUCTION =
+  "回答控制在 3-5 句：先给结论，再给关键下一步或注意事项。只保留必要的细节，不要复述分析过程；代码块、命令、文件路径和链接原样保留，不要省略。";
+const LEGACY_PLAIN_INSTRUCTION =
+  "面向非技术同事解释：先说结论，以及这对用户意味着什么、需要做什么。少用术语；必须使用术语时用一句话解释。代码块、命令、文件路径和链接原样保留。";
 
-export const REPLY_STYLE_OPTIONS: ReadonlyArray<{
-  value: ReplyStyle;
-  label: string;
-  hint: string;
-}> = [
-  { value: "default", label: "默认", hint: "不追加额外要求，沿用智能体自己的回答风格。" },
-  {
-    value: "concise",
-    label: "简洁结论",
-    hint: "3-5 句，先给结论和下一步；代码、命令、路径保留。",
-  },
-  {
-    value: "plain",
-    label: "通俗解释",
-    hint: "面向非技术同事，少用术语；代码、命令、路径保留。",
-  },
-  {
-    value: "custom",
-    label: "自定义",
-    hint: "在下方填写自己的回复要求，会追加到系统提示末尾；留空则不追加。",
-  },
-];
-
-/** Prompt text appended for a reply style; empty for default or blank custom. */
-export function replyStyleInstruction(style: ReplyStyle, custom: string): string {
-  switch (style) {
-    case "concise":
-      return "回答控制在 3-5 句：先给结论，再给关键下一步或注意事项。只保留必要的细节，不要复述分析过程；代码块、命令、文件路径和链接原样保留，不要省略。";
-    case "plain":
-      return "面向非技术同事解释：先说结论，以及这对用户意味着什么、需要做什么。少用术语；必须使用术语时用一句话解释。代码块、命令、文件路径和链接原样保留。";
-    case "custom":
-      return custom.trim();
-    default:
-      return "";
-  }
-}
+/**
+ * Prompt text appended to the main turn's system prompt («### 回复要求»).
+ * Empty (default) appends nothing — the model keeps its own answer style.
+ * The rewrite pass also uses it as its default instruction (before the
+ * built-in DEFAULT_REWRITE_INSTRUCTION fallback), so one prompt shapes both
+ * turns unless `rewriteInstruction` / `rewriteIgnoreStyle` override it.
+ */
 
 /**
  * Optional post-processing pass: run one extra model turn over the final
@@ -250,12 +224,11 @@ export const chatBindingSchema = z.object({
   /** Optional system prompt for this chat; replaces the plugin default when set. */
   systemPrompt: z.string().default(""),
   /**
-   * Appended to the effective system prompt as an extra reply-style
-   * instruction. `custom` uses replyStylePrompt below.
+   * Prompt appended to the effective system prompt as a «### 回复要求»
+   * section; empty appends nothing. Replaces the v2 replyStyle preset +
+   * replyStylePrompt pair with one plain prompt box.
    */
-  replyStyle: replyStyleSchema.default("default"),
-  /** Custom reply instruction; only used when replyStyle is `custom`. */
-  replyStylePrompt: z.string().default(""),
+  replyInstruction: z.string().default(""),
   /** Optional AI rewrite of the final answer before sending it to Feishu. */
   replyRewrite: replyRewriteSchema.default("off"),
   /** Provider used only for the rewrite; empty follows the main binding. */
@@ -411,19 +384,46 @@ export const DEFAULT_BOT_VALUES: BotValues = botValuesSchema.parse({});
 export const larkBotSettings = defineSettings({
   id: "lark_bot",
   scope: "host",
-  version: 2,
+  version: 3,
   schema: botValuesSchema,
   /**
    * v1 had independent `ackReaction` / `ackOnReceive` flags, so both could be
    * on at once. Collapse them into one mode; when both were enabled the emoji
    * wins, because the duplicate text ack was the reason for this change.
+   *
+   * v2 replaced the replyStyle preset enum + replyStylePrompt pair with a
+   * single `replyInstruction` prompt box: `custom` keeps its prompt text,
+   * `concise`/`plain` fold into their preset texts, `default` becomes empty.
    */
   migrate: (values, fromVersion) => {
-    if (fromVersion !== 1 || !values || typeof values !== "object") return values;
-    const { ackReaction, ackOnReceive, ...rest } = values as Record<string, unknown>;
-    const reaction = ackReaction !== false;
-    const text = ackOnReceive === true;
-    return { ...rest, ackMode: text && !reaction ? "text" : reaction ? "reaction" : "off" };
+    if (!values || typeof values !== "object") return values;
+    let next = values as Record<string, unknown>;
+    if (fromVersion === 1) {
+      const { ackReaction, ackOnReceive, ...rest } = next;
+      const reaction = ackReaction !== false;
+      const text = ackOnReceive === true;
+      next = { ...rest, ackMode: text && !reaction ? "text" : reaction ? "reaction" : "off" };
+    }
+    if (fromVersion <= 2) {
+      const chats = Array.isArray(next.chats) ? next.chats : [];
+      next = {
+        ...next,
+        chats: chats.map((chat) => {
+          if (!chat || typeof chat !== "object") return chat;
+          const { replyStyle, replyStylePrompt, ...rest } = chat as Record<string, unknown>;
+          const instruction =
+            replyStyle === "custom"
+              ? String(replyStylePrompt ?? "").trim()
+              : replyStyle === "concise"
+                ? LEGACY_CONCISE_INSTRUCTION
+                : replyStyle === "plain"
+                  ? LEGACY_PLAIN_INSTRUCTION
+                  : "";
+          return { ...rest, replyInstruction: instruction };
+        }),
+      };
+    }
+    return next;
   },
 });
 

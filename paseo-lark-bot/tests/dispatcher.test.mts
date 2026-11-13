@@ -43,8 +43,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
-        replyStyle: "default",
-        replyStylePrompt: "",
+        replyInstruction: "",
         replyRewrite: "off",
         rewriteProvider: "",
         rewriteModel: "",
@@ -336,8 +335,7 @@ describe("createDispatcher", () => {
       replyRewrite: "always",
       rewriteProvider: "",
       rewriteModel: "",
-      replyStyle: "custom",
-      replyStylePrompt: "用三句话回答",
+      replyInstruction: "用三句话回答",
     };
     const seen: RewriteReplyOptions[] = [];
     const h = makeHarness(values, {
@@ -365,8 +363,7 @@ describe("createDispatcher", () => {
       replyRewrite: "always",
       rewriteProvider: "",
       rewriteModel: "",
-      replyStyle: "custom",
-      replyStylePrompt: "用三句话回答",
+      replyInstruction: "用三句话回答",
       rewriteIgnoreStyle: true,
     };
     let seenInstruction = "";
@@ -392,8 +389,7 @@ describe("createDispatcher", () => {
       replyRewrite: "always",
       rewriteProvider: "",
       rewriteModel: "",
-      replyStyle: "custom",
-      replyStylePrompt: "用三句话回答",
+      replyInstruction: "用三句话回答",
       rewriteIgnoreStyle: true,
       rewriteInstruction: "面向非技术同事，不超过 150 字",
     };
@@ -1551,8 +1547,7 @@ describe("p2p and delivery hygiene", () => {
         allowedUsers: [],
         cwd: "/tmp/project",
         systemPrompt: "",
-        replyStyle: "default",
-        replyStylePrompt: "",
+        replyInstruction: "",
         replyRewrite: "off",
         rewriteProvider: "",
         rewriteModel: "",

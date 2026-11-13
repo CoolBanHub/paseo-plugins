@@ -5,7 +5,6 @@ import {
   botValuesSchema,
   isDshProvider,
   larkBotSettings,
-  replyStyleInstruction,
 } from "../shared/settings.ts";
 
 describe("chat binding schema", () => {
@@ -22,8 +21,7 @@ describe("chat binding schema", () => {
     // Existing cwd/system-prompt/reply-format defaults are unchanged.
     assert.equal(binding.cwd, "");
     assert.equal(binding.systemPrompt, "");
-    assert.equal(binding.replyStyle, "default");
-    assert.equal(binding.replyStylePrompt, "");
+    assert.equal(binding.replyInstruction, "");
     assert.equal(binding.replyRewrite, "off");
     assert.equal(binding.rewriteProvider, "");
     assert.equal(binding.rewriteModel, "");
@@ -78,12 +76,30 @@ describe("chat binding schema", () => {
     assert.equal(binding.issueAiModel, "gpt-5-mini");
   });
 
-  it("maps reply-style presets to prompt text and trims custom text", () => {
-    assert.equal(replyStyleInstruction("default", "ignored"), "");
-    assert.match(replyStyleInstruction("concise", ""), /3-5 句/);
-    assert.match(replyStyleInstruction("plain", ""), /非技术同事/);
-    assert.equal(replyStyleInstruction("custom", "  用三句话回答  "), "用三句话回答");
-    assert.equal(replyStyleInstruction("custom", "   "), "");
+  it("folds v2 reply-style presets into replyInstruction on migration", () => {
+    const migrate = larkBotSettings.migrate;
+    assert.ok(migrate);
+    const migrated = migrate(
+      {
+        chats: [
+          { chatId: "oc_1", provider: "dsh", replyStyle: "default", replyStylePrompt: "ignored" },
+          { chatId: "oc_2", provider: "dsh", replyStyle: "concise", replyStylePrompt: "" },
+          { chatId: "oc_3", provider: "dsh", replyStyle: "plain", replyStylePrompt: "" },
+          { chatId: "oc_4", provider: "dsh", replyStyle: "custom", replyStylePrompt: "  用三句话回答  " },
+          { chatId: "oc_5", provider: "dsh", replyStyle: "custom", replyStylePrompt: "   " },
+        ],
+      },
+      2,
+    ) as { chats: Array<{ chatId: string; replyInstruction: string; replyStyle?: unknown }> };
+    assert.equal(migrated.chats[0]?.replyInstruction, "");
+    assert.ok(!("replyStyle" in (migrated.chats[0] ?? {})));
+    assert.match(migrated.chats[1]?.replyInstruction ?? "", /3-5 句/);
+    assert.match(migrated.chats[2]?.replyInstruction ?? "", /非技术同事/);
+    assert.equal(migrated.chats[3]?.replyInstruction, "用三句话回答");
+    assert.equal(migrated.chats[4]?.replyInstruction, "");
+
+    const parsed = botValuesSchema.parse(migrated);
+    assert.equal(parsed.chats[4]?.replyInstruction, "");
   });
 
   it("keeps an explicit allowlist and trims nothing implicitly", () => {
@@ -136,7 +152,7 @@ describe("chat binding schema", () => {
   });
 
   it("migrates v1 ack flags into one mutually exclusive mode", async () => {
-    assert.equal(larkBotSettings.version, 2);
+    assert.equal(larkBotSettings.version, 3);
     const migrate = larkBotSettings.migrate;
     assert.ok(migrate);
     const at = async (values: Record<string, unknown>) =>
@@ -154,6 +170,14 @@ describe("chat binding schema", () => {
     assert.equal(migrated.enabled, false);
     assert.equal("ackReaction" in migrated, false);
     assert.equal("ackOnReceive" in migrated, false);
+
+    // v1 values also pass through the v2→v3 reply-style fold.
+    const v1Chats = await at({
+      chats: [{ chatId: "oc_1", provider: "dsh", replyStyle: "plain", replyStylePrompt: "" }],
+    });
+    const chat = (v1Chats.chats as Array<Record<string, unknown>>)[0];
+    assert.match(String(chat.replyInstruction), /非技术同事/);
+    assert.ok(!("replyStyle" in chat));
   });
 
   it("defaults completion mentions off and preserves a per-chat choice", () => {

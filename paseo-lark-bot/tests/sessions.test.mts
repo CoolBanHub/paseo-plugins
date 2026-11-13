@@ -72,8 +72,7 @@ const binding: ChatBinding = {
   allowedUsers: [],
   cwd: "/tmp/project",
   systemPrompt: "用中文回答",
-  replyStyle: "default",
-  replyStylePrompt: "",
+  replyInstruction: "",
   replyRewrite: "off",
   rewriteProvider: "",
   rewriteModel: "",
@@ -1718,44 +1717,30 @@ describe("default system prompt", () => {
     assert.equal(h.created[0].config.systemPrompt, "用中文回答");
   });
 
-  it("appends a preset reply-style instruction after the system prompt", async () => {
+  it("appends the reply instruction after the system prompt", async () => {
     const h = makeHarness();
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
       ...binding,
-      replyStyle: "concise",
+      replyInstruction: "用 3-5 句回答，先说结论",
     });
     await flush();
     const prompt = h.created[0].config.systemPrompt ?? "";
     assert.match(prompt, /^用中文回答/);
-    assert.match(prompt, /### 回复风格/);
+    assert.match(prompt, /### 回复要求/);
     assert.match(prompt, /3-5 句/);
-  });
-
-  it("appends a custom reply-style prompt", async () => {
-    const h = makeHarness();
-    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
-      ...binding,
-      replyStyle: "custom",
-      replyStylePrompt: "  用三句话回答  ",
-      replyRewrite: "off",
-      rewriteProvider: "",
-      rewriteModel: "",
-    });
-    await flush();
-    assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);
   });
 
   it("keeps the dedicated rewrite instruction out of the system prompt", async () => {
     const h = makeHarness();
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
       ...binding,
-      replyStyle: "default",
+      replyInstruction: "",
       replyRewrite: "always",
       rewriteInstruction: "面向非技术同事，不超过 150 字",
     });
     await flush();
     const prompt = h.created[0].config.systemPrompt ?? "";
-    assert.doesNotMatch(prompt, /### 回复风格/);
+    assert.doesNotMatch(prompt, /### 回复要求/);
     assert.doesNotMatch(prompt, /面向非技术同事/);
   });
 

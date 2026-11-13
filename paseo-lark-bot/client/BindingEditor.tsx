@@ -4,7 +4,6 @@ import type { LarkBotChatMember, LarkBotProviderInfo } from "../shared/contracts
 import {
   MENTION_ON_REPLY_OPTIONS,
   REPLY_REWRITE_OPTIONS,
-  REPLY_STYLE_OPTIONS,
   type ChatBinding,
   type ReplyFormat,
 } from "../shared/settings.ts";
@@ -148,7 +147,6 @@ export function BindingEditor({
   const thinkingValue = binding.thinkingOptionId
     ? thinkingOptions.find((option) => option.id === binding.thinkingOptionId)?.label ?? `${unknownThinking}（未在列表）`
     : thinkingDefaultLabel;
-  const styleValue = REPLY_STYLE_OPTIONS.find((style) => style.value === binding.replyStyle)?.label ?? binding.replyStyle;
   const rewriteValue = REPLY_REWRITE_OPTIONS.find((option) => option.value === binding.replyRewrite)?.label ?? binding.replyRewrite;
   const rewriteModelTone: "default" | "warning" = unknownRewriteProvider || unknownRewriteModel ? "warning" : "default";
   const rewriteModelValue = !binding.rewriteProvider
@@ -334,43 +332,19 @@ export function BindingEditor({
       </Card>
 
       <Card>
-        <CardTitle text="回复呈现" hint="回答的风格、长度、格式与完成提醒；点一行展开选择" />
-        <SelectRow
-          label="回复风格"
-          value={styleValue}
-          expanded={openField === "style"}
-          onPress={() => toggleField("style")}
-        >
-          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-            {REPLY_STYLE_OPTIONS.map((style) => (
-              <ChoicePill
-                key={style.value}
-                label={style.label}
-                active={binding.replyStyle === style.value}
-                onPress={() => onPatch({ replyStyle: style.value })}
-              />
-            ))}
-          </View>
-          <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
-            {REPLY_STYLE_OPTIONS.find((style) => style.value === binding.replyStyle)?.hint ?? ""}
-          </Text>
-          <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
-            风格是提示词，模型可能不完全遵守；保存后对新建会话生效，已有话题可发 /new 重建。硬性长度限制可在全局设置里调小「单条回复长度」。
-          </Text>
-        </SelectRow>
-        {binding.replyStyle === "custom" ? (
-          <>
-            <FieldLabel text="自定义回复要求" />
-            <TextInput
-              value={binding.replyStylePrompt}
-              placeholder="例：用 3-5 句中文回答，先说结论，面向非技术同事，保留代码和命令"
-              placeholderTextColor={colors().foregroundMuted}
-              multiline
-              onChangeText={(text) => onPatch({ replyStylePrompt: text })}
-              style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
-            />
-          </>
-        ) : null}
+        <CardTitle text="回复呈现" hint="回答的风格、长度、格式与完成提醒" />
+        <FieldLabel text="回复提示词" />
+        <TextInput
+          value={binding.replyInstruction}
+          placeholder="例：用 3-5 句中文回答，先说结论，面向非技术同事，保留代码和命令；留空则不追加任何要求"
+          placeholderTextColor={colors().foregroundMuted}
+          multiline
+          onChangeText={(text) => onPatch({ replyInstruction: text })}
+          style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
+        />
+        <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
+          追加到系统提示末尾，直接决定回答风格；AI 改写默认也按它改写。提示词模型可能不完全遵守；保存后对新建会话生效，已有话题可发 /new 重建。硬性长度限制可在全局设置里调小「单条回复长度」。
+        </Text>
 
         <SelectRow
           label="AI 改写"
@@ -460,18 +434,18 @@ export function BindingEditor({
             <FieldLabel text="改写专用指令" />
             <TextInput
               value={binding.rewriteInstruction}
-              placeholder="例：面向非技术同事，不超过 150 字，最多保留一条必要链接；留空则沿用回复风格"
+              placeholder="例：面向非技术同事，不超过 150 字，最多保留一条必要链接；留空则沿用回复提示词"
               placeholderTextColor={colors().foregroundMuted}
               multiline
               onChangeText={(text) => onPatch({ rewriteInstruction: text })}
               style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
             />
             <Text style={{ fontSize: 11, color: colors().foregroundMuted, lineHeight: 17 }}>
-              只作用于改写，不进入主回答的系统提示；填写后优先于回复风格与「改写不套用回复风格」。
+              只作用于改写，不进入主回答的系统提示；填写后优先于回复提示词与「改写不套用回复提示词」。
             </Text>
             <ToggleRow
-              label="改写不套用回复风格"
-              hint="开启后改写只压缩长度，保持原文的语气与术语深度；不注入回复风格，风格为「默认」时也不用内置的通俗化指令"
+              label="改写不套用回复提示词"
+              hint="开启后改写只压缩长度，保持原文的语气与术语深度；不用回复提示词，回复提示词为空时也不用内置的通俗化指令"
               value={binding.rewriteIgnoreStyle}
               onChange={(value) => onPatch({ rewriteIgnoreStyle: value })}
             />

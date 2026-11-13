@@ -4,7 +4,6 @@ import { dirname, join } from "node:path";
 import {
   DSH_DEFAULT_PERMISSION,
   isDshProvider,
-  replyStyleInstruction,
   type ChatBinding,
   type ReplyFormat,
 } from "../shared/settings.ts";
@@ -192,9 +191,9 @@ function providerCreateConfig(
       issueHelperPath,
       binding.issueTracking === "auto",
     );
-  const styleInstruction = replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt);
   const promptParts = [basePrompt];
-  if (styleInstruction) promptParts.push(`### 回复风格\n${styleInstruction}`);
+  const replyInstruction = binding.replyInstruction.trim();
+  if (replyInstruction) promptParts.push(`### 回复要求\n${replyInstruction}`);
   if (mentionHelper && binding.systemPrompt?.trim()) {
     promptParts.push(
       "### @ 群成员\n" +
