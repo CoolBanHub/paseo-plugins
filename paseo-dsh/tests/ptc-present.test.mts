@@ -136,7 +136,6 @@ test("PTC sub-calls reach Paseo as detailed timeline rows", async () => {
     assert.match(bridgeSource, /job\/registered/);
     assert.match(bridgeSource, /subagent\/start/);
     assert.match(bridgeSource, /commands\.execute/);
-    assert.match(bridgeSource, /planMode\.set/);
 
     const session = await conn.connection.newSession({
       cwd: "/tmp",

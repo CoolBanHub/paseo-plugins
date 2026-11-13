@@ -210,28 +210,12 @@ test("connector adapts dsh ACP for Paseo", async (t) => {
       "selected permission is forwarded to the dsh bridge",
     );
 
-    // Plan mode is exposed as a session toggle beside the permission preset.
-    const planOption = (real.configOptions ?? []).find((option) => option.id === "paseo_dsh_plan_mode");
-    assert.ok(planOption?.type === "boolean", "plan mode is a boolean config option");
-    assert.equal(planOption?.currentValue, false, "new sessions start outside plan mode");
-    const changedPlan = await first.connection.setSessionConfigOption({
-      sessionId: real.sessionId,
-      configId: "paseo_dsh_plan_mode",
-      type: "boolean",
-      value: true,
-    } as never);
-    const selectedPlan = changedPlan.configOptions.find((option) => option.id === "paseo_dsh_plan_mode");
-    assert.equal(
-      selectedPlan?.type === "boolean" && selectedPlan.currentValue,
-      true,
-      "Paseo receives the selected plan mode value",
+    // Plan mode is not a composer toggle: dsh itself enters it only through
+    // the /plan command, so no boolean session setting is injected.
+    assert.ok(
+      !(real.configOptions ?? []).some((option) => option.id === "paseo_dsh_plan_mode"),
+      "no plan mode toggle is injected into the session settings",
     );
-    const planFile = readdirSync(join(home, "plugin-data", "dsh"))
-      .find((file) => file.startsWith("plan-control-"));
-    assert.ok(planFile, "per-process plan control file exists");
-    const planSelection = JSON.parse(readFileSync(join(home, "plugin-data", "dsh", planFile!), "utf8"))[real.sessionId];
-    assert.equal(planSelection?.active, true, "plan mode selection is forwarded to the dsh bridge");
-    assert.equal(typeof planSelection?.requestId, "string", "each user toggle carries a fresh bridge request id");
 
     // Session imports carry the title and activity from dsh's projection cache.
     const projectionDir = join(home, "storages", "session_projcache", "sessions");

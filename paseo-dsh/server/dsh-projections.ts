@@ -5,9 +5,9 @@ import { dshHomePath, dshSessionUpdatedAt } from "./probe-cleanup.ts";
 /**
  * dsh keeps a durable per-session projection cache next to the session logs.
  * It carries the values its own web client lists: the generated title, the
- * last prompt time, plan mode, the current goal and the subagent catalog.
- * Reading it is much cheaper than replaying a whole session log, so Paseo's
- * session picker can show real titles instead of bare session ids.
+ * last prompt time, the current goal and the subagent catalog. Reading it is
+ * much cheaper than replaying a whole session log, so Paseo's session picker
+ * can show real titles instead of bare session ids.
  */
 
 interface ProjectionRow {
@@ -45,20 +45,9 @@ function stringValue(row: ProjectionRow | undefined): string | undefined {
   return typeof row?.val === "string" ? row.val : undefined;
 }
 
-function booleanValue(row: ProjectionRow | undefined): boolean | undefined {
-  return typeof row?.val === "boolean" ? row.val : undefined;
-}
-
 export function dshSessionTitle(sessionId: string): string | undefined {
   const title = stringValue(readDshProjection(sessionId)?.title)?.trim();
   return title ? title : undefined;
-}
-
-export function dshSessionPlanActive(sessionId: string): boolean | undefined {
-  const plan = readDshProjection(sessionId)?.plan?.val;
-  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return undefined;
-  const active = (plan as Record<string, unknown>).active;
-  return typeof active === "boolean" ? active : undefined;
 }
 
 /** Cached last-prompt time, falling back to the session log's mtime. */

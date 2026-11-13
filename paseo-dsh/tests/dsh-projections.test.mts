@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   dshSessionLastActivity,
-  dshSessionPlanActive,
   dshSessionTitle,
   dshSubagentCatalog,
 } from "../server/dsh-projections.ts";
@@ -18,11 +17,10 @@ function homeWithProjection(sessionId: string, rows: Record<string, unknown>): s
   return home;
 }
 
-test("projection cache supplies session titles, activity, plan and subagents", (t) => {
+test("projection cache supplies session titles, activity and subagents", (t) => {
   const sessionId = "session-abc";
   const home = homeWithProjection("session-abc", {
     title: { val: "Fix the login flow" },
-    plan: { val: { active: true } },
     sessionListMetadata: { val: { lastPromptAt: 1_700_000_000_000 } },
     subagentCatalog: { val: { head: { values: [
       { childId: "child-1", label: "Review memory", mode: "continuable" },
@@ -37,7 +35,6 @@ test("projection cache supplies session titles, activity, plan and subagents", (
   });
 
   assert.equal(dshSessionTitle(sessionId), "Fix the login flow");
-  assert.equal(dshSessionPlanActive(sessionId), true);
   assert.equal(dshSessionLastActivity(sessionId), new Date(1_700_000_000_000).toISOString());
   assert.deepEqual(dshSubagentCatalog(sessionId), [
     { childId: "child-1", label: "Review memory", mode: "continuable" },
@@ -54,7 +51,6 @@ test("missing or malformed projections degrade to undefined/empty", (t) => {
     rmSync(home, { recursive: true, force: true });
   });
   assert.equal(dshSessionTitle("missing"), undefined);
-  assert.equal(dshSessionPlanActive("missing"), undefined);
   assert.equal(dshSessionLastActivity("missing"), undefined);
   assert.deepEqual(dshSubagentCatalog("missing"), []);
 });

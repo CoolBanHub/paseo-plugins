@@ -24,7 +24,7 @@ import { resolveModelOverlay } from "./dsh-catalog.ts";
 import { DSH_PTC_CALL_METHOD, DSH_PTC_RESULT_METHOD } from "./ptc-present.ts";
 import { DSH_TOOL_CALL_METHOD, DSH_TOOL_RESULT_METHOD } from "./tool-present.ts";
 import { DSH_EVENT_METHOD } from "./dsh-events.ts";
-import { dshSessionLastActivity, dshSessionPlanActive, dshSessionTitle } from "./dsh-projections.ts";
+import { dshSessionLastActivity, dshSessionTitle } from "./dsh-projections.ts";
 import { cancelAllDshQuestions, cancelDshQuestion, registerDshQuestion } from "./dsh-questions.ts";
 import { SidecarTail, type SidecarTailRecord } from "./sidecar-tail.ts";
 import {
@@ -34,9 +34,6 @@ import {
   PERMISSION_SETTING_DESCRIPTION,
   PERMISSION_SETTING_ID,
   PERMISSION_SETTING_NAME,
-  PLAN_SETTING_DESCRIPTION,
-  PLAN_SETTING_ID,
-  PLAN_SETTING_NAME,
 } from "./dsh-labels.ts";
 import type { DshModeId } from "./dsh-labels.ts";
 import {
@@ -171,7 +168,6 @@ const REWIND_PLAIN = new Set(["session/start","session/create","session/end-seed
   "session-log-deepseek/delivery-accepted"]);
 const permissionAgents = new Map();
 const appliedPermissions = new Map();
-const appliedPlanRequests = new Map();
 const toolCalls = new Map();
 const subagentRuns = new Map();
 const startedRuns = new Set();
@@ -183,7 +179,6 @@ const eventFile = process.env.DSH_EVENT_FILE;
 const requestDir = process.env.DSH_BRIDGE_REQUEST_DIR;
 const responseDir = process.env.DSH_BRIDGE_RESPONSE_DIR;
 const commandCatalogFile = process.env.DSH_COMMAND_CATALOG_FILE;
-const planControlFile = process.env.DSH_PLAN_CONTROL_FILE;
 const receiptFile = process.env.DSH_RECEIPT_FILE;
 let questionSeq = 0;
 let pollTick = 0;
@@ -309,12 +304,6 @@ function selectedPermissions() {
   return parsed && typeof parsed === "object" ? parsed : {};
 }
 
-function planSelections() {
-  if (!planControlFile) return {};
-  const parsed = readJson(planControlFile);
-  return parsed && typeof parsed === "object" ? parsed : {};
-}
-
 async function writeCatalog(ctx) {
   if (!catalogFile) return;
   try {
@@ -341,25 +330,6 @@ async function applyPermission(ctx, agent, preset) {
     await writeCatalog(ctx);
   } catch (error) {
     ctx.logger.warn("paseo-dsh: permission preset could not be applied", { preset, error });
-  }
-}
-
-async function applyPlanRequest(ctx, agent, entry) {
-  if (!entry || typeof entry !== "object") return;
-  const active = entry.active;
-  const requestId = entry.requestId;
-  // A request id makes a repeated user toggle apply even when its value
-  // equals the previous one; entries without one are only UI state.
-  if (typeof active !== "boolean" || typeof requestId !== "string") return;
-  const sessionId = agent.session.id;
-  if (appliedPlanRequests.get(sessionId) === requestId) return;
-  const planMode = ctx.get("planMode");
-  if (!planMode || typeof planMode.set !== "function") return;
-  try {
-    planMode.set(agent, active);
-    appliedPlanRequests.set(sessionId, requestId);
-  } catch (error) {
-    ctx.logger.warn("paseo-dsh: plan mode could not be applied", { active, error });
   }
 }
 
@@ -850,7 +820,7 @@ function questionBridge(ctx) {
   });
 }
 
-// Commands and plan-mode changes arrive as request files from the connector.
+// Commands arrive as request files from the connector.
 async function processRequests(ctx) {
   if (processingRequests || !requestDir || !responseDir) return;
   processingRequests = true;
@@ -870,13 +840,7 @@ async function processRequests(ctx) {
       const requestId = typeof request.requestId === "string" ? request.requestId : name.slice(0, -5);
       const responseFile = join(responseDir, requestId + ".json");
       try {
-        if (request.kind === "plan") {
-          const agent = permissionAgents.get(request.sessionId);
-          const planMode = ctx.get("planMode");
-          if (!agent || !planMode || typeof planMode.set !== "function") throw new Error("plan mode is not available in this preset");
-          planMode.set(agent, request.active === true);
-          writeJson(responseFile, { ok: true });
-        } else if (request.kind === "command") {
+        if (request.kind === "command") {
           const agent = permissionAgents.get(request.sessionId);
           const commands = ctx.get("commands");
           if (!agent || !commands || typeof commands.execute !== "function") throw new Error("commands are not available in this preset");
@@ -934,7 +898,6 @@ export function apply(ctx) {
     else await ctx.agentPresets.select(agent, preset);
     permissionAgents.set(agent.session.id, agent);
     await applyPermission(ctx, agent, selectedPermissions()[agent.session.id]);
-    await applyPlanRequest(ctx, agent, planSelections()[agent.session.id]);
     await writeCatalog(ctx);
     writeCommandCatalog(ctx);
   });
@@ -944,12 +907,6 @@ export function apply(ctx) {
     const selections = selectedPermissions();
     for (const entry of permissionAgents) {
       void applyPermission(ctx, entry[1], selections[entry[0]]);
-    }
-    // Each Paseo toggle carries a fresh request id, so dsh's own /plan
-    // changes are never overwritten by a stale control value.
-    const plans = planSelections();
-    for (const entry of permissionAgents) {
-      void applyPlanRequest(ctx, entry[1], plans[entry[0]]);
     }
     void processRequests(ctx);
     if (pollTick % 10 === 0) writeCommandCatalog(ctx);
@@ -1063,21 +1020,10 @@ function permissionConfigOption(
   };
 }
 
-function planConfigOption(active: boolean): ConfigOption {
-  return {
-    id: PLAN_SETTING_ID,
-    name: PLAN_SETTING_NAME,
-    description: PLAN_SETTING_DESCRIPTION,
-    type: "boolean",
-    currentValue: active,
-  };
-}
-
 function decorateConfigOptions(
   source: unknown,
   permissionOptions: Array<{ value: string; name: string }>,
   currentPermission: string,
-  planActive: boolean,
 ): ConfigOption[] {
   const options = Array.isArray(source) ? source as ConfigOption[] : [];
   const insert = (next: ConfigOption[], setting: ConfigOption): ConfigOption[] => {
@@ -1086,22 +1032,10 @@ function decorateConfigOptions(
     next[existing] = setting;
     return next;
   };
-  return insert(
-    insert([...options], permissionConfigOption(permissionOptions, currentPermission)),
-    planConfigOption(planActive),
-  );
+  return insert([...options], permissionConfigOption(permissionOptions, currentPermission));
 }
 
 function writePermissionSelections(file: string, selections: Map<string, string>): void {
-  const temporaryFile = `${file}.tmp`;
-  writeFileSync(temporaryFile, JSON.stringify(Object.fromEntries(selections)), { mode: 0o600 });
-  renameSync(temporaryFile, file);
-}
-
-function writePlanSelections(
-  file: string,
-  selections: Map<string, { active: boolean; requestId?: string }>,
-): void {
   const temporaryFile = `${file}.tmp`;
   writeFileSync(temporaryFile, JSON.stringify(Object.fromEntries(selections)), { mode: 0o600 });
   renameSync(temporaryFile, file);
@@ -1491,14 +1425,12 @@ export function createDshConnector(
     const bridgeRequestDir = join(dataDir, `bridge-requests-${bridgeId}`);
     const bridgeResponseDir = join(dataDir, `bridge-responses-${bridgeId}`);
     const commandCatalogFile = join(dataDir, `command-catalog-${randomUUID()}.json`);
-    const planControlFile = join(dataDir, `plan-control-${randomUUID()}.json`);
     const receiptFile = join(dataDir, `file-receipts-conn-${bridgeId}.jsonl`);
     const persistentReceiptDir = join(dataDir, "file-receipts");
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(bridgeRequestDir, { recursive: true });
     mkdirSync(bridgeResponseDir, { recursive: true });
     writeFileSync(permissionControlFile, "{}", { mode: 0o600 });
-    writeFileSync(planControlFile, "{}", { mode: 0o600 });
     writeFileSync(commandCatalogFile, "{}", { mode: 0o600 });
     writeFileSync(ptcEventFile, "", { mode: 0o600 });
     writeFileSync(eventFile, "", { mode: 0o600 });
@@ -1512,7 +1444,6 @@ export function createDshConnector(
     env.DSH_BRIDGE_REQUEST_DIR = bridgeRequestDir;
     env.DSH_BRIDGE_RESPONSE_DIR = bridgeResponseDir;
     env.DSH_COMMAND_CATALOG_FILE = commandCatalogFile;
-    env.DSH_PLAN_CONTROL_FILE = planControlFile;
     env.DSH_RECEIPT_FILE = receiptFile;
     log("starting dsh acp", {
       node,
@@ -1564,7 +1495,6 @@ export function createDshConnector(
     child.once("exit", (code, signal) => {
       rmSync(permissionControlFile, { force: true });
       rmSync(permissionCatalogFile, { force: true });
-      rmSync(planControlFile, { force: true });
       rmSync(commandCatalogFile, { force: true });
       rmSync(receiptFile, { force: true });
       rmSync(bridgeRequestDir, { recursive: true, force: true });
@@ -1586,9 +1516,6 @@ export function createDshConnector(
     const tracked = new Map<string | number, TrackedRequest>();
     const sessionConfigOptions = new Map<string, ConfigOption[]>();
     const permissionSelections = new Map<string, string>();
-    // `requestId` is present only on a user toggle, so the bridge can tell a
-    // fresh request from the cached UI state.
-    const planSelections = new Map<string, { active: boolean; requestId?: string }>();
     const sessionCwds = new Map<string, string>();
     const launchPermission = launchContext?.settings?.[PERMISSION_SETTING_ID];
     const configuredPermission = typeof launchPermission === "string" ? launchPermission : undefined;
@@ -1755,7 +1682,6 @@ export function createDshConnector(
                 sessionConfigOptions.get(params.sessionId),
                 catalog.options,
                 params.value,
-                planSelections.get(params.sessionId)?.active ?? false,
               );
               sessionConfigOptions.set(params.sessionId, currentOptions);
               fromAgentController?.enqueue({
@@ -1764,33 +1690,6 @@ export function createDshConnector(
                 result: { configOptions: currentOptions },
               });
               log("changed dsh permission preset", { sessionId: params.sessionId, preset: params.value });
-              return;
-            }
-            if (params?.configId === PLAN_SETTING_ID) {
-              if (typeof params.sessionId !== "string" || typeof params.value !== "boolean") {
-                fromAgentController?.enqueue({
-                  jsonrpc: "2.0",
-                  id: message.id,
-                  error: { code: -32602, message: "Plan mode requires a session id and boolean value" },
-                });
-                return;
-              }
-              planSelections.set(params.sessionId, { active: params.value, requestId: randomUUID() });
-              writePlanSelections(planControlFile, planSelections);
-              const catalog = readPermissionCatalog(permissionCatalogFile);
-              const currentOptions = decorateConfigOptions(
-                sessionConfigOptions.get(params.sessionId),
-                catalog.options,
-                currentPermissionFor(params.sessionId, sessionCwds.get(params.sessionId), catalog),
-                params.value,
-              );
-              sessionConfigOptions.set(params.sessionId, currentOptions);
-              fromAgentController?.enqueue({
-                jsonrpc: "2.0",
-                id: message.id,
-                result: { configOptions: currentOptions },
-              });
-              log("changed dsh plan mode", { sessionId: params.sessionId, active: params.value });
               return;
             }
           }
@@ -2005,7 +1904,6 @@ export function createDshConnector(
                     update.configOptions,
                     catalog.options,
                     current,
-                    planSelections.get(sessionId)?.active ?? false,
                   );
                   update.configOptions = decorated;
                   sessionConfigOptions.set(sessionId, decorated);
@@ -2067,13 +1965,10 @@ export function createDshConnector(
                   const catalog = readPermissionCatalog(permissionCatalogFile);
                   const currentPermission = currentPermissionFor(sessionId, cwd, catalog);
                   permissionSelections.set(sessionId, currentPermission);
-                  const planActive = dshSessionPlanActive(sessionId) ?? planSelections.get(sessionId)?.active ?? false;
-                  planSelections.set(sessionId, { active: planActive });
                   const decorated = decorateConfigOptions(
                     result.configOptions,
                     catalog.options,
                     currentPermission,
-                    planActive,
                   );
                   result.configOptions = decorated;
                   sessionConfigOptions.set(sessionId, decorated);
@@ -2087,13 +1982,10 @@ export function createDshConnector(
                   sessionCwds.get(request.sessionId),
                   catalog,
                 );
-                const planActive = dshSessionPlanActive(request.sessionId) ?? planSelections.get(request.sessionId)?.active ?? false;
-                planSelections.set(request.sessionId, { active: planActive });
                 const decorated = decorateConfigOptions(
                   result.configOptions,
                   catalog.options,
                   currentPermission,
-                  planActive,
                 );
                 result.configOptions = decorated;
                 sessionConfigOptions.set(request.sessionId, decorated);
@@ -2218,7 +2110,6 @@ export function createDshConnector(
         }
         // Fall through: the transformer also renders a timeout notice.
       }
-      if (record.kind === "plan-mode") syncPlanSetting(sessionId, data);
       try {
         fromAgentController.enqueue({
           jsonrpc: "2.0",
@@ -2264,35 +2155,6 @@ export function createDshConnector(
         });
       } catch {
         // The stream is gone; nothing left to render.
-      }
-    }
-
-    /** Keep the Plan mode toggle in sync when dsh changes it itself (/plan). */
-    function syncPlanSetting(sessionId: string, data: Record<string, unknown>): void {
-      const active = data.active;
-      if (typeof active !== "boolean" || planSelections.get(sessionId)?.active === active) return;
-      // Keep a pending request id so a user toggle still reaches the bridge.
-      planSelections.set(sessionId, { ...planSelections.get(sessionId), active });
-      const catalog = readPermissionCatalog(permissionCatalogFile);
-      const options = decorateConfigOptions(
-        sessionConfigOptions.get(sessionId),
-        catalog.options,
-        currentPermissionFor(sessionId, sessionCwds.get(sessionId), catalog),
-        active,
-      );
-      sessionConfigOptions.set(sessionId, options);
-      if (!fromAgentController) return;
-      try {
-        fromAgentController.enqueue({
-          jsonrpc: "2.0",
-          method: "session/update",
-          params: {
-            sessionId,
-            update: { sessionUpdate: "config_option_update", configOptions: options },
-          },
-        });
-      } catch {
-        // The stream is gone; the next session open decorates from disk.
       }
     }
 

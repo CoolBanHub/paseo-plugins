@@ -51,17 +51,14 @@ const eventFile = join(home, "bridge-events.jsonl");
 const requestDir = join(home, "bridge-requests");
 const responseDir = join(home, "bridge-responses");
 const commandCatalogFile = join(home, "bridge-commands.json");
-const planControlFile = join(home, "bridge-plan.json");
 writeFileSync(eventFile, "");
 writeFileSync(commandCatalogFile, "{}");
-writeFileSync(planControlFile, "{}");
 mkdirSync(requestDir, { recursive: true });
 mkdirSync(responseDir, { recursive: true });
 process.env.DSH_EVENT_FILE = eventFile;
 process.env.DSH_BRIDGE_REQUEST_DIR = requestDir;
 process.env.DSH_BRIDGE_RESPONSE_DIR = responseDir;
 process.env.DSH_COMMAND_CATALOG_FILE = commandCatalogFile;
-process.env.DSH_PLAN_CONTROL_FILE = planControlFile;
 
 test.after(() => rmSync(home, { recursive: true, force: true }));
 
@@ -71,19 +68,12 @@ function fakeContext() {
   const handlers = new Map<string, Handler[]>();
   const calls = {
     commands: [] as string[],
-    plans: [] as boolean[],
   };
   const commands = {
     list: () => [{ name: "plan", description: "Toggle plan mode", input: { hint: "[off|message]" } }],
     execute: async (_agent: unknown, line: string) => {
       calls.commands.push(line);
       return { commandId: "command-1", result: { kind: "success", text: `ran ${line}` } };
-    },
-  };
-  const planMode = {
-    set: (_agent: unknown, active: boolean) => {
-      calls.plans.push(active);
-      return "committed";
     },
   };
   const ctx = {
@@ -95,7 +85,6 @@ function fakeContext() {
     },
     get(name: string) {
       if (name === "commands") return commands;
-      if (name === "planMode") return planMode;
       return undefined;
     },
     logger: { warn() {} },
@@ -142,7 +131,7 @@ function readEvents(): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-test("the installed bridge mirrors events, questions, commands and plan changes", async () => {
+test("the installed bridge mirrors events, questions and commands", async () => {
   const bridgePath = await generatedBridgePath();
   const bridge = await import(`${pathToFileURL(bridgePath).href}?v=${Date.now()}`) as {
     apply(ctx: unknown): void;
@@ -199,46 +188,19 @@ test("the installed bridge mirrors events, questions, commands and plan changes"
   }));
   assert.deepEqual(await answerPromise, { answers: [{ id: "q1", selected: ["Yes"] }] });
 
-  // Commands and plan changes are executed through the injected services.
+  // Commands are executed through the injected services.
   writeFileSync(join(requestDir, "cmd-test.json"), JSON.stringify({
     kind: "command",
     requestId: "cmd-test",
     sessionId: "session-1",
     line: "/plan off",
   }));
-  writeFileSync(join(requestDir, "plan-test.json"), JSON.stringify({
-    kind: "plan",
-    requestId: "plan-test",
-    sessionId: "session-1",
-    active: true,
-  }));
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.deepEqual(fake.calls.commands, ["/plan off"]);
-  assert.deepEqual(fake.calls.plans, [true]);
   assert.deepEqual(
     JSON.parse(readFileSync(join(responseDir, "cmd-test.json"), "utf8")),
     { ok: true, result: { kind: "success", text: "ran /plan off" } },
   );
-  assert.deepEqual(JSON.parse(readFileSync(join(responseDir, "plan-test.json"), "utf8")), { ok: true });
-
-  // Control-file plan toggles are applied once per request id. dsh changing
-  // plan mode itself (/plan) must not be undone by the previous request.
-  writeFileSync(planControlFile, JSON.stringify({
-    "session-1": { active: true, requestId: "plan-toggle-1" },
-  }));
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.deepEqual(fake.calls.plans, [true, true], "the control toggle is applied");
-  fake.emit("session/event", { header: { id: "session-1" } }, {
-    type: "plan/mode",
-    data: { active: false },
-  });
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.deepEqual(fake.calls.plans, [true, true], "a stale control toggle does not fight dsh's /plan");
-  writeFileSync(planControlFile, JSON.stringify({
-    "session-1": { active: true, requestId: "plan-toggle-2" },
-  }));
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.deepEqual(fake.calls.plans, [true, true, true], "a fresh toggle with the same value applies again");
 
   // The command catalog is available to the connector.
   await new Promise((resolve) => setTimeout(resolve, 1_200));

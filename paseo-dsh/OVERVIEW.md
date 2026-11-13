@@ -144,9 +144,11 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   `custom` field. `exit_plan_mode` uses the same channel, so plan review
   renders the plan in the timeline and accepts approve / keep-planning /
   feedback.
-- Plan mode is also a session toggle next to the permission preset. dsh's
-  own `/plan` changes flow back into the toggle, and dsh's command registry
-  is published as Paseo slash commands (`/plan`, `/compact`, `/goal`,
+- Plan mode has no composer toggle — dsh itself enters it only through `/plan`
+  and leaves with `/plan off`, so Paseo does not inject one (the 极简模式
+  preset does not even include plan mode). Entering or leaving through dsh's
+  own commands renders as a timeline notice. dsh's command registry is
+  published as Paseo slash commands (`/plan`, `/compact`, `/goal`,
   `/permission`, …). A slash command is executed by dsh's command service
   through the bridge instead of being sent to the model; the command's text
   result appears as a Paseo notice.
