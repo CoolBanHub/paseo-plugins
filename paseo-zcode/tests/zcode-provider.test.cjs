@@ -1590,6 +1590,10 @@ test("turn.completed reports decode speed from model stream timing", async (t) =
   });
   f.sessionEvent({
     type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 2_100,
+    payload: { kind: "reasoning_delta", assistantMessageId: "assistant-1", delta: "more" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-speed", timestamp: 2_100,
     payload: { kind: "finish", assistantMessageId: "assistant-1" },
   });
   f.sessionEvent({
@@ -1616,9 +1620,11 @@ test("decode speed aggregates every model request and skips tool-only requests",
   // Two content requests: 500ms + 1000ms of decode time.
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_000, payload: { kind: "start" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_100, payload: { kind: "text_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_600, payload: { kind: "text_delta", delta: "tail" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_600, payload: { kind: "finish" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_700, payload: { kind: "start" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 1_800, payload: { kind: "reasoning_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 2_800, payload: { kind: "reasoning_delta", delta: "tail" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-multi", timestamp: 2_800, payload: { kind: "finish" } });
   f.sessionEvent({
     type: "turn.completed", sessionId, turnId: "turn-multi", timestamp: 2_900,
@@ -1642,6 +1648,7 @@ test("decode speed aggregates every model request and skips tool-only requests",
   // Under ten tokens per second keeps one decimal, like the dsh provider.
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 4_000, payload: { kind: "start" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 4_100, payload: { kind: "text_start" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 8_100, payload: { kind: "text_delta", delta: "tail" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-slow", timestamp: 8_100, payload: { kind: "finish" } });
   f.sessionEvent({
     type: "turn.completed", sessionId, turnId: "turn-slow", timestamp: 8_200,
@@ -1655,6 +1662,7 @@ test("decode speed aggregates every model request and skips tool-only requests",
     type: "model.streaming", sessionId, turnId: "turn-delta-only", timestamp: 9_000,
     payload: { kind: "text_delta", delta: "x" },
   });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-delta-only", timestamp: 10_000, payload: { kind: "text_delta", delta: "y" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-delta-only", timestamp: 10_000, payload: { kind: "finish" } });
   f.sessionEvent({
     type: "turn.completed", sessionId, turnId: "turn-delta-only", timestamp: 10_100,
@@ -1673,6 +1681,10 @@ test("model completions stream one usage row per request", async (t) => {
   f.sessionEvent({
     type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 1_000,
     payload: { kind: "text_delta", delta: "one" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 2_000,
+    payload: { kind: "text_delta", delta: "tail" },
   });
   // A main-turn model request commits mid-turn; the app-server projects it as
   // session.updated with the request's usage snapshot.
@@ -1697,6 +1709,10 @@ test("model completions stream one usage row per request", async (t) => {
   f.sessionEvent({
     type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 3_000,
     payload: { kind: "reasoning_delta", delta: "two" },
+  });
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-live", timestamp: 4_500,
+    payload: { kind: "reasoning_delta", delta: "tail" },
   });
   f.sessionEvent({
     type: "session.updated", sessionId, turnId: "turn-live", timestamp: 4_500,
@@ -1749,10 +1765,16 @@ test("a re-broadcast final usage snapshot does not duplicate the row", async (t)
     payload: { kind: "text_delta", delta: "one" },
   });
   f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-dup", timestamp: 2_000,
+    payload: { kind: "text_delta", delta: "tail" },
+  });
+  f.sessionEvent({
     type: "session.updated", sessionId, turnId: "turn-dup", timestamp: 2_000,
     payload: { querySource: "main_turn", usage: { inputTokens: 50_900, outputTokens: 125, cacheReadTokens: 49_300 } },
   });
-  // Step two streams and commits with different numbers.
+  // Step two commits with different numbers, but the app-server batched the
+  // whole response into one burst frame: the arrival span is a forwarding
+  // artifact, so the row keeps the counts and omits the speed.
   f.sessionEvent({
     type: "model.streaming", sessionId, turnId: "turn-dup", timestamp: 3_000,
     payload: { kind: "text_delta", delta: "two" },
@@ -1764,7 +1786,7 @@ test("a re-broadcast final usage snapshot does not duplicate the row", async (t)
 
   let rows = f.notifications();
   assert.equal(rows.length, 2);
-  assert.match(rows[1].item.message, /速度 58000 tok\/s/);
+  assert.match(rows[1].item.message, /Token 用量：输入 52\.2k · 缓存读 50\.8k · 输出 58$/);
 
   // The app-server re-broadcasts the final request's snapshot when the turn
   // settles: same numbers, no streaming in between. It must not become a row.
@@ -1778,6 +1800,49 @@ test("a re-broadcast final usage snapshot does not duplicate the row", async (t)
     payload: { response: "done", resultType: "success", usage: { inputTokens: 52_200, outputTokens: 58, cacheReadTokens: 50_800 } },
   });
   assert.equal(f.notifications().length, 2, "settling still does not append a total");
+});
+
+test("batched frame bursts and idle tails do not distort decode speed", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+
+  // The app-server batched a whole 694-token response into frames spread over
+  // 5ms: 138k tok/s is a forwarding artifact, so the row omits the speed.
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-burst", timestamp: 900 });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-burst", timestamp: 1_000, payload: { kind: "text_delta", delta: "one" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-burst", timestamp: 1_005, payload: { kind: "text_delta", delta: "two" } });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-burst", timestamp: 1_100,
+    payload: { querySource: "main_turn", usage: { inputTokens: 123_000, outputTokens: 694, cacheReadTokens: 122_000 } },
+  });
+  let row = f.notifications().at(-1);
+  assert.match(row.item.message, /输出 694$/);
+
+  // The idle tail between the last content frame and the usage event stays
+  // outside the window: 40 tokens over a 500ms content span is 80 tok/s, not
+  // the 20 tok/s the old first-frame → commit span would report.
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-tail", timestamp: 1_900 });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tail", timestamp: 2_000, payload: { kind: "text_delta", delta: "a" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tail", timestamp: 2_500, payload: { kind: "text_delta", delta: "b" } });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-tail", timestamp: 3_500,
+    payload: { querySource: "main_turn", usage: { inputTokens: 3_000, outputTokens: 40 } },
+  });
+  row = f.notifications().at(-1);
+  assert.match(row.item.message, /速度 80 tok\/s$/);
+
+  // The plausibility bound itself stays generous: 1000 tok/s survives.
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn-bound", timestamp: 3_900 });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-bound", timestamp: 4_000, payload: { kind: "text_delta", delta: "a" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-bound", timestamp: 5_000, payload: { kind: "text_delta", delta: "b" } });
+  f.sessionEvent({
+    type: "session.updated", sessionId, turnId: "turn-bound", timestamp: 5_100,
+    payload: { querySource: "main_turn", usage: { inputTokens: 2_000, outputTokens: 1000 } },
+  });
+  row = f.notifications().at(-1);
+  assert.match(row.item.message, /速度 1000 tok\/s$/);
 });
 
 test("identical usage numbers with fresh streaming still become a row", async (t) => {
@@ -1883,6 +1948,7 @@ test("delta-only streams close the decode window at turn completion and tool cal
   // The app-server forwards content as delta frames only: no start/finish.
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-deltas", timestamp: 1_000, payload: { kind: "text_delta", delta: "S" } });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-deltas", timestamp: 1_100, payload: { kind: "reasoning_delta", delta: "R" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-deltas", timestamp: 2_000, payload: { kind: "reasoning_delta", delta: "tail" } });
   f.sessionEvent({
     type: "turn.completed", sessionId, turnId: "turn-deltas", timestamp: 2_000,
     payload: { response: "SPEED_OK", resultType: "success", usage: { outputTokens: 5 } },
@@ -1895,11 +1961,13 @@ test("delta-only streams close the decode window at turn completion and tool cal
 
   // A tool call closes the current model segment; the next delta reopens it.
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_000, payload: { kind: "text_delta", delta: "a" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_500, payload: { kind: "text_delta", delta: "tail" } });
   f.sessionEvent({
-    type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_500,
+    type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 3_600,
     payload: { kind: "tool_call", toolCallId: "tool-1", toolName: "bash", input: {} },
   });
   f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 4_500, payload: { kind: "text_delta", delta: "b" } });
+  f.sessionEvent({ type: "model.streaming", sessionId, turnId: "turn-tool-split", timestamp: 5_000, payload: { kind: "text_delta", delta: "tail" } });
   f.sessionEvent({
     type: "turn.completed", sessionId, turnId: "turn-tool-split", timestamp: 5_000,
     payload: { response: "done", resultType: "success", usage: { outputTokens: 10 } },

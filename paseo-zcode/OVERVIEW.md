@@ -61,10 +61,14 @@ local ZCode sessions are listed in Paseo's session picker.
   `session.updated`, so a multi-step turn shows accounting while it is still
   running and the context meter advances with it; compact, title and subagent
   requests are not counted. The speed is output tokens over that request's
-  generated-content time, the same decode-only definition ZCode's own
+  generated-content time (first → last content frame; the idle tail up to the
+  closing event is not decoding), the same decode-only definition ZCode's own
   `tokensPerSecond` uses. Because the app-server forwards only delta frames, a
   tool call, the model commit or the turn completion closes each segment, and a
-  request without content timing omits only the speed. Older app-server
+  request without content timing omits only the speed. Frames the app-server
+  batched into a burst compress the arrival span to milliseconds; any figure
+  beyond 1000 tok/s is such a forwarding artifact, and the row omits the speed
+  rather than report it. Older app-server
   versions that never push per-request usage fall back to one row at turn
   completion. A snapshot with identical numbers and no model streaming since
   the last row is the app-server re-broadcasting the final request's usage as

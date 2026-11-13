@@ -295,6 +295,8 @@ interface TurnState {
   emittedAssistant: Set<string>;
   /** First generated content (text, reasoning or tool input) of the open decode window. */
   firstContentAt?: number;
+  /** Most recent generated content of the open decode window. */
+  lastContentAt?: number;
   /** Summed generated-content time across this turn's model requests. */
   decodeMs: number;
   /** Generated-content time of the model request that is currently streaming. */
@@ -829,17 +831,27 @@ function formatTokenCount(value: number): string {
 }
 
 /**
+ * Ceiling for a single stream's decode rate. The app-server can batch a whole
+ * response into a burst of frames delivered within a few milliseconds, so any
+ * figure above the ceiling is a forwarding artifact, not generation
+ * throughput, and is discarded instead of reported.
+ */
+const MAX_PLAUSIBLE_TPS = 1000;
+
+/**
  * Generation throughput for one model request: ZCode reports output tokens when
  * the request commits, while the plugin accumulates the request's
- * first-content → commit time. This is the same decode-only definition ZCode's
- * own `tokensPerSecond` debug figure uses (`durationMs - timeToFirstContentMs`);
- * because the app-server forwards only delta frames, a tool call, a model
- * commit or the turn completion closes the segment.
+ * first-content → last-content time. This is the same decode-only definition
+ * ZCode's own `tokensPerSecond` debug figure uses (`durationMs -
+ * timeToFirstContentMs`); because the app-server forwards only delta frames, a
+ * tool call, a model commit or the turn completion closes the segment. The
+ * idle tail between the last content frame and the closing event is idle time,
+ * not decoding, so it stays outside the window.
  */
 function decodeTokPerSec(outputTokens: number | undefined, decodeMs: number): number | undefined {
   if (outputTokens === undefined || outputTokens <= 0 || decodeMs <= 0) return undefined;
   const tps = outputTokens / (decodeMs / 1000);
-  if (!Number.isFinite(tps) || tps <= 0) return undefined;
+  if (!Number.isFinite(tps) || tps <= 0 || tps > MAX_PLAUSIBLE_TPS) return undefined;
   return tps;
 }
 
@@ -849,15 +861,17 @@ function formatTokPerSec(tps: number): string {
 
 function openDecodeWindow(turn: TurnState, at: number): void {
   if (turn.firstContentAt === undefined) turn.firstContentAt = at;
+  turn.lastContentAt = at;
   turn.stepSawStream = true;
 }
 
-function closeDecodeWindow(turn: TurnState, at: number): void {
-  if (turn.firstContentAt === undefined) return;
-  const elapsed = Math.max(0, at - turn.firstContentAt);
+function closeDecodeWindow(turn: TurnState): void {
+  if (turn.firstContentAt === undefined || turn.lastContentAt === undefined) return;
+  const elapsed = Math.max(0, turn.lastContentAt - turn.firstContentAt);
   turn.decodeMs += elapsed;
   turn.stepDecodeMs += elapsed;
   turn.firstContentAt = undefined;
+  turn.lastContentAt = undefined;
 }
 
 interface UsageFields {
@@ -957,9 +971,8 @@ function emitStepUsage(
   state: SessionState,
   turn: TurnState,
   usage: Record<string, unknown>,
-  at: number,
 ): void {
-  closeDecodeWindow(turn, at);
+  closeDecodeWindow(turn);
   const fields = readUsageFields(usage);
   const speed = decodeTokPerSec(fields.outputTokens, turn.stepDecodeMs);
   turn.stepDecodeMs = 0;
@@ -1759,10 +1772,11 @@ export function createZcodeProvider(): ProviderRegistration {
               // A new request; the previous window should already have been
               // closed by a finish/tool call, so drop only an incomplete one.
               turn.firstContentAt = undefined;
+              turn.lastContentAt = undefined;
               turn.stepDecodeMs = 0;
               turn.stepSawStream = true;
             } else if (kind === "finish" || kind === "error") {
-              closeDecodeWindow(turn, event.timestamp);
+              closeDecodeWindow(turn);
               turn.stepSawStream = true;
             } else if (kind === "text_start" || kind === "reasoning_start" || kind === "tool_input_start"
               || kind === "text_delta" || kind === "reasoning_delta" || kind === "tool_input_delta") {
@@ -1773,7 +1787,7 @@ export function createZcodeProvider(): ProviderRegistration {
             } else if (kind === "text_delta" && typeof payload.delta === "string") {
               turn.text += payload.delta;
             } else if (kind === "tool_call") {
-              closeDecodeWindow(turn, event.timestamp);
+              closeDecodeWindow(turn);
               turn.stepSawStream = true;
               flushReasoning(state, turn);
               const toolCallId = String(payload.toolCallId ?? "");
@@ -1842,7 +1856,7 @@ export function createZcodeProvider(): ProviderRegistration {
               ? payload.usage as Record<string, unknown>
               : undefined;
             if (usage && turn.started && isMainTurnModelUsage(payload)) {
-              emitStepUsage(emit, state, turn, usage, event.timestamp);
+              emitStepUsage(emit, state, turn, usage);
               emitUsageContext(emit, state, contextTokensFromUsage(readUsageFields(usage)), state.contextWindow);
             }
             break;
@@ -1977,7 +1991,7 @@ export function createZcodeProvider(): ProviderRegistration {
             // Main-turn requests already reported their own rows as they
             // committed; the total is only needed for older app-servers that
             // never pushed a per-request usage snapshot.
-            closeDecodeWindow(turn, event.timestamp);
+            closeDecodeWindow(turn);
             if (turn.usageRows === 0) emitTurnUsage(emit, state, turn, usage);
             const totals = readUsageFields(usage);
             emit({
