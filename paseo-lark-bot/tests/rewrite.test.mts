@@ -147,6 +147,20 @@ describe("rewriteReplyWithModel", () => {
     assert.match(captured.prompt ?? "", /3-5 句/);
   });
 
+  it("keeps technical details as a default that the instruction may override", async () => {
+    const captured: Captured = {};
+    await rewriteReplyWithModel({
+      ...baseOptions,
+      instruction: "不超过 150 字，不出现代码和命令",
+      paseo: fakePaseo(captured, async () => ({ lastMessage: "短版" })),
+    });
+    const prompt = captured.prompt ?? "";
+    // The trade-off rule must exist and stay behind the instruction, so a
+    // length/audience rule in the instruction wins over keep-everything.
+    assert.match(prompt, /改写要求未另作取舍时/);
+    assert.ok(prompt.indexOf("不超过 150 字") < prompt.indexOf("改写要求未另作取舍时"));
+  });
+
   it("returns null when the rewrite is empty", async () => {
     const result = await rewriteReplyWithModel({
       ...baseOptions,
