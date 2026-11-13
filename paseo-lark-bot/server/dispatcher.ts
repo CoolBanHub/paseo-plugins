@@ -2619,9 +2619,11 @@ export function createDispatcher(options: DispatcherOptions) {
           chatId,
           topicKey: meta.topicKey ?? topicKey ?? "",
           text: body,
-          instruction: binding.rewriteIgnoreStyle
-            ? NEUTRAL_REWRITE_INSTRUCTION
-            : replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt),
+          instruction: binding.rewriteInstruction.trim()
+            ? binding.rewriteInstruction
+            : binding.rewriteIgnoreStyle
+              ? NEUTRAL_REWRITE_INSTRUCTION
+              : replyStyleInstruction(binding.replyStyle, binding.replyStylePrompt),
           log,
         });
         if (rewritten) body = rewritten;

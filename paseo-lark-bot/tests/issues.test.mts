@@ -43,6 +43,7 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     mentionOnReply: "off",
     allowAgentDelegation: false,
     rewriteIgnoreStyle: false,
+    rewriteInstruction: "",
     issueTracking: "auto",
     issueAiClassify: true,
     issueAiStatusReview: true,

@@ -56,6 +56,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         issueAcceptRequester: true,
   issueAcceptUsers: [],
         rewriteIgnoreStyle: false,
+        rewriteInstruction: "",
       },
       {
         chatId: "oc_p2p",
@@ -88,6 +89,7 @@ function values(overrides: Partial<typeof DEFAULT_BOT_VALUES> = {}) {
         issueAcceptRequester: true,
   issueAcceptUsers: [],
         rewriteIgnoreStyle: false,
+        rewriteInstruction: "",
       },
     ],
     ...overrides,

@@ -93,6 +93,7 @@ const binding: ChatBinding = {
   issueAcceptRequester: true,
   issueAcceptUsers: [],
   rewriteIgnoreStyle: false,
+  rewriteInstruction: "",
 };
 
 function makeHarness(
@@ -1742,6 +1743,20 @@ describe("default system prompt", () => {
     });
     await flush();
     assert.match(h.created[0].config.systemPrompt ?? "", /用三句话回答/);
+  });
+
+  it("keeps the dedicated rewrite instruction out of the system prompt", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", {
+      ...binding,
+      replyStyle: "default",
+      replyRewrite: "always",
+      rewriteInstruction: "面向非技术同事，不超过 150 字",
+    });
+    await flush();
+    const prompt = h.created[0].config.systemPrompt ?? "";
+    assert.doesNotMatch(prompt, /### 回复风格/);
+    assert.doesNotMatch(prompt, /面向非技术同事/);
   });
 
   it("appends the group member directory to new post sessions", async () => {

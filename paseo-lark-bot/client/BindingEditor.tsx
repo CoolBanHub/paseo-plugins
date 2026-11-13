@@ -457,6 +457,18 @@ export function BindingEditor({
                 适合「主回答用强模型、改写用便宜快模型」；不选则跟随主绑定/话题覆盖。
               </Text>
             </SelectRow>
+            <FieldLabel text="改写专用指令" />
+            <TextInput
+              value={binding.rewriteInstruction}
+              placeholder="例：面向非技术同事，不超过 150 字，最多保留一条必要链接；留空则沿用回复风格"
+              placeholderTextColor={colors().foregroundMuted}
+              multiline
+              onChangeText={(text) => onPatch({ rewriteInstruction: text })}
+              style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
+            />
+            <Text style={{ fontSize: 11, color: colors().foregroundMuted, lineHeight: 17 }}>
+              只作用于改写，不进入主回答的系统提示；填写后优先于回复风格与「改写不套用回复风格」。
+            </Text>
             <ToggleRow
               label="改写不套用回复风格"
               hint="开启后改写只压缩长度，保持原文的语气与术语深度；不注入回复风格，风格为「默认」时也不用内置的通俗化指令"

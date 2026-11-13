@@ -303,6 +303,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               mentionOnReply: "off",
               allowAgentDelegation: false,
               rewriteIgnoreStyle: false,
+              rewriteInstruction: "",
               issueTracking: "off",
               issueAiClassify: true,
               issueAiStatusReview: true,

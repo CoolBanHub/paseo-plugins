@@ -269,6 +269,13 @@ export const chatBindingSchema = z.object({
    * falling back to DEFAULT_REWRITE_INSTRUCTION for the `default` style.
    */
   rewriteIgnoreStyle: z.boolean().default(false),
+  /**
+   * Dedicated rewrite instruction. When non-empty it wins over both the
+   * reply-style instruction and rewriteIgnoreStyle, and it never reaches the
+   * main turn's system prompt — the way to rewrite for a different audience
+   * than the main answer without touching it.
+   */
+  rewriteInstruction: z.string().default(""),
   replyFormat: replyFormatSchema.default("markdown"),
   /** Who to @ in the group after the turn finishes. */
   mentionOnReply: mentionOnReplySchema.default("off"),

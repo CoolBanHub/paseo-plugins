@@ -64,6 +64,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         issueAcceptRequester: true,
   issueAcceptUsers: [],
         rewriteIgnoreStyle: false,
+        rewriteInstruction: "",
       },
     ],
     ...overrides,
@@ -382,6 +383,34 @@ describe("createDispatcher", () => {
     assert.equal(h.replies.length, 1);
     assert.equal(h.replies[0].text, "精简版回答");
     assert.equal(seenInstruction, NEUTRAL_REWRITE_INSTRUCTION);
+  });
+
+  it("prefers the dedicated rewrite instruction over the style and ignore switches", async () => {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0],
+      replyRewrite: "always",
+      rewriteProvider: "",
+      rewriteModel: "",
+      replyStyle: "custom",
+      replyStylePrompt: "用三句话回答",
+      rewriteIgnoreStyle: true,
+      rewriteInstruction: "面向非技术同事，不超过 150 字",
+    };
+    let seenInstruction = "";
+    const h = makeHarness(values, {
+      rewriteReply: async (options) => {
+        seenInstruction = options.instruction;
+        return "精简版回答";
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "原始长回答"));
+    await flush();
+    assert.equal(h.replies.length, 1);
+    assert.equal(h.replies[0].text, "精简版回答");
+    assert.equal(seenInstruction, "面向非技术同事，不超过 150 字");
   });
 
   it("uses the independent rewrite provider/model when configured", async () => {
@@ -1543,6 +1572,7 @@ describe("p2p and delivery hygiene", () => {
         issueAcceptRequester: true,
   issueAcceptUsers: [],
         rewriteIgnoreStyle: false,
+        rewriteInstruction: "",
       },
     ],
   });
@@ -2742,6 +2772,7 @@ describe("completion mentions", () => {
       issueAcceptRequester: true,
   issueAcceptUsers: [],
       rewriteIgnoreStyle: false,
+      rewriteInstruction: "",
     };
     const h = makeHarness(values, {
       readThreadRootDetail: async () => ({ text: null, senderOpenId: "ou_user", senderName: "张三" }),

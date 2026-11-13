@@ -35,6 +35,7 @@ const binding: ChatBinding = {
   issueAcceptRequester: true,
   issueAcceptUsers: [],
   rewriteIgnoreStyle: false,
+  rewriteInstruction: "",
 };
 
 function context(overrides: Partial<CommandContext> = {}) {

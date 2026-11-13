@@ -28,6 +28,7 @@ describe("chat binding schema", () => {
     assert.equal(binding.rewriteProvider, "");
     assert.equal(binding.rewriteModel, "");
     assert.equal(binding.rewriteIgnoreStyle, false);
+    assert.equal(binding.rewriteInstruction, "");
     assert.equal(binding.allowAgentDelegation, false);
     assert.equal(binding.replyFormat, "markdown");
     assert.equal(binding.issueAiClassify, true);
