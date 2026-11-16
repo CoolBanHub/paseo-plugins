@@ -1,7 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { createDecipheriv, createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type {
   AccountFamily,
   OAuthAccount,
@@ -33,6 +34,8 @@ export interface AccountProvider {
 export interface ReadAccountProvidersOptions {
   v2Dir?: string;
   onSkip?: (providerId: string, reason: string) => void;
+  /** Injectable keyring reader for tests; defaults to the OS keychain. */
+  keyStore?: CredentialKeyStore;
 }
 
 export interface OAuthTokenSet {
@@ -69,8 +72,158 @@ interface StoredProjectLocation extends ProjectLocation {
 }
 
 const ENC_PREFIX = "enc:v1:";
+const ENC_V2_PREFIX = "enc:v2:";
+const KEYCHAIN_SERVICE = "ZCode Credential Encryption";
+const KEYCHAIN_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{24}$/;
 
-export function decryptCredential(value: string): string | undefined {
+/** Resolves the default credentials.json path used by the desktop app. */
+export function defaultCredentialPath(): string {
+  return resolve(join(homedir(), ".zcode", "v2", "credentials.json"));
+}
+
+/**
+ * Reads the base64url keyring password the desktop app stores for one
+ * credentials file. Injectable so tests can decrypt without a keychain.
+ */
+export interface CredentialKeyStore {
+  readKey(credentialPath: string): string | undefined;
+}
+
+// Successful keychain reads are cached per credentials path; misses re-read so a
+// login that creates the entry is picked up without a plugin reload.
+const osKeyringCache = new Map<string, string>();
+
+function readOsKeyringKey(credentialPath: string): string | undefined {
+  const resolvedPath = resolve(credentialPath);
+  const cached = osKeyringCache.get(resolvedPath);
+  if (cached) return cached;
+  // The desktop app indexes the entry by sha256 of the resolved file path.
+  const account = createHash("sha256").update(resolvedPath).digest("hex");
+  try {
+    const current = platform();
+    const output = current === "darwin"
+      ? execFileSync(
+        "security",
+        ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
+      )
+      : current === "linux"
+        ? execFileSync(
+          "secret-tool",
+          ["lookup", "service", KEYCHAIN_SERVICE, "username", account],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
+        )
+        : undefined;
+    const key = output?.trim();
+    if (key && KEYCHAIN_KEY_PATTERN.test(key)) {
+      osKeyringCache.set(resolvedPath, key);
+      return key;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * `enc:v2:env:` keys wrap a managed secret: the ZCODE_CREDENTIAL_SECRET env
+ * var, or a 32..4096-byte owner-only file next to the credentials (mirrors the
+ * desktop app's resolveManagedSecret, including its both-sources refusal).
+ */
+function readManagedSecret(credentialPath: string): string | undefined {
+  const envSecret = process.env.ZCODE_CREDENTIAL_SECRET;
+  const envSecretFile = process.env.ZCODE_CREDENTIAL_SECRET_FILE;
+  if (envSecret && envSecretFile) return undefined;
+  if (envSecret) return envSecret;
+  let file: string | undefined = envSecretFile;
+  if (!file) {
+    file = join(dirname(resolve(credentialPath)), "credential-secret");
+    try {
+      const st = statSync(file);
+      if (!st.isFile()) return undefined;
+      // The default file must stay owner-only, like the app's own check.
+      if (platform() !== "win32" && (st.mode & 0o77) !== 0) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const content = readFileSync(file, "utf8");
+    const size = Buffer.byteLength(content, "utf8");
+    return size >= 32 && size <= 4096 ? content : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function openSealed(sealed: string, key: Buffer): string | undefined {
+  const parts = sealed.split(".");
+  if (parts.length !== 3 || parts.some((p) => !/^[A-Za-z0-9_-]+$/.test(p))) return undefined;
+  const [iv, tag, ciphertext] = parts.map((p) => Buffer.from(p, "base64url"));
+  if (iv.length !== 12 || tag.length !== 16) return undefined;
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** `enc:v2:<source>:<keyFingerprint>:<iv>.<tag>.<ciphertext>` (desktop app >= 2026-11). */
+function decryptV2Credential(
+  value: string,
+  credentialPath: string,
+  keyStore: CredentialKeyStore,
+): string | undefined {
+  const parts = value.slice(ENC_V2_PREFIX.length).split(":");
+  if (parts.length !== 3) return undefined;
+  const [source, fingerprint, sealed] = parts;
+  if (!FINGERPRINT_PATTERN.test(fingerprint)) return undefined;
+
+  const matchesFingerprint = (key: Buffer): boolean =>
+    createHash("sha256").update(key).digest("hex").slice(0, 24) === fingerprint;
+
+  if (source === "os") {
+    const resolvedPath = resolve(credentialPath);
+    let raw = keyStore.readKey(resolvedPath);
+    if (!raw || !KEYCHAIN_KEY_PATTERN.test(raw)) return undefined;
+    let key = Buffer.from(raw, "base64url");
+    if (key.length !== 32) return undefined;
+    if (!matchesFingerprint(key) && osKeyringCache.get(resolvedPath) === raw) {
+      // The app may have rotated the key (re-login); re-read the keychain once.
+      osKeyringCache.delete(resolvedPath);
+      raw = keyStore.readKey(resolvedPath);
+      if (!raw || !KEYCHAIN_KEY_PATTERN.test(raw)) return undefined;
+      key = Buffer.from(raw, "base64url");
+      if (key.length !== 32) return undefined;
+    }
+    if (!matchesFingerprint(key)) return undefined;
+    return openSealed(sealed, key);
+  }
+  if (source === "env") {
+    const secret = readManagedSecret(credentialPath);
+    if (!secret) return undefined;
+    const key = createHash("sha256").update(secret).digest();
+    if (!matchesFingerprint(key)) return undefined;
+    return openSealed(sealed, key);
+  }
+  return undefined;
+}
+
+export interface DecryptCredentialOptions {
+  /** Credentials file the value came from; selects the keychain key. */
+  credentialPath?: string;
+  /** Keyring reader; defaults to the OS keychain (macOS / Linux). */
+  keyStore?: CredentialKeyStore;
+}
+
+export function decryptCredential(value: string, options: DecryptCredentialOptions = {}): string | undefined {
+  if (value.startsWith(ENC_V2_PREFIX)) {
+    const credentialPath = options.credentialPath ?? defaultCredentialPath();
+    return decryptV2Credential(value, credentialPath, options.keyStore ?? { readKey: readOsKeyringKey });
+  }
   if (!value.startsWith(ENC_PREFIX)) return value;
   const secret =
     process.env.ZCODE_CREDENTIAL_SECRET?.trim() ||
@@ -91,6 +244,9 @@ export function decryptCredential(value: string): string | undefined {
 
 export function readAccountProviders(options: ReadAccountProvidersOptions = {}): AccountProvider[] {
   const v2Dir = options.v2Dir ?? defaultV2Dir();
+  // v2 keyring keys are indexed by the resolved credentials.json path.
+  const credentialPath = resolve(join(v2Dir, "credentials.json"));
+  const keyStore = options.keyStore;
   try {
     const creds = readJsonFile<Record<string, unknown>>(join(v2Dir, "credentials.json"));
     const cfg = readJsonFile<ProviderConfigFile>(join(v2Dir, "provider_config.json"));
@@ -99,10 +255,10 @@ export function readAccountProviders(options: ReadAccountProvidersOptions = {}):
 
     const oauthSets = new Map<AccountFamily, OAuthTokenSet>();
     for (const family of ["bigmodel", "zai"] as const) {
-      const set = readOAuthTokenSetFromCreds(creds, family);
+      const set = readOAuthTokenSetFromCreds(creds, family, credentialPath, keyStore);
       if (set) oauthSets.set(family, set);
     }
-    const locations = readProjectLocations(creds);
+    const locations = readProjectLocations(creds, credentialPath, keyStore);
 
     const rules = cfg.config?.providerConfigRules?.providerRules ?? [];
     const modelRules = cfg.config?.modelConfigRules?.providerModelRules ?? [];
@@ -119,8 +275,8 @@ export function readAccountProviders(options: ReadAccountProvidersOptions = {}):
       if (!family) continue;
 
       const planKind = planKindForProvider(providerId);
-      const manualApiKey = readManualApiKey(creds, providerId);
-      const authSource = readAuthSource(creds, providerId);
+      const manualApiKey = readManualApiKey(creds, providerId, credentialPath, keyStore);
+      const authSource = readAuthSource(creds, providerId, credentialPath, keyStore);
       const oauthSet = oauthSets.get(family);
       const selection = settings?.providerFamilyConnectionSelections?.[family];
 
@@ -174,10 +330,15 @@ export function readAccountProviders(options: ReadAccountProvidersOptions = {}):
 }
 
 /** Re-reads the OAuth token set so a desktop refresh is picked up between turns. */
-export function readOAuthTokenSet(family: AccountFamily, v2Dir = defaultV2Dir()): OAuthTokenSet | undefined {
+export function readOAuthTokenSet(
+  family: AccountFamily,
+  v2Dir = defaultV2Dir(),
+  keyStore?: CredentialKeyStore,
+): OAuthTokenSet | undefined {
   try {
     const creds = readJsonFile<Record<string, unknown>>(join(v2Dir, "credentials.json"));
-    return creds ? readOAuthTokenSetFromCreds(creds, family) : undefined;
+    const credentialPath = resolve(join(v2Dir, "credentials.json"));
+    return creds ? readOAuthTokenSetFromCreds(creds, family, credentialPath, keyStore) : undefined;
   } catch {
     return undefined;
   }
@@ -186,11 +347,15 @@ export function readOAuthTokenSet(family: AccountFamily, v2Dir = defaultV2Dir())
 function readOAuthTokenSetFromCreds(
   creds: Record<string, unknown>,
   family: AccountFamily,
+  credentialPath: string,
+  keyStore?: CredentialKeyStore,
 ): OAuthTokenSet | undefined {
-  const accessToken = readEncryptedString(creds[`oauth:${family}:access_token`]);
+  const accessToken = readEncryptedString(creds[`oauth:${family}:access_token`], credentialPath, keyStore);
   if (!accessToken) return undefined;
-  const zcodeJwtToken = readEncryptedString(creds.zcodejwttoken);
-  const accountIdentity = readAccountIdentity(readEncryptedString(creds[`oauth:${family}:user_info`]));
+  const zcodeJwtToken = readEncryptedString(creds.zcodejwttoken, credentialPath, keyStore);
+  const accountIdentity = readAccountIdentity(
+    readEncryptedString(creds[`oauth:${family}:user_info`], credentialPath, keyStore),
+  );
   if (!accountIdentity) return undefined;
   return {
     family,
@@ -284,7 +449,11 @@ function locationScore(location: StoredProjectLocation): number {
   return score;
 }
 
-function readProjectLocations(creds: Record<string, unknown>): StoredProjectLocation[] {
+function readProjectLocations(
+  creds: Record<string, unknown>,
+  credentialPath: string,
+  keyStore?: CredentialKeyStore,
+): StoredProjectLocation[] {
   const locations: StoredProjectLocation[] = [];
   for (const key of Object.keys(creds)) {
     if (!key.startsWith("project-key-location:v1:")) continue;
@@ -293,7 +462,7 @@ function readProjectLocations(creds: Record<string, unknown>): StoredProjectLoca
       if (!Array.isArray(descriptor) || descriptor.length < 2) continue;
       const [origin, family, accountId, team, usageScene, selection] = descriptor;
       if (typeof origin !== "string" || (family !== "bigmodel" && family !== "zai")) continue;
-      const value = readEncryptedString(creds[key]);
+      const value = readEncryptedString(creds[key], credentialPath, keyStore);
       if (!value) continue;
       const location = JSON.parse(value) as Record<string, unknown>;
       const organizationId = stringValue(location.organizationId);
@@ -318,16 +487,28 @@ function readProjectLocations(creds: Record<string, unknown>): StoredProjectLoca
   return locations;
 }
 
-function readManualApiKey(creds: Record<string, unknown>, providerId: string): string | undefined {
+function readManualApiKey(
+  creds: Record<string, unknown>,
+  providerId: string,
+  credentialPath: string,
+  keyStore?: CredentialKeyStore,
+): string | undefined {
   const prefix = `account-provider:coding-plan:${providerId}:account:`;
   const apiKeyEntry = Object.keys(creds).find(
     (key) => key.startsWith(prefix) && key.endsWith(":api-key") && key.length > prefix.length + ":api-key".length,
   );
-  return apiKeyEntry ? readEncryptedString(creds[apiKeyEntry]) : undefined;
+  return apiKeyEntry ? readEncryptedString(creds[apiKeyEntry], credentialPath, keyStore) : undefined;
 }
 
-function readAuthSource(creds: Record<string, unknown>, providerId: string): string | undefined {
-  return readEncryptedString(creds[`account-provider:${providerId}:auth-source`])?.trim().toLowerCase();
+function readAuthSource(
+  creds: Record<string, unknown>,
+  providerId: string,
+  credentialPath: string,
+  keyStore?: CredentialKeyStore,
+): string | undefined {
+  return readEncryptedString(creds[`account-provider:${providerId}:auth-source`], credentialPath, keyStore)
+    ?.trim()
+    .toLowerCase();
 }
 
 function readAccountIdentity(raw: string | undefined): string | undefined {
@@ -345,9 +526,9 @@ function readAccountIdentity(raw: string | undefined): string | undefined {
   }
 }
 
-function readEncryptedString(value: unknown): string | undefined {
+function readEncryptedString(value: unknown, credentialPath: string, keyStore?: CredentialKeyStore): string | undefined {
   if (typeof value !== "string" || !value) return undefined;
-  return decryptCredential(value)?.trim() || undefined;
+  return decryptCredential(value, { credentialPath, ...(keyStore ? { keyStore } : {}) })?.trim() || undefined;
 }
 
 function stringValue(value: unknown): string | undefined {

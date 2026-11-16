@@ -49,6 +49,13 @@ local ZCode sessions are listed in Paseo's session picker.
   `/Applications/ZCode.app` (or set `ZCODE_CLI_PATH` to a `zcode.cjs`).
 - The ZCode CLI must be signed in (`zcode login`) — credentials are shared
   with the desktop app.
+- Encrypted credential values are decrypted in-process: legacy `enc:v1:`
+  values via the deterministic fallback secret, and the desktop app's newer
+  `enc:v2:os:` / `enc:v2:env:` values via the macOS keychain entry
+  `ZCode Credential Encryption` (indexed by the resolved credentials.json
+  path; Linux uses Secret Service) or the `ZCODE_CREDENTIAL_SECRET` /
+  `credential-secret` managed secret. The plugin only decrypts; the desktop
+  app owns writing credentials and the keychain key.
 - Paseo >= 0.15.3.
 
 ## Capabilities and limits
