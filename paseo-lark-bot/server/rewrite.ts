@@ -2,8 +2,12 @@ import { DEFAULT_REWRITE_INSTRUCTION } from "../shared/settings.ts";
 import type { SessionPaseoApi, SessionWorkspaceHandle } from "./sessions.ts";
 import { createHelperAgent } from "./workspace.ts";
 
-/** Hard stop for the one-shot rewrite; the caller falls back to the original. */
-const REWRITE_TIMEOUT_MS = 30_000;
+/**
+ * Hard stop for the one-shot rewrite. GLM-5.3-Flash with max thinking has
+ * been measured at 28-70s for long technical answers; 30s silently sent the
+ * raw report often. Keep a generous ceiling and log the fallback instead.
+ */
+const REWRITE_TIMEOUT_MS = 90_000;
 
 export interface RewriteReplyOptions {
   paseo: SessionPaseoApi;
@@ -74,8 +78,26 @@ export async function rewriteReplyWithModel(options: RewriteReplyOptions): Promi
       return null;
     }
     const result = await handle.run(prompt, { timeoutMs: options.timeoutMs ?? REWRITE_TIMEOUT_MS });
+    if (result.status === "timeout") {
+      options.log?.(
+        `回复改写超过 ${Math.round((options.timeoutMs ?? REWRITE_TIMEOUT_MS) / 1000)}s，发送原文`,
+      );
+      return null;
+    }
+    if (result.status === "error") {
+      options.log?.("回复改写失败，发送原文", result.error ?? "智能体执行出错");
+      return null;
+    }
+    if (result.status === "permission") {
+      options.log?.("回复改写等待权限确认，发送原文");
+      return null;
+    }
     const rewritten = (result.lastMessage ?? "").trim();
-    return rewritten || null;
+    if (!rewritten) {
+      options.log?.("回复改写返回空文本，发送原文");
+      return null;
+    }
+    return rewritten;
   } catch (error) {
     options.log?.(
       "回复改写失败，发送原文",

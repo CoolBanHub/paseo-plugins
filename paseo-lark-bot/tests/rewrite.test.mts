@@ -11,7 +11,7 @@ interface Captured {
 
 function fakePaseo(
   captured: Captured,
-  run: () => Promise<{ lastMessage: string | null }>,
+  run: () => Promise<{ lastMessage: string | null; status?: "idle" | "timeout" | "error" | "permission"; error?: string | null }>,
 ): SessionPaseoApi {
   return {
     agents: {
@@ -23,7 +23,8 @@ function fakePaseo(
           run: async (prompt: string, options?: { timeoutMs?: number }) => {
             captured.prompt = prompt;
             captured.runOptions = options;
-            return { status: "idle", error: null, ...(await run()) };
+            const extra = await run();
+            return { status: extra.status ?? "idle", error: extra.error ?? null, lastMessage: extra.lastMessage };
           },
           respondToPermission: async () => {},
         };
@@ -37,7 +38,7 @@ function fakePaseo(
 
 function fakeWorkspace(
   captured: Captured,
-  run: () => Promise<{ lastMessage: string | null }>,
+  run: () => Promise<{ lastMessage: string | null; status?: "idle" | "timeout" | "error" | "permission"; error?: string | null }>,
 ): SessionWorkspaceHandle {
   return {
     id: "ws-shared",
@@ -50,7 +51,8 @@ function fakeWorkspace(
           run: async (prompt: string, options?: { timeoutMs?: number }) => {
             captured.prompt = prompt;
             captured.runOptions = options;
-            return { status: "idle", error: null, ...(await run()) };
+            const extra = await run();
+            return { status: extra.status ?? "idle", error: extra.error ?? null, lastMessage: extra.lastMessage };
           },
           respondToPermission: async () => {},
         };
@@ -85,7 +87,7 @@ describe("rewriteReplyWithModel", () => {
     assert.equal(create.autoArchive, true);
     assert.equal(create.background, true);
     assert.equal(create.cwd, "/tmp/project");
-    assert.equal(captured.runOptions?.timeoutMs, 30_000);
+    assert.equal(captured.runOptions?.timeoutMs, 90_000);
   });
 
   it("rides in the provided workspace instead of creating a standalone agent", async () => {
@@ -180,6 +182,17 @@ describe("rewriteReplyWithModel", () => {
     });
     assert.equal(result, null);
     assert.ok(logs.some((line) => line.includes("回复改写失败")), logs.join("\n"));
+  });
+
+  it("logs and returns null when the rewrite times out", async () => {
+    const logs: string[] = [];
+    const result = await rewriteReplyWithModel({
+      ...baseOptions,
+      paseo: fakePaseo({}, async () => ({ status: "timeout" as const, lastMessage: null })),
+      log: (message) => logs.push(message),
+    });
+    assert.equal(result, null);
+    assert.ok(logs.some((line) => line.includes("90s")), logs.join("\n"));
   });
 
   it("passes a custom timeout to the one-shot turn", async () => {
