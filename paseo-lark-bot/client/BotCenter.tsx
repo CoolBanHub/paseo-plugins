@@ -1572,6 +1572,12 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               suffix="次/时"
             />
             <ToggleRow
+              label="允许话题发起人开启限时协作"
+              hint="开启后，话题发起人可用 /collab open @成员 24h 给指定访客只读问答；访客使用独立会话，只能查看，不能执行命令或写操作"
+              value={draft.collabEnabled}
+              onChange={(value) => patchDraft({ collabEnabled: value })}
+            />
+            <ToggleRow
               label="回传生成的附件"
               hint="允许智能体通过 lark-bot-send 把图片/文件发回话题（路径限定在工作目录或临时目录）"
               value={draft.attachmentSend}

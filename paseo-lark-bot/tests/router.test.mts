@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { extractPrompt, routeMessage } from "../server/router.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
-import { DEFAULT_BOT_VALUES } from "../shared/settings.ts";
+import { DEFAULT_BOT_VALUES, botValuesSchema } from "../shared/settings.ts";
 
 const BOT = "ou_bot";
 const USER = "ou_user";
@@ -192,5 +192,26 @@ describe("extractPrompt", () => {
   it("keeps p2p text as-is", () => {
     const prompt = extractPrompt(event({ content: "  直接提问  ", mentions: undefined }));
     assert.equal(prompt, "直接提问");
+  });
+});
+
+describe("guest route", () => {
+  it("keeps the allowlist closed unless the caller matched a grant", () => {
+    const values = botValuesSchema.parse({
+      chats: [
+        {
+          chatId: "oc_group",
+          provider: "dsh",
+          allowedUsers: [{ openId: "ou_owner", name: "负责人" }],
+        },
+      ],
+    });
+    const blocked = routeMessage(event({ sender_id: "ou_guest" }), values, BOT);
+    assert.equal(blocked.reason, "blocked");
+    const guest = routeMessage(event({ sender_id: "ou_guest" }), values, BOT, {
+      allowUnlistedSender: true,
+    });
+    assert.equal(guest.reason, "ok");
+    assert.ok(guest.binding);
   });
 });

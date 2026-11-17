@@ -74,7 +74,16 @@ import {
   writePendingQuestions,
   type PendingQuestion,
 } from "./question-store.ts";
-import { createSessionRegistry, type SessionPaseoApi } from "./sessions.ts";
+import { createSessionRegistry, type GuestTurn, type SessionPaseoApi } from "./sessions.ts";
+import { createMemoryStore, formatMemoryList } from "./memory.ts";
+import {
+  chooseReadOnlyPermission,
+  createCollabStore,
+  formatCollabOpened,
+  formatCollabStatus,
+  guestTopicKey,
+  isGuestTopicKey,
+} from "./collab.ts";
 import { createHelperAgent, ensureWorkspace, workspaceTitleFor } from "./workspace.ts";
 import {
   DEFAULT_BOT_VALUES,
@@ -131,6 +140,10 @@ export interface DispatcherOptions {
    * becoming dead buttons.
    */
   pendingStorePath?: string;
+  /** JSON file holding per-chat `/remember` entries; omitted means in-memory. */
+  memoryStorePath?: string;
+  /** JSON file holding time-boxed guest grants; omitted means in-memory. */
+  collabStorePath?: string;
   /**
    * Directory where ingested topic media is persisted as files. The paths
    * are quoted in the prompt's attachment note so users (and file-capable
@@ -322,6 +335,14 @@ export function createDispatcher(options: DispatcherOptions) {
       console.log("[lark-bot] " + message, detail === undefined ? "" : detail);
     });
   const now = options.now ?? Date.now;
+  const memoryStore = createMemoryStore(options.memoryStorePath ?? null, {
+    now,
+    log: (message) => log(message),
+  });
+  const collabStore = createCollabStore(options.collabStorePath ?? null, {
+    now,
+    log: (message) => log(message),
+  });
   const patchCard = options.updateCard || updateCard;
   const reactAdd = options.addReaction || addReaction;
   const reactRemove = options.removeReaction || removeReaction;
@@ -1301,7 +1322,8 @@ export function createDispatcher(options: DispatcherOptions) {
     const provider = overrides.provider ?? binding.provider;
     const legacyModel = provider.includes("/") ? provider.slice(provider.indexOf("/") + 1) : "";
     const model = overrides.model ?? binding.model ?? legacyModel;
-    const needsProviders = parsed.name === "model" || parsed.name === "mode" || parsed.name === "thinking";
+    const needsProviders =
+      parsed.name === "model" || parsed.name === "mode" || parsed.name === "thinking" || parsed.name === "collab";
     let providers: SessionProviderSnapshot | null = null;
     if (needsProviders) {
       try {
@@ -1445,6 +1467,78 @@ export function createDispatcher(options: DispatcherOptions) {
         const handle = options.paseo.agents.ref(agentId);
         return handle.run(task, { timeoutMs: 5 * 60_000 });
       },
+      memory: {
+        remember: (text) => {
+          const entry = memoryStore.remember(event.chat_id, text, event.sender_id);
+          if (!entry) return "记忆内容为空，未写入。";
+          return (
+            `已记住 #${entry.id}：${entry.text}\n` +
+            "下一条消息起自动生效；发 `/memory` 查看，`/forget " +
+            entry.id +
+            "` 删除。"
+          );
+        },
+        list: () => formatMemoryList(memoryStore.list(event.chat_id)),
+        forget: (target) => {
+          const removed = memoryStore.forget(event.chat_id, target);
+          return removed
+            ? `已删除 #${removed.id}：${removed.text}`
+            : "没有找到这个编号；发 `/memory` 查看。";
+        },
+      },
+      collab: {
+        enabled: values.collabEnabled,
+        isOwner:
+          event.chat_type === "p2p" ||
+          (topicOwners.get(topicKey)?.openId ?? event.sender_id) === event.sender_id,
+        isGroup: event.chat_type === "group",
+        status: () => {
+          const grant = collabStore.active(event.chat_id, topicKey);
+          return grant ? formatCollabStatus(grant, now()) : "本话题没有进行中的协作。";
+        },
+        open: async ({ guests, hours, scope }) => {
+          if (event.chat_type === "p2p") {
+            return "单聊是私聊，不需要开启协作。";
+          }
+          const permission = chooseReadOnlyPermission(provider, providers);
+          if (!permission) {
+            return (
+              `无法开启：provider \`${provider}\` 没有可用的只读/计划模式。` +
+              "请改用 dsh（read-only 预设）或 Claude（Plan Mode），否则访客仍可能写文件。"
+            );
+          }
+          const grant = collabStore.open({
+            chatId: event.chat_id,
+            topicKey,
+            guests,
+            openedBy: event.sender_id,
+            hours,
+            scope,
+            permission,
+            provider,
+          });
+          if (!grant) return "开启失败：访客名单为空或只读模式无效。";
+          // A new grant starts from a clean guest context; drop anything the
+          // previous grant left queued so it cannot run under the new one.
+          const guestKey = guestTopicKey(topicKey);
+          sessions.clearQueue(guestKey);
+          sessions.resetTopicForCommand(guestKey, true);
+          return formatCollabOpened(grant, now());
+        },
+        close: () => {
+          const removed = collabStore.close(event.chat_id, topicKey);
+          if (!removed) return "本话题没有进行中的协作。";
+          // Closing must also drop queued guest turns; otherwise they would
+          // start on a fresh session after the grant is gone.
+          const guestKey = guestTopicKey(topicKey);
+          sessions.clearQueue(guestKey);
+          sessions.resetTopicForCommand(guestKey, true);
+          return `已关闭协作，并清空访客会话（${removed.guests.length} 位访客）。`;
+        },
+      },
+      mentions: (event.mentions ?? [])
+        .filter((mention) => mention.id !== cachedBotOpenId)
+        .map((mention) => ({ openId: mention.id, name: mention.name })),
       resetSession: ({ clearOverrides }) => {
         const tracker = progressByTopic.get(topicKey);
         if (tracker) {
@@ -1513,9 +1607,18 @@ export function createDispatcher(options: DispatcherOptions) {
       // member's @ is still recorded (text and media) for an allowed member's
       // later @ — otherwise the bot loses the discussion around the request.
       const allowed = isSenderAllowed(binding, event.sender_id);
+      const messageTopicKey = topicKeyFor(event);
+      // A named guest inside an active, unexpired grant may talk to this topic
+      // through a separate read-only session; everyone else stays blocked.
+      // Turning collabEnabled off revokes every existing grant immediately.
+      const collabGrant = values.collabEnabled
+        ? collabStore.active(event.chat_id, messageTopicKey)
+        : null;
+      const guestInfo =
+        collabGrant?.guests.find((candidate) => candidate.openId === event.sender_id) ?? null;
       const triggered =
         event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
-      const blocked = !allowed && triggered;
+      const blocked = !allowed && !guestInfo && triggered;
 
       // Commands are a control plane, not agent input: answer them here so
       // they never enter history, the queue or the rate budget.
@@ -1535,6 +1638,19 @@ export function createDispatcher(options: DispatcherOptions) {
         }
       }
 
+      // Guests never get the control plane: no /new, /model, /collab or
+      // /remember. A command-shaped message is answered as a refusal.
+      if (guestInfo && triggered && parseCommand(extractPrompt(event))) {
+        await send(
+          cliPath,
+          event.message_id,
+          "访客模式不能使用命令；请直接提问，或让话题发起人处理。",
+          values,
+          "text",
+        );
+        return;
+      }
+
       recordHistory(event);
       if (!triggered && allowed) {
         void maybeReviewIssueStatus(cliPath, values, binding, event);
@@ -1547,8 +1663,8 @@ export function createDispatcher(options: DispatcherOptions) {
       await ingestMedia(cliPath, event);
       await ensureRootMedia(cliPath, event);
       if (blocked) return;
-      if (!allowed) return;
-      if (triggered) {
+      if (!allowed && !guestInfo) return;
+      if (triggered && !guestInfo) {
         const pending = [...pendingQuestions.values()].find(
           (entry) => entry.chatId === event.chat_id && entry.topicKey === topicKeyFor(event),
         );
@@ -1563,7 +1679,13 @@ export function createDispatcher(options: DispatcherOptions) {
           return;
         }
       }
-      const decision = routeMessage(event, values, botOpenId);
+      // Guests are unlisted by definition; the grant is their allowlist.
+      const decision = routeMessage(
+        event,
+        values,
+        botOpenId,
+        guestInfo ? { allowUnlistedSender: true } : undefined,
+      );
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {
         rememberUnmatched(event);
@@ -1572,7 +1694,10 @@ export function createDispatcher(options: DispatcherOptions) {
       // One agent session per Feishu thread: replies inside a topic share
       // context, while each fresh @-mention starts an independent topic. P2P
       // has no thread root, so the chat itself is the continuous topic.
-      const topicKey = topicKeyFor(event);
+      const topicKey = messageTopicKey;
+      // Guests use a sibling session keyed by the same topic, so the owner's
+      // agent context (and memory/system prompt) never mixes with theirs.
+      const sessionKey = guestInfo ? guestTopicKey(topicKey) : topicKey;
       const rootless = !event.root_id && !event.thread_id && !event.reply_to;
       if (event.chat_type === "group" && rootless && !topicOwners.has(topicKey)) {
         // A fresh group @ starts the topic, so its sender is the owner.
@@ -1613,23 +1738,43 @@ export function createDispatcher(options: DispatcherOptions) {
       if (values.ackMode === "text") {
         await send(cliPath, event.message_id, ACK_TEXT, values, "text");
       }
-      const { text: prompt, topicRootText } = await withThreadContext(cliPath, event, instruction);
+      const { text: prompt, topicRootText } = await withThreadContext(
+        cliPath,
+        event,
+        instruction,
+        sessionKey,
+      );
       const attachmentsNote = describeAttachments(images, files);
-      const finalPrompt = attachmentsNote ? prompt + "\n\n" + attachmentsNote : prompt;
+      // Memory is a control-plane instruction from an allowlisted member; it
+      // rides at the end of the current turn so a correction applies to the
+      // very next answer instead of requiring /new. Guests never see it.
+      const memoryNote = guestInfo ? null : memoryStore.promptFor(event.chat_id);
+      const finalPrompt = [prompt, attachmentsNote, memoryNote].filter(Boolean).join("\n\n");
+      const guestTurn: GuestTurn | undefined =
+        guestInfo && collabGrant
+          ? {
+              openId: guestInfo.openId,
+              name: guestInfo.name,
+              scope: collabGrant.scope,
+              expiresAt: collabGrant.expiresAt,
+              permission: collabGrant.permission,
+            }
+          : undefined;
       if (
         sessions.enqueue(
-          topicKey,
+          sessionKey,
           event.chat_id,
           event.message_id,
           finalPrompt,
           decision.binding,
           images,
           topicRootText,
+          guestTurn,
         )
       ) {
-        if (triggered) options.issueTracker?.markWorking(event, binding, values);
-        lastTriggerMessage.set(topicKey, event.message_id);
-        pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, topicKey);
+        if (triggered && !guestInfo) options.issueTracker?.markWorking(event, binding, values);
+        lastTriggerMessage.set(sessionKey, event.message_id);
+        pruneMap(lastTriggerMessage, MAX_TOPIC_HISTORY, sessionKey);
         triggerSenders.set(event.message_id, {
           openId: event.sender_id,
           isBot: event.sender_type === "bot",
@@ -1645,7 +1790,7 @@ export function createDispatcher(options: DispatcherOptions) {
         ) {
           void lookupSenderName(cliPath, event.message_id, event.sender_id);
         }
-        progressByTopic.get(topicKey)?.setQueue(sessions.sessionInfo(topicKey, event.chat_id).queued);
+        progressByTopic.get(sessionKey)?.setQueue(sessions.sessionInfo(sessionKey, event.chat_id).queued);
         void addReceipt(cliPath, event.message_id);
       }
     } catch (error) {
@@ -1663,6 +1808,7 @@ export function createDispatcher(options: DispatcherOptions) {
     cliPath: string,
     event: LarkMessageEvent,
     prompt: string,
+    sessionKey = topicKeyFor(event),
   ): Promise<{ text: string; hasContext: boolean; topicRootText: string | null }> {
     const historyKey = topicKeyFor(event);
     const history = (topicHistory.get(historyKey) ?? []).filter(
@@ -1685,8 +1831,10 @@ export function createDispatcher(options: DispatcherOptions) {
     }
     // A fresh/rebuilt agent has no prior turns in its own context, so treat
     // this as the first message and include the topic root/history again.
-    if (sessions.needsRebuild(historyKey)) lastTriggerMessage.delete(historyKey);
-    const previousTrigger = lastTriggerMessage.get(historyKey);
+    // The trigger cursor is per session, so a guest session never advances
+    // the owner session's incremental context.
+    if (sessions.needsRebuild(sessionKey)) lastTriggerMessage.delete(sessionKey);
+    const previousTrigger = lastTriggerMessage.get(sessionKey);
     const previousIndex = previousTrigger
       ? history.findIndex((entry) => entry.messageId === previousTrigger)
       : -1;
@@ -2592,13 +2740,18 @@ export function createDispatcher(options: DispatcherOptions) {
     const cliPath = cliPathFor(values);
     if (!cliPath) return;
     const binding = values.chats.find((chat) => chat.chatId === chatId);
-    const configured: ReplyFormat = binding?.replyFormat ?? "markdown";
+    // Guest answers never relay: force markdown (no <at> delivery), strip any
+    // mention tags the model produced, and skip rewrite/footer so the owner's
+    // style and cost details do not leak into the guest conversation.
+    const guestTopic = isGuestTopicKey(meta?.topicKey ?? topicKey);
+    const configured: ReplyFormat = guestTopic ? "markdown" : (binding?.replyFormat ?? "markdown");
     let format = configured;
     let body = text;
-    if (configured === "post" && body.includes("@")) {
+    if (!guestTopic && configured === "post" && body.includes("@")) {
       body = await resolveMemberMentions(body, chatId);
     }
-    if (binding && meta && shouldRewriteReply(binding, body, meta.outcome)) {
+    if (guestTopic) body = stripMentionTags(body);
+    if (binding && meta && !guestTopic && shouldRewriteReply(binding, body, meta.outcome)) {
       const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
       const rewriteProvider = binding.rewriteProvider.trim();
       const provider = rewriteProvider || overrides.provider || binding.provider;
@@ -2640,7 +2793,7 @@ export function createDispatcher(options: DispatcherOptions) {
     const awaitingConfirmation =
       meta?.outcome.outcome === "completed" && replyAwaitsConfirmation(body);
     let footer: string | undefined;
-    if (values.replyFooter && binding && meta) {
+    if (values.replyFooter && binding && meta && !guestTopic) {
       const overrides = meta.topicKey ? sessions.overridesFor(meta.topicKey) : {};
       const provider = overrides.provider ?? binding.provider;
       const model = overrides.model ?? binding.model;
@@ -2652,7 +2805,9 @@ export function createDispatcher(options: DispatcherOptions) {
       });
     }
     const sent = await send(cliPath, messageId, body, values, format, footer);
-    if (sent && meta && binding) {
+    // Guest answers never @ anyone: the room already knows who asked, and the
+    // owner's mention preference was not written for guest turns.
+    if (sent && meta && binding && !isGuestTopicKey(meta.topicKey ?? topicKey)) {
       await sendCompletionMention({
         cliPath,
         values,

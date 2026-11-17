@@ -1788,3 +1788,97 @@ describe("live activity forwarding", () => {
     assert.equal(h.activities[1]?.activity.text, "最后一行");
   });
 });
+
+describe("guest sessions", () => {
+  const guest = {
+    openId: "ou_guest",
+    name: "张三",
+    scope: "只看本话题进度",
+    expiresAt: 1_700_003_600_000,
+    permission: "plan",
+  };
+
+  it("uses the guest brief, the forced mode, and none of the owner's prompt", async () => {
+    const h = makeHarness();
+    h.registry.enqueue(
+      "om_1::guest",
+      "oc_group",
+      "om_1",
+      "进度如何？",
+      { ...binding, replyInstruction: "用三句话回答" },
+      undefined,
+      null,
+      guest,
+    );
+    await flush();
+    assert.equal(h.created.length, 1);
+    const config = h.created[0].config;
+    assert.match(config.systemPrompt ?? "", /协作访客/);
+    assert.match(config.systemPrompt ?? "", /张三/);
+    assert.match(config.systemPrompt ?? "", /只看本话题进度/);
+    assert.match(config.systemPrompt ?? "", /只读/);
+    assert.doesNotMatch(config.systemPrompt ?? "", /用中文回答/);
+    assert.doesNotMatch(config.systemPrompt ?? "", /用三句话回答/);
+    assert.equal(config.modeId, "plan");
+    assert.equal(h.created[0].labels?.["lark-bot-guest"], "1");
+    assert.match(h.created[0].title ?? "", /协作访客/);
+  });
+
+  it("forces the dsh read-only preset even when the binding is full access", async () => {
+    const h = makeHarness();
+    h.registry.enqueue(
+      "om_1::guest",
+      "oc_group",
+      "om_1",
+      "进度如何？",
+      { ...binding, provider: "dsh", permission: "danger-full-access" },
+      undefined,
+      null,
+      { ...guest, permission: "read-only" },
+    );
+    await flush();
+    const config = h.created[0].config;
+    assert.equal(config.featureValues?.paseo_dsh_permission_preset, "read-only");
+    assert.equal(config.modeId, undefined);
+  });
+
+  it("never lets a fresh main-stream command target the guest session", async () => {
+    const h = makeHarness();
+    h.registry.enqueue(
+      "om_1::guest",
+      "oc_group",
+      "om_1",
+      "访客的问题",
+      binding,
+      undefined,
+      null,
+      guest,
+    );
+    await flush();
+    assert.equal(h.registry.latestTopicKey("oc_group"), null);
+    h.registry.enqueue("om_1", "oc_group", "om_2", "负责人的问题", binding);
+    await flush();
+    assert.equal(h.registry.latestTopicKey("oc_group"), "om_1");
+  });
+
+  it("keeps the guest session separate from the owner session", async () => {
+    const h = makeHarness();
+    h.registry.enqueue("om_1", "oc_group", "om_1", "负责人的问题", binding);
+    await flush();
+    const ownerAgent = h.currentAgent().id;
+    h.registry.enqueue(
+      "om_1::guest",
+      "oc_group",
+      "om_2",
+      "访客的问题",
+      binding,
+      undefined,
+      null,
+      guest,
+    );
+    await flush();
+    assert.equal(h.created.length, 2, "guest gets its own agent");
+    assert.notEqual(h.currentAgent().id, ownerAgent);
+    assert.equal(h.runCalls.length, 0, "both first turns run through create()");
+  });
+});

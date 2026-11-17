@@ -58,6 +58,14 @@ const ALIASES: Record<string, string> = {
   问题列表: "issues",
   issue: "issue",
   问题: "issue",
+  remember: "remember",
+  记住: "remember",
+  memory: "memory",
+  记忆: "memory",
+  forget: "forget",
+  忘记: "forget",
+  collab: "collab",
+  协作: "collab",
 };
 
 /** Parse `/name args`; returns null for non-command messages. */
@@ -92,6 +100,8 @@ export function commandHelp(): string {
     "`/issue close [原因]` 关闭当前话题的问题记录",
     "`/issue type 问题|需求|咨询` 修正当前话题的类型",
     "`/issue track` 强制把当前话题登记到跟踪表（跳过 AI 判断）",
+    "`/remember <规则>` 记住一条纠正，后续消息自动遵守；`/memory` 查看，`/forget <编号>` 删除",
+    "`/collab` 查看本话题协作状态；`/collab open @成员 [24h] [范围]` 开启限时只读协作；`/collab close` 关闭",
     "`/doctor` 自检 lark-cli、监听、卡片回调与 provider",
     "`/help` 显示这份帮助",
   ].join("\n");
@@ -123,6 +133,27 @@ export interface CommandIssueActions {
   track: () => Promise<string>;
 }
 
+export interface CommandMemoryActions {
+  /** Store a rule for this chat; returns the ready-to-send confirmation. */
+  remember: (text: string) => string;
+  /** Formatted `#id · date · rule` list. */
+  list: () => string;
+  /** Delete by id; returns the ready-to-send result. */
+  forget: (target: string) => string;
+}
+
+export interface CommandCollabActions {
+  /** Host switch; off means `/collab open` explains where to enable it. */
+  enabled: boolean;
+  /** Only the topic owner (or either side of a p2p chat) may open/close. */
+  isOwner: boolean;
+  /** Collaboration is a group-topic feature; p2p chats need no grant. */
+  isGroup: boolean;
+  status: () => string;
+  open: (input: { guests: { openId: string; name: string }[]; hours: number; scope: string }) => Promise<string>;
+  close: () => string;
+}
+
 export interface CommandContext {
   command: ParsedCommand;
   values: BotValues;
@@ -140,6 +171,12 @@ export interface CommandContext {
   doctor: () => Promise<string>;
   /** Optional issue-ledger actions; omitted when tracking is not configured. */
   issue?: CommandIssueActions;
+  /** Optional chat memory actions; omitted on hosts without a store. */
+  memory?: CommandMemoryActions;
+  /** Optional guest-collaboration actions; omitted on hosts without a store. */
+  collab?: CommandCollabActions;
+  /** People/bots @-mentioned in the command message (bot excluded). */
+  mentions?: ReadonlyArray<{ openId: string; name: string }>;
   /** Group bots for /bots; omitted when the host cannot list members. */
   listBots?: () => Promise<LarkChatBot[]>;
   /** Users + bots for /members; omitted when the host cannot list members. */
@@ -412,6 +449,38 @@ export async function runCommand(context: CommandContext): Promise<void> {
     case "cron":
       await runCronCommand(context, args);
       return;
+    case "remember": {
+      if (!context.memory) {
+        await reply("当前宿主没有配置会话记忆。");
+        return;
+      }
+      if (!args) {
+        await reply("用法：`/remember <需要长期遵守的规则>`，例如 `/remember 不要用内部代号，先说结论`。");
+        return;
+      }
+      await reply(context.memory.remember(args));
+      return;
+    }
+    case "memory":
+      await reply(
+        context.memory ? context.memory.list() : "当前宿主没有配置会话记忆。",
+      );
+      return;
+    case "forget": {
+      if (!context.memory) {
+        await reply("当前宿主没有配置会话记忆。");
+        return;
+      }
+      if (!args) {
+        await reply("用法：`/forget <编号>`；先发 `/memory` 查看编号。");
+        return;
+      }
+      await reply(context.memory.forget(args));
+      return;
+    }
+    case "collab":
+      await runCollabCommand(context, args);
+      return;
     case "doctor":
       await reply(await context.doctor());
       return;
@@ -679,4 +748,80 @@ async function runCronCommand(context: CommandContext, args: string): Promise<vo
   }
 
   await reply("用法：`/cron list`、`/cron add <表达式> <提示词>`、`/cron remove|on|off|run <id>`。");
+}
+
+const COLLAB_DEFAULT_HOURS = 24;
+const COLLAB_MAX_HOURS = 72;
+
+/**
+ * `/collab` family. Status is readable by anyone allowed to run commands;
+ * opening and closing is limited to the topic owner by the dispatcher. The
+ * guest list comes from @-mentions in the command message, because the
+ * pre-rendered command text has the mention placeholders stripped.
+ */
+async function runCollabCommand(context: CommandContext, args: string): Promise<void> {
+  const { reply, collab } = context;
+  if (!collab) {
+    await reply("当前宿主没有配置协作功能。");
+    return;
+  }
+  const tokens = args.split(/\s+/).filter(Boolean);
+  const sub = (tokens.shift() ?? "status").toLowerCase();
+
+  if (sub === "status" || sub === "状态") {
+    await reply(collab.status());
+    return;
+  }
+
+  if (sub === "open" || sub === "开启") {
+    if (!collab.enabled) {
+      await reply(
+        "管理员未开启协作功能：请在「飞书机器人 → 全局设置 → 安全与限制」打开「允许话题发起人开启限时协作」。",
+      );
+      return;
+    }
+    if (!collab.isOwner) {
+      await reply("只有本话题的发起人可以开启协作。");
+      return;
+    }
+    if (!collab.isGroup) {
+      await reply("单聊是私聊，不需要开启协作。");
+      return;
+    }
+    const guests = (context.mentions ?? []).map((mention) => ({
+      openId: mention.openId,
+      name: mention.name,
+    }));
+    if (guests.length === 0) {
+      await reply("请在命令里 @ 至少一位访客，例如 `/collab open @张三 @李四 24h 只看本话题进度`。");
+      return;
+    }
+    let hours = COLLAB_DEFAULT_HOURS;
+    const scopeParts: string[] = [];
+    for (const token of tokens) {
+      const match = /^(\d+)\s*(h|小时|d|天)$/i.exec(token);
+      if (!match) {
+        scopeParts.push(token);
+        continue;
+      }
+      const amount = Number(match[1]);
+      const days = /d|天/i.test(match[2] ?? "");
+      hours = Math.min(COLLAB_MAX_HOURS, Math.max(1, days ? amount * 24 : amount));
+    }
+    await reply(await collab.open({ guests, hours, scope: scopeParts.join(" ") }));
+    return;
+  }
+
+  if (sub === "close" || sub === "关闭") {
+    if (!collab.isOwner) {
+      await reply("只有本话题的发起人可以关闭协作。");
+      return;
+    }
+    await reply(collab.close());
+    return;
+  }
+
+  await reply(
+    "用法：`/collab` 查看状态，`/collab open @成员 [24h|3d] [范围]` 开启限时协作，`/collab close` 关闭。",
+  );
 }

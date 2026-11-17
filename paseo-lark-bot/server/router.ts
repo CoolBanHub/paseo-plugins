@@ -34,7 +34,18 @@ export function mentionsBot(event: LarkMessageEvent, botOpenId: string | null): 
  * handled directly. The bot's own outgoing messages and non-text types are
  * ignored. A bound chat can restrict triggering to allowlisted users.
  */
-export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpenId: string | null): RoutingDecision {
+export function routeMessage(
+  event: LarkMessageEvent,
+  values: BotValues,
+  botOpenId: string | null,
+  options?: {
+    /**
+     * Guest mode: the dispatcher already matched this sender against an
+     * unexpired topic grant, which is stricter than the binding allowlist.
+     */
+    allowUnlistedSender?: boolean;
+  },
+): RoutingDecision {
   if (!HANDLED_MESSAGE_TYPES.has(event.message_type)) {
     return { binding: null, prompt: "", reason: "ignored" };
   }
@@ -57,7 +68,7 @@ export function routeMessage(event: LarkMessageEvent, values: BotValues, botOpen
   if (!binding) {
     return { binding: null, prompt: "", reason: "unmatched" };
   }
-  if (!isSenderAllowed(binding, event.sender_id)) {
+  if (!options?.allowUnlistedSender && !isSenderAllowed(binding, event.sender_id)) {
     return { binding: null, prompt: "", reason: "blocked" };
   }
   return { binding, prompt: extractPrompt(event), reason: "ok" };

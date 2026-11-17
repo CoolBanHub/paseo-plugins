@@ -346,6 +346,13 @@ export const botValuesSchema = z.object({
    */
   rateLimitPerHour: z.number().int().min(0).max(500).default(20),
   /**
+   * Allow a topic owner to open time-boxed guest access in that topic
+   * (`/collab open`). Off by default: guest turns run in a separate session
+   * with the provider's read-only mode, but sharing the agent with teammates
+   * is still an explicit per-host decision.
+   */
+  collabEnabled: z.boolean().default(false),
+  /**
    * Give each chat binding its own workspace (named after the chat) instead
    * of putting every topic agent in the shared "飞书任务" workspace. Use this
    * when bindings point at different project directories.

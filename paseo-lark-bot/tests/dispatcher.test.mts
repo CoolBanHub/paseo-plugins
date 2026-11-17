@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createDispatcher } from "../server/dispatcher.ts";
+import { createCollabStore } from "../server/collab.ts";
+import { createMemoryStore } from "../server/memory.ts";
 import type { IssueRecord, IssueTracker } from "../server/issues.ts";
 import type { LarkCardActionEvent, LarkMessageEvent } from "../server/lark-events.ts";
 import type {
@@ -2796,5 +2798,179 @@ describe("completion mentions", () => {
     off.dispatch.handleTurnEnded(turnEnded("agent-1", "完成"));
     await flush();
     assert.equal(off.replies.length, 1);
+  });
+});
+
+describe("guest collaboration", () => {
+  const NOW = 1_700_000_000_000;
+
+  function setup() {
+    const dir = mkdtempSync(join(tmpdir(), "lark-dispatch-guest-"));
+    const collabPath = join(dir, "collab.json");
+    const memoryPath = join(dir, "memory.json");
+    const collab = createCollabStore(collabPath, { now: () => NOW });
+    collab.open({
+      chatId: "oc_group",
+      topicKey: "om_root",
+      guests: [{ openId: "ou_guest", name: "张三" }],
+      openedBy: "ou_owner",
+      hours: 24,
+      scope: "只看本话题进度",
+      permission: "plan",
+      provider: "claude",
+    });
+    createMemoryStore(memoryPath, { now: () => NOW }).remember(
+      "oc_group",
+      "负责人的内部规则，访客不可见",
+      "ou_owner",
+    );
+    const values = baseValues({ collabEnabled: true });
+    values.chats[0] = {
+      ...values.chats[0],
+      allowedUsers: [{ openId: "ou_owner", name: "负责人" }],
+    };
+    return { dir, collabPath, memoryPath, values };
+  }
+
+  it("lets a named guest trigger a read-only session without owner memory", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    try {
+      const h = makeHarness(values, {
+        now: () => NOW,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({
+          sender_id: "ou_guest",
+          root_id: "om_root",
+          content: "@_user_1 进度如何？",
+        }),
+      );
+      await flush();
+      assert.equal(h.created.length, 1);
+      const config = h.created[0].config as { systemPrompt?: string; modeId?: string };
+      assert.match(config.systemPrompt ?? "", /协作访客/);
+      assert.match(config.systemPrompt ?? "", /只看本话题进度/);
+      assert.equal(config.modeId, "plan");
+      assert.match(h.created[0].prompt ?? "", /进度如何/);
+      assert.doesNotMatch(h.created[0].prompt ?? "", /负责人的内部规则/);
+      assert.doesNotMatch(config.systemPrompt ?? "", /负责人的内部规则/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("injects the chat memory into owner turns", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    try {
+      const h = makeHarness(values, {
+        now: () => NOW,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ sender_id: "ou_owner", root_id: "om_root", content: "@_user_1 继续" }),
+      );
+      await flush();
+      assert.equal(h.created.length, 1);
+      assert.match(h.created[0].prompt ?? "", /### 会话记忆（长期有效）/);
+      assert.match(h.created[0].prompt ?? "", /负责人的内部规则/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses commands from guests", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    try {
+      const h = makeHarness(values, {
+        now: () => NOW,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ sender_id: "ou_guest", root_id: "om_root", content: "@_user_1 /new" }),
+      );
+      await flush();
+      assert.equal(h.created.length, 0);
+      assert.match(h.replies[0]?.text ?? "", /访客模式不能使用命令/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sends guest answers as markdown without mentions", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    values.chats[0] = {
+      ...values.chats[0],
+      replyFormat: "post",
+      mentionOnReply: "both",
+    };
+    try {
+      const h = makeHarness(values, {
+        now: () => NOW,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ sender_id: "ou_guest", root_id: "om_root", content: "@_user_1 进度如何？" }),
+      );
+      await flush();
+      assert.equal(h.created.length, 1);
+      h.dispatch.handleTurnEnded(
+        turnEnded(h.agentId, '<at user_id="ou_owner">负责人</at> 进度 50%'),
+      );
+      await flush();
+      assert.equal(h.replies.length, 1);
+      assert.equal(h.replies[0]?.format, "markdown");
+      assert.doesNotMatch(h.replies[0]?.text ?? "", /<at /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("revokes an active grant as soon as collabEnabled is turned off", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    values.collabEnabled = false;
+    try {
+      const h = makeHarness(values, {
+        now: () => NOW,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({ sender_id: "ou_guest", root_id: "om_root", content: "@_user_1 进度如何？" }),
+      );
+      await flush();
+      assert.equal(h.created.length, 0);
+      assert.match(h.replies[0]?.text ?? "", /仅允许指定成员/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks the guest once the grant expires", async () => {
+    const { dir, collabPath, memoryPath, values } = setup();
+    try {
+      const later = NOW + 25 * 3_600_000;
+      const h = makeHarness(values, {
+        now: () => later,
+        collabStorePath: collabPath,
+        memoryStorePath: memoryPath,
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({
+          sender_id: "ou_guest",
+          root_id: "om_root",
+          content: "@_user_1 进度如何？",
+        }),
+      );
+      await flush();
+      assert.equal(h.created.length, 0);
+      assert.match(h.replies[0]?.text ?? "", /仅允许指定成员/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -209,6 +209,8 @@ function ensureDispatcher(
       dedupStorePath: join(PLUGIN_DATA_ROOT, "seen-message-ids.json"),
       topicStorePath: join(PLUGIN_DATA_ROOT, "topic-agents.json"),
       pendingStorePath: join(PLUGIN_DATA_ROOT, "pending-questions.json"),
+      memoryStorePath: join(PLUGIN_DATA_ROOT, "memory.json"),
+      collabStorePath: join(PLUGIN_DATA_ROOT, "collab-grants.json"),
       mediaStoreDir: join(PLUGIN_DATA_ROOT, "media"),
       pluginDataDir: PLUGIN_DATA_ROOT,
       attachmentOutboxDir: join(PLUGIN_DATA_ROOT, "outbox"),

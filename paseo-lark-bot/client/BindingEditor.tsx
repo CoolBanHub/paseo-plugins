@@ -7,6 +7,7 @@ import {
   type ChatBinding,
   type ReplyFormat,
 } from "../shared/settings.ts";
+import { REPLY_INSTRUCTION_PRESETS } from "../shared/presets.ts";
 import {
   Card,
   CardTitle,
@@ -342,6 +343,20 @@ export function BindingEditor({
           onChangeText={(text) => onPatch({ replyInstruction: text })}
           style={inputStyle({ minHeight: 64, textAlignVertical: "top" })}
         />
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          {REPLY_INSTRUCTION_PRESETS.map((preset) => (
+            <ChoicePill
+              key={preset.id}
+              label={preset.label}
+              active={binding.replyInstruction.trim() === preset.text.trim()}
+              onPress={() => onPatch({ replyInstruction: preset.text })}
+            />
+          ))}
+        </View>
+        <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
+          点预设会覆盖当前内容，可再按群的习惯修改：
+          {REPLY_INSTRUCTION_PRESETS.map((preset) => `${preset.label} = ${preset.hint}`).join("；")}。
+        </Text>
         <Text style={{ fontSize: 11, color: colors().foregroundMuted }}>
           追加到系统提示末尾，直接决定回答风格；AI 改写默认也按它改写。提示词模型可能不完全遵守；保存后对新建会话生效，已有话题可发 /new 重建。硬性长度限制可在全局设置里调小「单条回复长度」。
         </Text>

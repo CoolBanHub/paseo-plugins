@@ -10,6 +10,7 @@ import {
 import { isMissingAgentError, isTransientTurnError, sanitizeTopicText } from "./format.ts";
 import { generateTopicTitle } from "./title.ts";
 import { ensureWorkspace, workspaceTitleFor } from "./workspace.ts";
+import { guestCollabPrompt, isGuestTopicKey } from "./collab.ts";
 
 /** Expand a leading `~`; empty cwd still means the user's home directory. */
 export function resolveCwd(cwd: string): string {
@@ -63,6 +64,19 @@ export interface TopicOverrides {
   thinkingOptionId?: string;
   permission?: string;
   cwd?: string;
+}
+
+/**
+ * A guest turn's identity and grant snapshot. Sessions created from it get a
+ * separate, read-only agent with the guest prompt instead of the owner's.
+ */
+export interface GuestTurn {
+  openId: string;
+  name: string;
+  scope: string;
+  expiresAt: number;
+  /** Read-only provider mode (dsh: permission preset). */
+  permission: string;
 }
 
 /** Normalized live activity forwarded from the agent timeline. */
@@ -171,6 +185,7 @@ function providerCreateConfig(
   membersHelperPath?: string | null,
   larkCliPath?: string | null,
   issueHelperPath?: string | null,
+  guest?: GuestTurn,
 ): {
   provider: string;
   systemPrompt?: string;
@@ -179,6 +194,37 @@ function providerCreateConfig(
   featureValues?: Record<string, unknown>;
 } {
   const thinking = overrides.thinkingOptionId ?? binding.thinkingOptionId;
+
+  // Guest turns never inherit the owner's prompt, reply style, member
+  // directory or helpers: only the read-only guest brief and the forced
+  // read-only mode. Everything else would leak context written for the owner.
+  if (guest) {
+    const guestConfig: {
+      provider: string;
+      systemPrompt?: string;
+      modeId?: string;
+      thinkingOptionId?: string;
+      featureValues?: Record<string, unknown>;
+    } = {
+      provider,
+      systemPrompt: guestCollabPrompt({
+        name: guest.name,
+        openId: guest.openId,
+        scope: guest.scope,
+        expiresAt: guest.expiresAt,
+      }),
+    };
+    if (isDshProvider(provider)) {
+      guestConfig.featureValues = {
+        paseo_dsh_permission_preset: guest.permission.trim() || "read-only",
+      };
+    } else if (guest.permission.trim()) {
+      guestConfig.modeId = guest.permission.trim();
+    }
+    if (thinking.trim()) guestConfig.thinkingOptionId = thinking.trim();
+    return guestConfig;
+  }
+
   const permission = overrides.permission ?? binding.permission;
   const mentionHelper = binding.replyFormat === "post" ? membersHelperPath : null;
   const basePrompt =
@@ -433,6 +479,8 @@ interface QueueItem {
   topicRootText?: string;
   binding: ChatBinding;
   images?: SessionImage[];
+  /** Present when the turn runs in the read-only guest session. */
+  guest?: GuestTurn;
 }
 
 interface TopicState {
@@ -947,6 +995,7 @@ export function createSessionRegistry(options: {
     binding: ChatBinding,
     images?: SessionImage[],
     topicRootText?: string | null,
+    guest?: GuestTurn,
   ): boolean {
     if (disposed) return false;
     const state = stateFor(topicKey, chatId);
@@ -980,6 +1029,7 @@ export function createSessionRegistry(options: {
       topicRootText: topicRootText ?? undefined,
       binding,
       images,
+      ...(guest ? { guest } : {}),
     });
     drain(topicKey);
     return true;
@@ -1429,9 +1479,13 @@ export function createSessionRegistry(options: {
     // comes from the workspace directory. Without the workspaces slice (older
     // daemon / failure), fall back to a standalone create() with the cwd.
     const workspace = await workspaceForAgent(item, cwd);
-    const attachmentEnv = options.getAttachmentEnv?.(state.chatId, topicKey);
+    const guestTurn = item.guest;
+    // Guest sessions get neither the attachment helper nor the member
+    // directory: both are owner-scoped capabilities, and the guest brief
+    // already forbids sending things or @-ing people.
+    const attachmentEnv = guestTurn ? undefined : options.getAttachmentEnv?.(state.chatId, topicKey);
     let memberDirectory: string | null = null;
-    if (effective.replyFormat === "post") {
+    if (!guestTurn && effective.replyFormat === "post") {
       try {
         memberDirectory =
           (await options.getMemberDirectory?.(state.chatId, effective.replyFormat)) ?? null;
@@ -1450,9 +1504,16 @@ export function createSessionRegistry(options: {
         options.getMembersHelperPath?.() ?? null,
         options.getLarkCliPath?.() ?? null,
         options.getIssueHelperPath?.() ?? null,
+        guestTurn,
       ),
-      title: await resolveTitle(topicKey, item, provider, cwd, workspace),
-      labels: { "lark-bot-chat": state.chatId, "lark-bot-topic": topicKey },
+      title: guestTurn
+        ? `协作访客 · ${(item.topicRootText?.trim() || item.prompt.trim() || "话题").slice(0, 20)}`
+        : await resolveTitle(topicKey, item, provider, cwd, workspace),
+      labels: {
+        "lark-bot-chat": state.chatId,
+        "lark-bot-topic": topicKey,
+        ...(guestTurn ? { "lark-bot-guest": "1" } : {}),
+      },
       prompt: item.prompt,
       images: item.images,
       ...(attachmentEnv ? { env: attachmentEnv } : {}),
@@ -1694,6 +1755,9 @@ export function createSessionRegistry(options: {
     let best: { key: string; at: number } | null = null;
     for (const [key, state] of topics) {
       if (state.chatId !== chatId) continue;
+      // A fresh command in the main stream must never target the guest
+      // sibling session; it is not a topic the operator owns.
+      if (isGuestTopicKey(key)) continue;
       if (!state.agentId && !state.busy && state.queue.length === 0) continue;
       const at = Math.max(state.lastActivityAt, state.busySince ?? 0);
       if (!best || at > best.at) best = { key, at };

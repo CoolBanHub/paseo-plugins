@@ -296,3 +296,165 @@ describe("command handlers", () => {
     assert.match(missing.replies[0] ?? "", /还没有启用问题跟踪/);
   });
 });
+
+describe("memory commands", () => {
+  it("routes /remember, /memory and /forget to the store", async () => {
+    const calls: string[] = [];
+    const memory = {
+      remember: (text: string) => {
+        calls.push(`remember:${text}`);
+        return "已记住 #1：先说结论";
+      },
+      list: () => {
+        calls.push("list");
+        return "**本会话记忆（1 条）**\n#1 · 2026-11-17 · 先说结论";
+      },
+      forget: (target: string) => {
+        calls.push(`forget:${target}`);
+        return "已删除 #1";
+      },
+    };
+
+    const remember = context({
+      command: { name: "remember", args: "先说结论" },
+      memory,
+    });
+    await runCommand(remember.value);
+    assert.match(remember.replies[0] ?? "", /已记住/);
+
+    const list = context({ command: { name: "memory", args: "" }, memory });
+    await runCommand(list.value);
+    assert.match(list.replies[0] ?? "", /本会话记忆/);
+
+    const forget = context({ command: { name: "forget", args: "1" }, memory });
+    await runCommand(forget.value);
+    assert.match(forget.replies[0] ?? "", /已删除/);
+
+    assert.deepEqual(calls, ["remember:先说结论", "list", "forget:1"]);
+  });
+
+  it("explains when memory is unavailable or the rule is empty", async () => {
+    const unavailable = context({ command: { name: "memory", args: "" } });
+    await runCommand(unavailable.value);
+    assert.match(unavailable.replies[0] ?? "", /没有配置会话记忆/);
+
+    const empty = context({
+      command: { name: "remember", args: "" },
+      memory: {
+        remember: () => "",
+        list: () => "",
+        forget: () => "",
+      },
+    });
+    await runCommand(empty.value);
+    assert.match(empty.replies[0] ?? "", /用法/);
+  });
+});
+
+describe("collab commands", () => {
+  const mentions = [{ openId: "ou_a", name: "张三" }];
+
+  function collabActions(overrides: Partial<{
+    enabled: boolean;
+    isOwner: boolean;
+    isGroup: boolean;
+    status: () => string;
+    open: (input: { guests: { openId: string; name: string }[]; hours: number; scope: string }) => Promise<string>;
+    close: () => string;
+  }> = {}) {
+    return {
+      enabled: true,
+      isOwner: true,
+      isGroup: true,
+      status: () => "本话题没有进行中的协作。",
+      open: async () => "已开启协作",
+      close: () => "已关闭协作",
+      ...overrides,
+    };
+  }
+
+  it("parses guests, duration and scope and opens collaboration", async () => {
+    const opened: { guests: { openId: string; name: string }[]; hours: number; scope: string }[] = [];
+    const h = context({
+      command: { name: "collab", args: "open 2d 只看本话题进度" },
+      mentions,
+      collab: collabActions({
+        open: async (input) => {
+          opened.push(input);
+          return "已开启协作";
+        },
+      }),
+    });
+    await runCommand(h.value);
+    assert.deepEqual(opened[0], {
+      guests: [{ openId: "ou_a", name: "张三" }],
+      hours: 48,
+      scope: "只看本话题进度",
+    });
+    assert.match(h.replies[0] ?? "", /已开启协作/);
+  });
+
+  it("defaults to 24 hours and caps the duration at 72", async () => {
+    const hours: number[] = [];
+    const make = (args: string) =>
+      context({
+        command: { name: "collab", args },
+        mentions,
+        collab: collabActions({
+          open: async (input) => {
+            hours.push(input.hours);
+            return "ok";
+          },
+        }),
+      });
+    await runCommand(make("open").value);
+    await runCommand(make("open 9d").value);
+    assert.deepEqual(hours, [24, 72]);
+  });
+
+  it("refuses when disabled, when not the owner, or without mentions", async () => {
+    const disabled = context({
+      command: { name: "collab", args: "open 1h" },
+      mentions,
+      collab: collabActions({ enabled: false }),
+    });
+    await runCommand(disabled.value);
+    assert.match(disabled.replies[0] ?? "", /管理员未开启协作/);
+
+    const notOwner = context({
+      command: { name: "collab", args: "open 1h" },
+      mentions,
+      collab: collabActions({ isOwner: false }),
+    });
+    await runCommand(notOwner.value);
+    assert.match(notOwner.replies[0] ?? "", /只有本话题的发起人/);
+
+    const noMentions = context({
+      command: { name: "collab", args: "open 1h" },
+      collab: collabActions(),
+    });
+    await runCommand(noMentions.value);
+    assert.match(noMentions.replies[0] ?? "", /@ 至少一位访客/);
+  });
+
+  it("reports status and closes for the owner", async () => {
+    const status = context({
+      command: { name: "collab", args: "" },
+      collab: collabActions({ status: () => "协作进行中" }),
+    });
+    await runCommand(status.value);
+    assert.equal(status.replies[0], "协作进行中");
+
+    const close = context({
+      command: { name: "collab", args: "close" },
+      collab: collabActions(),
+    });
+    await runCommand(close.value);
+    assert.equal(close.replies[0], "已关闭协作");
+  });
+
+  it("documents the new commands in /help", () => {
+    assert.match(commandHelp(), /\/remember/);
+    assert.match(commandHelp(), /\/collab/);
+  });
+});

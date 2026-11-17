@@ -22,6 +22,7 @@ describe("chat binding schema", () => {
     assert.equal(binding.cwd, "");
     assert.equal(binding.systemPrompt, "");
     assert.equal(binding.replyInstruction, "");
+    assert.equal(parsed.collabEnabled, false);
     assert.equal(binding.replyRewrite, "off");
     assert.equal(binding.rewriteProvider, "");
     assert.equal(binding.rewriteModel, "");
