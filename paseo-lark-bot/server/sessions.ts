@@ -825,6 +825,13 @@ export function createSessionRegistry(options: {
   const agentToTopic = new Map<string, string>();
   /** turn_ended can arrive before agents.create() resolves and maps the id. */
   const deferredTurnEnds = new Map<string, TurnOutcome>();
+  /**
+   * Number of ensureAgent() resolutions whose handle has not been mapped to a
+   * topic yet. A completion may fire before the returned handle is mapped;
+   * without this counter there is no way to tell that event apart from a
+   * manual Paseo turn, and the reply would be dropped.
+   */
+  let pendingMappings = 0;
 
   function freshTopicState(chatId: string): TopicState {
     return {
@@ -1163,18 +1170,28 @@ export function createSessionRegistry(options: {
       // ensureAgent() passes the prompt to agents.create() for fresh sessions,
       // which already starts the first turn — running it again would duplicate
       // the message.
-      const { handle, created } = await ensureAgent(topicKey, item);
-      if (state.activeTurn !== turn) return;
-      state.lastActivityAt = now();
-      agentToTopic.set(handle.id, topicKey);
-      // Persist the in-flight turn before any further await. A reload, crash
-      // or hard restart can then recover the final reply from the timeline.
-      state.pendingTurn = {
-        target: item.messageId,
-        startedAt: state.busySince ?? now(),
-      };
-      flushTopicStore();
-      state.pendingTargets.push(item.messageId);
+      // Keep pendingMappings set until the id is mapped and the reply target is
+      // recorded: a fast create() can emit turn_ended in that gap.
+      let ensured: { handle: SessionAgentHandle; created: boolean } | null = null;
+      pendingMappings += 1;
+      try {
+        ensured = await ensureAgent(topicKey, item);
+        if (state.activeTurn !== turn) return;
+        state.lastActivityAt = now();
+        agentToTopic.set(ensured.handle.id, topicKey);
+        // Persist the in-flight turn before any further await. A reload, crash
+        // or hard restart can then recover the final reply from the timeline.
+        state.pendingTurn = {
+          target: item.messageId,
+          startedAt: state.busySince ?? now(),
+        };
+        flushTopicStore();
+        state.pendingTargets.push(item.messageId);
+      } finally {
+        pendingMappings -= 1;
+      }
+      if (!ensured) return;
+      const { handle, created } = ensured;
       if (created) {
         // The first turn is driven by create(); wait for turn_ended. If the
         // completion raced ahead of the mapping, replay it now.
@@ -1185,6 +1202,9 @@ export function createSessionRegistry(options: {
         }
         return;
       }
+      // A restored handle may have emitted a completion for its previous turn
+      // before reattach; it belongs to no current turn, so do not retain it.
+      deferredTurnEnds.delete(handle.id);
       const result = await handle.run(item.prompt, { timeoutMs: RUN_TIMEOUT_MS, images: item.images });
       if (state.activeTurn !== turn) return;
       if (result.status === "error") {
@@ -1537,7 +1557,11 @@ export function createSessionRegistry(options: {
     if (disposed) return;
     const topicKey = agentToTopic.get(agentId);
     if (!topicKey) {
-      // create() is still in flight; replay this completion when the id maps.
+      // Only retain events while ensureAgent() is still resolving. Unknown
+      // agents from manual Paseo turns must not fill the deferred map or they
+      // could evict a real fast-create completion.
+      if (pendingMappings === 0) return;
+      // The handle is about to be mapped; replay this completion then.
       if (deferredTurnEnds.size >= 50) {
         const oldest = deferredTurnEnds.keys().next().value;
         if (oldest) deferredTurnEnds.delete(oldest);

@@ -156,6 +156,12 @@ export interface DispatcherOptions {
   resolveProvider?: (provider: string, model: string) => Promise<string>;
   /** Fallback reply lookup when turn_ended carries no assistant text. */
   fetchLastReply?: (agentId: string) => Promise<string | null>;
+  /**
+   * Backoff after each failed reply send. The number of entries also sets the
+   * retry budget: one initial attempt plus one per delay. Tests shrink this so
+   * a transient-failure case does not wait seconds.
+   */
+  replyRetryDelaysMs?: number[];
   resolveCli?: (explicit: string) => string | null;
   readOpenId?: (cliPath: string) => Promise<string | null>;
   reply?: (options: {
@@ -314,6 +320,21 @@ function replyAwaitsConfirmation(text: string | null | undefined): boolean {
 const MAX_PENDING_QUESTIONS = 200;
 
 /**
+ * Failures a fresh lark-cli process can plausibly recover from. The daemon
+ * often kills a slow CLI before it can retry a bad DNS answer, so the Chinese
+ * timeout message emitted by runWithStdin() must count as transient too.
+ */
+const RETRYABLE_REPLY_FAILURE =
+  /429|rate\s*limit|too many requests|频率|限流|timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|network|temporarily|超时|网络|连接(?:失败|重置|中断)|服务暂不可用/i;
+const RATE_LIMIT_REPLY_FAILURE = /429|rate\s*limit|too many requests|频率|限流/i;
+/** First retry is quick; later ones ride out a short DNS/network flap. */
+const DEFAULT_REPLY_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
+function isRetryableReplyFailure(message: string): boolean {
+  return RETRYABLE_REPLY_FAILURE.test(message);
+}
+
+/**
  * Wires inbound Feishu message events to per-chat agent sessions and sends
  * every reply back under the triggering message. turn_ended is the single
  * reply signal; permission requests are surfaced in the chat but resolved in
@@ -335,6 +356,7 @@ export function createDispatcher(options: DispatcherOptions) {
       console.log("[lark-bot] " + message, detail === undefined ? "" : detail);
     });
   const now = options.now ?? Date.now;
+  const replyRetryDelays = options.replyRetryDelaysMs ?? DEFAULT_REPLY_RETRY_DELAYS_MS;
   const memoryStore = createMemoryStore(options.memoryStorePath ?? null, {
     now,
     log: (message) => log(message),
@@ -1970,7 +1992,10 @@ export function createDispatcher(options: DispatcherOptions) {
   }
 
   function handleTurnEnded(event: TurnEndedEvent): void {
-    if (!sessions.ownsAgent(event.agent.id)) return;
+    // Do not drop unknown ids here: a fast create() can emit turn_ended before
+    // the registry maps the handle, and the registry has to see the event to
+    // replay it once the id is known. With no create in flight it ignores
+    // unknown agents itself, so manual Paseo turns stay filtered.
     let lastText: string | null = null;
     for (let index = event.timeline.length - 1; index >= 0; index -= 1) {
       const item = event.timeline[index];
@@ -2463,6 +2488,7 @@ export function createDispatcher(options: DispatcherOptions) {
     // Retryable failures (rate limit, transient transport) retry with backoff
     // under one idempotency key, so a retry can never duplicate a message.
     const key = `lb-${createHash("sha256").update(`${messageId}:${index}:${text}`).digest("hex").slice(0, 40)}`;
+    const maxAttempts = replyRetryDelays.length + 1;
     for (let attempt = 1; ; attempt += 1) {
       try {
         await reply({
@@ -2476,18 +2502,15 @@ export function createDispatcher(options: DispatcherOptions) {
         return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const retryable =
-          attempt < 3 &&
-          /429|rate\s*limit|too many requests|频率|限流|timeout|timed out|ETIMEDOUT|ECONNRESET|network|temporarily/i.test(
-            message,
-          );
-        if (!retryable) {
+        if (attempt >= maxAttempts || !isRetryableReplyFailure(message)) {
           log("回复消息失败", message);
           return false;
         }
-        const backoffMs = /429|rate\s*limit|too many requests|频率|限流/i.test(message)
+        // Rate limits get a fixed longer pause; transport failures use the
+        // increasing schedule (1s, 2s, 4s by default).
+        const backoffMs = RATE_LIMIT_REPLY_FAILURE.test(message)
           ? 5_000
-          : 1_000 * attempt;
+          : (replyRetryDelays[attempt - 1] ?? 1_000);
         log(
           `回复消息失败，${Math.round(backoffMs / 1000)}s 后重试（第 ${attempt} 次）`,
           message.slice(0, 200),

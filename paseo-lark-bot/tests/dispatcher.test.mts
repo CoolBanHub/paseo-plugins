@@ -1763,6 +1763,87 @@ describe("delivery reliability", () => {
     assert.ok(attempts.every((key) => key && key === attempts[0]), "retries reuse the idempotency key");
   });
 
+  it("retries a native lark-cli timeout as a transient failure", async () => {
+    const values = baseValues();
+    const attempts: Array<string | undefined> = [];
+    const sent: string[] = [];
+    let failures = 1;
+    const h = makeHarness(values, {
+      replyRetryDelaysMs: [10, 10, 10],
+      reply: async (options) => {
+        attempts.push(options.idempotencyKey);
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("lark-cli 执行超时");
+        }
+        sent.push(options.text);
+        return null;
+      },
+    });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded(h.agentId, "已经修复，请验收。"));
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(attempts.length, 2, "the timeout must be retried");
+    assert.ok(attempts.every((key) => key && key === attempts[0]), "retries reuse the idempotency key");
+    assert.equal(sent.length, 1);
+    assert.match(sent[0] ?? "", /已经修复/);
+  });
+
+  it("replays a completion that arrives before agents.create resolves", async () => {
+    const values = baseValues();
+    const replies: string[] = [];
+    let current: SessionAgentHandle | undefined;
+    let dispatch: ReturnType<typeof createDispatcher>;
+    const paseo = {
+      agents: {
+        create: async () => {
+          current = {
+            id: "agent-early",
+            send: async () => {},
+            run: async () => ({ status: "idle", error: null, lastMessage: "ok" }),
+          };
+          // A fast provider can finish before create() returns; the event must
+          // be deferred instead of being dropped as an unknown agent.
+          dispatch.handleTurnEnded({
+            agent: {
+              id: current.id,
+              workspaceId: null,
+              parentAgentId: null,
+              provider: "claude",
+              cwd: "/tmp",
+              title: null,
+            },
+            turnId: "t1",
+            outcome: { kind: "completed" },
+            timeline: [{ type: "assistant_message", text: "早到的完成结果" }],
+          });
+          return current;
+        },
+        ref: (id: string) => {
+          if (!current || current.id !== id) throw new Error("unexpected ref");
+          return current;
+        },
+      },
+    } as unknown as SessionPaseoApi;
+    dispatch = createDispatcher({
+      paseo,
+      readValues: async () => values,
+      resolveCli: () => "/fake/lark-cli",
+      readOpenId: async () => BOT,
+      reply: async (options) => {
+        replies.push(options.text);
+        return null;
+      },
+      log: () => {},
+    });
+    await dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    assert.equal(replies.length, 1);
+    assert.match(replies[0] ?? "", /早到的完成结果/);
+  });
+
   it("keeps the message-id dedup window across a dispatcher restart", async () => {
     const store = join(tmpdir(), `lark-bot-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
     const values = baseValues();
