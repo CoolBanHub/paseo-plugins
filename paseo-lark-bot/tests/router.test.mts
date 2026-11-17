@@ -102,6 +102,18 @@ describe("routeMessage", () => {
     assert.equal(decision.prompt, "帮我看看这个问题");
   });
 
+  it("matches the bot by app id when its open_id is unavailable", () => {
+    const APP = "cli_test_app";
+    const decision = routeMessage(
+      event({ mentions: [{ id: APP, key: "@_user_1", name: "测试机器人" }] }),
+      values(),
+      null,
+      { botAppId: APP },
+    );
+    assert.equal(decision.reason, "ok");
+    assert.equal(decision.prompt, "帮我看看这个问题");
+  });
+
   it("blocks senders outside the per-chat allowlist", () => {
     const base = values();
     const first = base.chats[0];

@@ -7,6 +7,7 @@ import {
   listChatBots,
   listChatDirectory,
   readBotOpenId,
+  readCurrentAppId,
   readMessageDetail,
   readRawContent,
   removeReaction,
@@ -21,6 +22,11 @@ import {
   type LarkChatDirectoryEntry,
   type MessageDetail,
 } from "./lark.ts";
+import {
+  clearBotIdentity,
+  loadBotIdentity,
+  saveBotIdentity,
+} from "./bot-identity.ts";
 import {
   collectImageKeys,
   downloadMessageResource,
@@ -164,6 +170,14 @@ export interface DispatcherOptions {
   replyRetryDelaysMs?: number[];
   resolveCli?: (explicit: string) => string | null;
   readOpenId?: (cliPath: string) => Promise<string | null>;
+  /** Local app id lookup; used when bot/v3/info is unreachable. */
+  readAppId?: (cliPath: string) => Promise<string | null>;
+  /**
+   * JSON file caching the bot's open_id/app id. Without it, one failed
+   * bot/v3/info call makes every group message look unmentionable and the
+   * message is dropped until a later fetch succeeds.
+   */
+  botIdentityPath?: string;
   reply?: (options: {
     cliPath: string;
     messageId: string;
@@ -372,9 +386,13 @@ export function createDispatcher(options: DispatcherOptions) {
   const sendFile = options.uploadFile || uploadFile;
   const replyWithMedia = options.replyMedia || replyMedia;
   const sendToChat = options.sendChat || sendChatMessage;
+  const readAppId = options.readAppId || readCurrentAppId;
+  const botIdentityPath = options.botIdentityPath ?? null;
+  const storedBotIdentity = loadBotIdentity(botIdentityPath);
 
-  let cachedBotOpenId: string | null = null;
-  let openIdLoaded = false;
+  let cachedBotOpenId: string | null = storedBotIdentity.openId;
+  let cachedBotAppId: string | null = storedBotIdentity.appId;
+  let openIdLoaded = Boolean(storedBotIdentity.openId);
   let warnedMissingCli = false;
   let warnedMemberDirectory = false;
   // Latest inbound message per chat: fallback reply target for notices.
@@ -516,6 +534,16 @@ export function createDispatcher(options: DispatcherOptions) {
     }
   }
 
+  /** True for this bot's own ids (open_id or app id). */
+  function isThisBot(id: string | null | undefined): boolean {
+    return Boolean(id && (id === cachedBotOpenId || id === cachedBotAppId));
+  }
+
+  /** True for this bot and other bots observed in the chat. */
+  function isBotIdentityId(id: string | null | undefined): boolean {
+    return isThisBot(id) || Boolean(id && knownBotIds.has(id));
+  }
+
   let valuesCache: BotValues = { ...DEFAULT_BOT_VALUES };
   /** Inbound turn budget; settings changes call setLimit. */
   const limiter = new SlidingWindowLimiter({
@@ -646,22 +674,68 @@ export function createDispatcher(options: DispatcherOptions) {
     return event.root_id || event.thread_id || event.reply_to || event.message_id;
   }
 
-  async function ensureBotOpenId(cliPath: string): Promise<string | null> {
-    if (openIdLoaded) return cachedBotOpenId;
-    try {
-      cachedBotOpenId = await readOpenId(cliPath);
-      openIdLoaded = true;
-      if (!cachedBotOpenId) log("无法读取机器人 open_id，群聊 @ 识别将不可用");
-    } catch (error) {
-      log("读取机器人 open_id 失败", error instanceof Error ? error.message : String(error));
+  let warnedBotIdentity = false;
+
+  function persistBotIdentity(): void {
+    saveBotIdentity(
+      botIdentityPath,
+      { openId: cachedBotOpenId, appId: cachedBotAppId },
+      log,
+    );
+  }
+
+  /**
+   * Resolve the bot's stable ids once and persist them. Group messages must
+   * not be dropped just because bot/v3/info is temporarily unreachable: the
+   * cached open_id or the locally configured app id is enough to match a
+   * Feishu @-mention.
+   */
+  async function ensureBotIdentity(
+    cliPath: string,
+  ): Promise<{ openId: string | null; appId: string | null }> {
+    if (!openIdLoaded) {
+      try {
+        const openId = await readOpenId(cliPath);
+        if (openId) {
+          cachedBotOpenId = openId;
+          openIdLoaded = true;
+          warnedBotIdentity = false;
+          persistBotIdentity();
+        } else if (!warnedBotIdentity) {
+          warnedBotIdentity = true;
+          log("无法读取机器人 open_id，群聊 @ 识别改用缓存的 app id");
+        }
+      } catch (error) {
+        if (!warnedBotIdentity) {
+          warnedBotIdentity = true;
+          log("读取机器人 open_id 失败", error instanceof Error ? error.message : String(error));
+        }
+      }
     }
-    return cachedBotOpenId;
+    if (!cachedBotAppId) {
+      try {
+        const appId = await readAppId(cliPath);
+        if (appId?.startsWith("cli_")) {
+          cachedBotAppId = appId;
+          persistBotIdentity();
+        }
+      } catch (error) {
+        if (!warnedBotIdentity) {
+          warnedBotIdentity = true;
+          log("读取机器人 app_id 失败", error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+    return { openId: cachedBotOpenId, appId: cachedBotAppId };
   }
 
   /** Credentials/app switch changed the bot identity; re-read it. */
   function resetIdentity(): void {
     cachedBotOpenId = null;
+    cachedBotAppId = null;
     openIdLoaded = false;
+    warnedBotIdentity = false;
+    clearBotIdentity(botIdentityPath);
   }
 
   function cliPathFor(values: BotValues): string | null {
@@ -709,7 +783,7 @@ export function createDispatcher(options: DispatcherOptions) {
     if (!cliPath) return null;
     try {
       const all = (await withDirectoryTimeout(listChatDirectory(cliPath, chatId))).filter(
-        (entry) => !cachedBotOpenId || entry.openId !== cachedBotOpenId,
+        (entry) => !isThisBot(entry.openId),
       );
       const bots = all.filter((entry) => entry.kind === "bot").slice(0, 20);
       const users = all.filter((entry) => entry.kind === "user").slice(0, 40);
@@ -1461,12 +1535,12 @@ export function createDispatcher(options: DispatcherOptions) {
         : undefined,
       listBots: async () =>
         (await listChatBots(cliPath, event.chat_id)).filter(
-          (bot) => !cachedBotOpenId || bot.openId !== cachedBotOpenId,
+          (bot) => !isThisBot(bot.openId),
         ),
       listMembers: async (query) => {
         const needle = query.trim().toLowerCase();
         return (await listChatDirectory(cliPath, event.chat_id))
-          .filter((entry) => !cachedBotOpenId || entry.openId !== cachedBotOpenId)
+          .filter((entry) => !isThisBot(entry.openId))
           .filter(
             (entry) =>
               !needle ||
@@ -1559,7 +1633,7 @@ export function createDispatcher(options: DispatcherOptions) {
         },
       },
       mentions: (event.mentions ?? [])
-        .filter((mention) => mention.id !== cachedBotOpenId)
+        .filter((mention) => !isThisBot(mention.id))
         .map((mention) => ({ openId: mention.id, name: mention.name })),
       resetSession: ({ clearOverrides }) => {
         const tracker = progressByTopic.get(topicKey);
@@ -1596,16 +1670,19 @@ export function createDispatcher(options: DispatcherOptions) {
       const values = await currentValues();
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
-      const botOpenId = await ensureBotOpenId(cliPath);
-      if (event.chat_type === "group" && !botOpenId) return;
+      const identity = await ensureBotIdentity(cliPath);
+      const botOpenId = identity.openId;
+      const botAppId = identity.appId;
+      if (event.chat_type === "group" && !botOpenId && !botAppId) return;
       rememberBotId(botOpenId);
+      rememberBotId(botAppId);
       if (event.sender_type === "bot") rememberBotId(event.sender_id);
 
       // Only chats with a binding may be recorded or downloaded. Unbound chats
       // get at most the configured "not configured" hint.
       const binding = values.chats.find((chat) => chat.chatId === event.chat_id) ?? null;
       if (!binding) {
-        const unmatched = routeMessage(event, values, botOpenId);
+        const unmatched = routeMessage(event, values, botOpenId, { botAppId });
         if (unmatched.reason === "unmatched") {
           rememberUnmatched(event);
           if (values.notifyUnmatched) {
@@ -1639,7 +1716,8 @@ export function createDispatcher(options: DispatcherOptions) {
       const guestInfo =
         collabGrant?.guests.find((candidate) => candidate.openId === event.sender_id) ?? null;
       const triggered =
-        event.chat_type === "p2p" || (event.chat_type === "group" && mentionsBot(event, botOpenId));
+        event.chat_type === "p2p" ||
+        (event.chat_type === "group" && mentionsBot(event, botOpenId, botAppId));
       const blocked = !allowed && !guestInfo && triggered;
 
       // Commands are a control plane, not agent input: answer them here so
@@ -1702,12 +1780,10 @@ export function createDispatcher(options: DispatcherOptions) {
         }
       }
       // Guests are unlisted by definition; the grant is their allowlist.
-      const decision = routeMessage(
-        event,
-        values,
-        botOpenId,
-        guestInfo ? { allowUnlistedSender: true } : undefined,
-      );
+      const decision = routeMessage(event, values, botOpenId, {
+        ...(guestInfo ? { allowUnlistedSender: true } : {}),
+        botAppId,
+      });
       if (decision.reason === "ignored") return;
       if (decision.reason === "unmatched" || !decision.binding) {
         rememberUnmatched(event);
@@ -2149,10 +2225,15 @@ export function createDispatcher(options: DispatcherOptions) {
     const values = await currentValues();
     const cliPath = cliPathFor(values);
     if (!cliPath) return;
-    const botOpenId = await ensureBotOpenId(cliPath);
-    if (!botOpenId) return;
+    const identity = await ensureBotIdentity(cliPath);
+    if (!identity.openId && !identity.appId) return;
     const detail = await readMessageDetail(cliPath, reaction.messageId);
-    if (!detail?.chatId || detail.senderOpenId !== botOpenId) return;
+    if (
+      !detail?.chatId ||
+      (detail.senderOpenId !== identity.openId && detail.senderOpenId !== identity.appId)
+    ) {
+      return;
+    }
     const binding = values.chats.find((chat) => chat.chatId === detail.chatId);
     if (!binding || binding.issueTracking !== "auto" || !binding.issueReactionAccept) return;
     const emojis = new Set(
@@ -2667,7 +2748,7 @@ export function createDispatcher(options: DispatcherOptions) {
     const add = (candidate: { openId: string; name: string | null; isBot: boolean } | undefined): void => {
       if (!candidate || candidate.isBot) return;
       if (!candidate.openId.startsWith("ou_")) return;
-      if (candidate.openId === cachedBotOpenId || knownBotIds.has(candidate.openId)) return;
+      if (isBotIdentityId(candidate.openId)) return;
       if (candidates.some((entry) => entry.openId === candidate.openId)) return;
       candidates.push(candidate);
     };

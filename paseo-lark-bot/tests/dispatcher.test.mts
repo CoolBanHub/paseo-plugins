@@ -1844,6 +1844,31 @@ describe("delivery reliability", () => {
     assert.match(replies[0] ?? "", /早到的完成结果/);
   });
 
+  it("still triggers a group @ when only the cached app id is available", async () => {
+    const APP = "cli_cached_app";
+    const dir = mkdtempSync(join(tmpdir(), "lark-bot-identity-"));
+    const identityPath = join(dir, "bot-identity.json");
+    writeFileSync(identityPath, JSON.stringify({ version: 1, appId: APP }));
+    try {
+      const h = makeHarness(baseValues(), {
+        botIdentityPath: identityPath,
+        readOpenId: async () => {
+          throw new Error("bot/v3/info: TLS handshake timeout");
+        },
+      });
+      await h.dispatch.handleMessageEvent(
+        groupEvent({
+          mentions: [{ id: APP, key: "@_user_1", name: "测试机器人" }],
+        }),
+      );
+      await flush();
+      assert.equal(h.created.length, 1, "the message must not be dropped");
+      assert.match(h.created[0]?.prompt ?? "", /帮我修个 bug/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the message-id dedup window across a dispatcher restart", async () => {
     const store = join(tmpdir(), `lark-bot-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
     const values = baseValues();

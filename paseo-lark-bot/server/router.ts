@@ -22,10 +22,20 @@ export function isSenderAllowed(binding: ChatBinding, senderId: string): boolean
   );
 }
 
-/** True when the event @-mentions this bot (group chats only). */
-export function mentionsBot(event: LarkMessageEvent, botOpenId: string | null): boolean {
-  if (!botOpenId) return false;
-  return (event.mentions ?? []).some((mention) => mention.id === botOpenId);
+/**
+ * True when the event @-mentions this bot (group chats only). Feishu may label
+ * the bot with its open_id or with the app id depending on the chat/tenant, so
+ * both are accepted.
+ */
+export function mentionsBot(
+  event: LarkMessageEvent,
+  botOpenId: string | null,
+  botAppId: string | null = null,
+): boolean {
+  if (!botOpenId && !botAppId) return false;
+  return (event.mentions ?? []).some(
+    (mention) => mention.id === botOpenId || (botAppId !== null && mention.id === botAppId),
+  );
 }
 
 /**
@@ -44,6 +54,8 @@ export function routeMessage(
      * unexpired topic grant, which is stricter than the binding allowlist.
      */
     allowUnlistedSender?: boolean;
+    /** App id fallback when the bot's open_id could not be fetched. */
+    botAppId?: string | null;
   },
 ): RoutingDecision {
   if (!HANDLED_MESSAGE_TYPES.has(event.message_type)) {
@@ -51,15 +63,18 @@ export function routeMessage(
   }
   // Feishu never delivers the bot's own messages to it, but guard anyway so a
   // future relay setup cannot create a reply loop.
-  if (botOpenId && event.sender_id === botOpenId) {
+  if (
+    (botOpenId && event.sender_id === botOpenId) ||
+    (options?.botAppId && event.sender_id === options.botAppId)
+  ) {
     return { binding: null, prompt: "", reason: "ignored" };
   }
   if (event.chat_type === "group") {
-    // Without the bot's own open_id there is no way to verify the mention.
-    if (!botOpenId) {
+    // Without either id there is no way to verify the mention.
+    if (!botOpenId && !options?.botAppId) {
       return { binding: null, prompt: "", reason: "ignored" };
     }
-    if (!mentionsBot(event, botOpenId)) {
+    if (!mentionsBot(event, botOpenId, options?.botAppId)) {
       return { binding: null, prompt: "", reason: "ignored" };
     }
   }

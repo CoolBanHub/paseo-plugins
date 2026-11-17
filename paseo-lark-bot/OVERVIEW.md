@@ -304,6 +304,9 @@ npm run typecheck
   `（1/N）` 只在多段时出现。
 - `message_id` 去重窗口持久化到 plugin-data（最近 1000 条，去抖原子写），
   daemon 重启后 at-least-once 的重投不会再触发重复回复。
+- 机器人自身身份（`ou_…` open_id 与本机 `cli_…` app id）缓存到
+  `bot-identity.json`；`bot/v3/info` 暂时超时时，群里的 @ 仍按缓存识别，
+  不会因为取不到机器人 id 丢掉整条新消息。切换应用凭证时缓存同步清除。
 - 新建会话的首轮 `turn_ended` 可能早于 `agents.create()` 返回；这类完成事件先
   暂存，等 agent id 映射到话题后再补发，不再当作未知 Agent 丢弃。
 - 轮次瞬时失败（429/5xx/网络）原地退避重试两次并保留智能体上下文，
