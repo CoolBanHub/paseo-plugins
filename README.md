@@ -9,7 +9,7 @@ Paseo 插件集合：把本地编码智能体注册为 [Paseo](https://github.co
 | [`paseo-dsh/`](paseo-dsh/) | `dsh` | 通过 dsh 的 ACP 接口（`dsh --profile acp`）把 DeepSeek 编码智能体 [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 接入 Paseo：独立切换 Agent 模式（标准 / PTC / 极简 / 创造）与权限预设，PTC 模式下每个子工具调用都展开为独立时间线行 | dsh（npx 缓存 / 全局 / `DSH_BIN`）、DeepSeek 账号、Node 版本见环境要求 |
 | [`paseo-git/`](paseo-git/) | `git-manager` | IDEA 风格的 Git 面板：左侧分支 / 标签 / Worktree 树，右侧提交图谱（车道着色、合并斜线、徽章）与提交详情，筛选条（分支 / 作者 / 日期 / 路径 / 文本），fetch / pull，以及可配置的网络代理设置 | `git` 在 PATH 上 |
 | [`paseo-zcode/`](paseo-zcode/) | `zcode` | 通过本地 `zcode app-server --stdio` 协议把 ZCode（GLM）接入 Paseo，会话与桌面端共享；附带智谱 Coding Plan 配额的用量展示 | macOS + ZCode 桌面端（`zcode login`） |
-| [`paseo-lark-bot/`](paseo-lark-bot/) | `lark-bot` | 飞书群机器人接入 Paseo：按会话绑定 provider，群里 @ 机器人（或单聊直发）即由对应智能体处理并以话题回复返回；支持话题内命令、进度卡片、附件回传、定时任务、可配置的完成 @ 提醒，以及把群话题登记到多维表格的问题跟踪台账（未 @ 也采集，验收/发布分离），权限请求默认只在 Paseo 内处理，可选用通知到群 | `lark-cli`（长连接事件订阅 + 机器人入群，详见 OVERVIEW） |
+| [`paseo-lark-bot/`](paseo-lark-bot/) | `lark-bot` | 飞书群机器人接入 Paseo：按会话绑定 provider，群里 @ 机器人（或单聊直发）即由对应智能体处理并以话题回复返回；支持话题内命令、进度卡片、附件回传、定时任务、可配置的完成 @ 提醒、按会话生效的 `/remember` 纠正记忆、限时只读的访客协作，以及把群话题登记到多维表格的问题跟踪台账（未 @ 也采集，验收/发布分离），权限请求默认只在 Paseo 内处理，可选用通知到群 | `lark-cli`（长连接事件订阅 + 机器人入群，详见 OVERVIEW） |
 | [`paseo-claude-models/`](paseo-claude-models/) | `claude-models` | 把自有 API Key 的模型（DeepSeek、GLM、Kimi、通义千问及任意 Anthropic / OpenAI 兼容端点）注入 Claude provider 的模型选择器：会话经内置本机代理桥按所选模型路由到对应厂商，Anthropic 协议直通、OpenAI Chat 协议自动转换 | 各厂商 API Key（或自建 vLLM / Ollama 等端点）、Claude provider 可用 |
 
 每个插件目录内都有各自的 `OVERVIEW.md`，详细说明架构、能力边界、环境要求与已知限制。
