@@ -1007,12 +1007,20 @@ export function createDispatcher(options: DispatcherOptions) {
     return collected.slice(-MAX_IMAGES_PER_TURN);
   }
 
-  /** Download a file message and keep it on disk for the agent to read. */
-  async function ingestFile(cliPath: string, event: LarkMessageEvent, messageId: string): Promise<void> {
+  /**
+   * Download a file message and keep it on disk for the agent to read.
+   * Returns false only for a transient read failure, so the caller can leave
+   * the message unmarked and retry it on the next event.
+   */
+  async function ingestFile(
+    cliPath: string,
+    event: LarkMessageEvent,
+    messageId: string,
+  ): Promise<boolean> {
     try {
       const raw = await readRaw(cliPath, messageId);
       const fileKey = typeof raw?.file_key === "string" ? raw.file_key : null;
-      if (!fileKey) return;
+      if (!fileKey) return true;
       const name = typeof raw?.file_name === "string" && raw.file_name.trim() ? raw.file_name.trim() : "file";
       const resource = await download({
         cliPath,
@@ -1025,13 +1033,15 @@ export function createDispatcher(options: DispatcherOptions) {
       const path = options.mediaStoreDir
         ? persistMediaFile(options.mediaStoreDir, topicKeyFor(event), messageId, 1, resource.bytes, extension)
         : null;
-      if (!path) return;
+      if (!path) return true;
       const files = filesByMessage.get(messageId) ?? [];
       files.push({ name, path, size: resource.bytes.length });
       filesByMessage.set(messageId, files);
       pruneMap(filesByMessage, MAX_CACHED_MEDIA_MESSAGES, messageId);
+      return true;
     } catch (error) {
       log("下载文件消息失败", error instanceof Error ? error.message : String(error));
+      return false;
     }
   }
 
@@ -1042,9 +1052,8 @@ export function createDispatcher(options: DispatcherOptions) {
    * provider. Failures degrade to placeholders.
    */
   async function ingestMedia(cliPath: string, event: LarkMessageEvent): Promise<void> {
-    markIngested(event.message_id);
     if (event.message_type === "file") {
-      await ingestFile(cliPath, event, event.message_id);
+      if (await ingestFile(cliPath, event, event.message_id)) markIngested(event.message_id);
       return;
     }
     const kind =
@@ -1053,6 +1062,9 @@ export function createDispatcher(options: DispatcherOptions) {
     try {
       const raw = await readRaw(cliPath, event.message_id);
       if (!raw) return;
+      // Mark only after a successful read: a TLS timeout must stay retryable
+      // on the next @-mention instead of poisoning the cache forever.
+      markIngested(event.message_id);
       let imageKeys: string[] = [];
       if (event.message_type === "post") {
         const keys = new Set<string>();
@@ -1131,14 +1143,16 @@ export function createDispatcher(options: DispatcherOptions) {
     if (event.chat_type !== "group") return;
     const rootId = event.root_id || event.reply_to;
     if (!rootId || ingestedMessages.has(rootId)) return;
-    markIngested(rootId);
     try {
       const raw = await readRaw(cliPath, rootId);
       if (!raw) return;
       if (typeof raw.file_key === "string" && raw.file_key) {
-        await ingestFile(cliPath, event, rootId);
+        if (await ingestFile(cliPath, event, rootId)) markIngested(rootId);
         return;
       }
+      // Mark only after a successful read so a TLS timeout is retried by the
+      // next @-mention instead of leaving the root permanently unread.
+      markIngested(rootId);
       const keys = new Set<string>();
       if (typeof raw.image_key === "string" && raw.image_key.startsWith("img_")) {
         keys.add(raw.image_key);
@@ -1943,7 +1957,15 @@ export function createDispatcher(options: DispatcherOptions) {
       if (!instruction) {
         const probe = await withThreadContext(cliPath, event, "");
         if (!probe.hasContext && images.length === 0 && files.length === 0) {
-          await send(cliPath, event.message_id, EMPTY_PROMPT_HINT, values, "text");
+          await send(
+            cliPath,
+            event.message_id,
+            probe.rootReadFailed
+              ? "这条 @ 没有文字；读取话题根消息又失败了（飞书接口超时）。请稍后重新 @ 我，或直接说一句要处理什么。"
+              : EMPTY_PROMPT_HINT,
+            values,
+            "text",
+          );
           return;
         }
         instruction = "请查看并处理上方话题内容。";
@@ -2035,7 +2057,13 @@ export function createDispatcher(options: DispatcherOptions) {
     event: LarkMessageEvent,
     prompt: string,
     sessionKey = topicKeyFor(event),
-  ): Promise<{ text: string; hasContext: boolean; topicRootText: string | null }> {
+  ): Promise<{
+    text: string;
+    hasContext: boolean;
+    topicRootText: string | null;
+    /** The root lookup threw (network); do not cache and let the user retry. */
+    rootReadFailed?: boolean;
+  }> {
     const historyKey = topicKeyFor(event);
     const history = (topicHistory.get(historyKey) ?? []).filter(
       (entry) => entry.messageId !== event.message_id,
@@ -2112,6 +2140,7 @@ export function createDispatcher(options: DispatcherOptions) {
     const rootId = event.root_id || event.reply_to;
     if (!rootId) return { text: prompt, hasContext: false, topicRootText: null };
     let rootText: string | null = null;
+    let rootReadFailed = false;
     const rootInHistory = history.length > 0 && history[0]?.messageId === rootId;
     if (rootInHistory) {
       rootText = history[0]?.text ?? null;
@@ -2122,14 +2151,17 @@ export function createDispatcher(options: DispatcherOptions) {
       } else {
         try {
           detail = await readThreadRootDetail(cliPath, rootId);
+          // Cache only a definitive answer. A TLS timeout cached as null would
+          // make every later @ in this topic believe the root has no context.
+          threadRootCache.set(rootId, detail);
+          if (threadRootCache.size > 100) {
+            const oldest = threadRootCache.keys().next().value;
+            if (oldest) threadRootCache.delete(oldest);
+          }
         } catch (error) {
           log("读取话题根消息失败", error instanceof Error ? error.message : String(error));
           detail = null;
-        }
-        threadRootCache.set(rootId, detail);
-        if (threadRootCache.size > 100) {
-          const oldest = threadRootCache.keys().next().value;
-          if (oldest) threadRootCache.delete(oldest);
+          rootReadFailed = true;
         }
       }
       if (detail?.senderOpenId) {
@@ -2155,10 +2187,12 @@ export function createDispatcher(options: DispatcherOptions) {
       const transcript = transcriptOf(prior);
       if (transcript && !lines.includes("【话题主题】" + transcript)) lines.push("【话题历史】\n" + transcript);
     }
-    if (lines.length === 0) return { text: prompt, hasContext: false, topicRootText: subject };
+    if (lines.length === 0) {
+      return { text: prompt, hasContext: false, topicRootText: subject, rootReadFailed };
+    }
     lines.push(TRANSCRIPT_GUARD);
     const text = lines.join("\n\n") + (prompt ? "\n\n【本次消息】" + prompt : "");
-    return { text, hasContext: true, topicRootText: subject };
+    return { text, hasContext: true, topicRootText: subject, rootReadFailed };
   }
 
   /**

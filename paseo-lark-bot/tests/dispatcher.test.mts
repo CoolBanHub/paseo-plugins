@@ -1527,6 +1527,46 @@ describe("bare mentions", () => {
     assert.ok(h.replies.some((reply) => reply.text.startsWith("✅")), "ack expected");
   });
 
+  it("retries the root lookup after a transient failure instead of caching null", async () => {
+    let rootReads = 0;
+    const h = makeHarness(baseValues({ ackMode: "off" }), {
+      readThreadRootDetail: async () => {
+        rootReads += 1;
+        if (rootReads === 1) throw new Error("lark-cli 执行失败：TLS handshake timeout");
+        return {
+          text: "为什么接单会一直显示订单已更新，刷新了还是这样显示接不了单",
+          senderOpenId: "ou_li",
+          senderName: "李丁",
+        };
+      },
+    });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_bare_retry_1",
+        root_id: "om_root",
+        sender_id: "ou_user",
+        content: "@测试机器人",
+      }),
+    );
+    await flush();
+    assert.equal(rootReads, 1);
+    assert.match(h.replies.at(-1)?.text ?? "", /接口超时/u);
+    assert.equal(h.created.length, 0);
+
+    await h.dispatch.handleMessageEvent(
+      groupEvent({
+        message_id: "om_bare_retry_2",
+        root_id: "om_root",
+        sender_id: "ou_user",
+        content: "@测试机器人",
+      }),
+    );
+    await flush();
+    assert.equal(rootReads, 2, "a failed root read must not be cached as null");
+    assert.equal(h.created.length, 1);
+    assert.match(h.created[0]?.prompt ?? "", /为什么接单会一直显示订单已更新/u);
+  });
+
   it("still asks for text when a fresh topic has nothing to work on", async () => {
     const h = makeHarness(baseValues({ ackMode: "text" }));
     await h.dispatch.handleMessageEvent(groupEvent({ message_id: "om_solo", content: "@测试机器人" }));
