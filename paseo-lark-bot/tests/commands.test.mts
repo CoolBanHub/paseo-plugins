@@ -258,6 +258,10 @@ describe("command handlers", () => {
         return "done";
       },
       release: async () => "release",
+      card: async () => {
+        calls.push("card");
+        return "card";
+      },
       close: async (reason: string) => {
         calls.push(`close:${reason}`);
         return "close";
@@ -279,6 +283,10 @@ describe("command handlers", () => {
     await runCommand(done.value);
     assert.equal(done.replies[0], "done");
 
+    const card = context({ command: { name: "issue", args: "card" }, issue });
+    await runCommand(card.value);
+    assert.equal(card.replies[0], "card");
+
     const close = context({ command: { name: "issue", args: "close 重复问题" }, issue });
     await runCommand(close.value);
     assert.equal(close.replies[0], "close");
@@ -290,7 +298,7 @@ describe("command handlers", () => {
     const track = context({ command: { name: "issue", args: "track" }, issue });
     await runCommand(track.value);
     assert.equal(track.replies[0], "track");
-    assert.deepEqual(calls, ["query:pending", "done:已改完", "close:重复问题", "type:需求", "track"]);
+    assert.deepEqual(calls, ["query:pending", "done:已改完", "card", "close:重复问题", "type:需求", "track"]);
 
     const missing = context({ command: { name: "issues", args: "" } });
     await runCommand(missing.value);

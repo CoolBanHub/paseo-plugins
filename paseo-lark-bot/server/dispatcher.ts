@@ -109,6 +109,7 @@ import { createProgressTracker, type ProgressTracker } from "./progress.ts";
 import { createCronScheduler, type CronJob } from "./cron.ts";
 import { createOutboxWatcher, isInsideRoots, type OutboxRequest } from "./attachments.ts";
 import {
+  buildIssueActionCard,
   buildIssueCard,
   buildIssueResolvedCard,
   parseIssueAction,
@@ -1342,6 +1343,42 @@ export function createDispatcher(options: DispatcherOptions) {
     return sent;
   }
 
+  /** Re-send the current state + action buttons; used by `/issue card`. */
+  async function sendIssueActionCard(
+    cliPath: string,
+    values: BotValues,
+    record: IssueRecord,
+    topicKey: string,
+    binding: ChatBinding,
+  ): Promise<boolean> {
+    const actions = binding.issueActions.filter((action) => action.from.includes(record.status));
+    if (actions.length === 0) return false;
+    const target = lastTriggerMessage.get(topicKey) ?? record.rootMessageId;
+    if (!target) return false;
+    try {
+      const messageId = await sendCard({
+        cliPath,
+        messageId: target,
+        card: buildIssueActionCard({
+          record,
+          title: record.title,
+          status: record.status,
+          topicKey,
+          actions,
+        }),
+        replyInThread: values.replyInThread,
+        idempotencyKey: `la-${createHash("sha256")
+          .update(`${record.recordId}:${topicKey}:${now()}`)
+          .digest("hex")
+          .slice(0, 40)}`,
+      });
+      return Boolean(messageId);
+    } catch (error) {
+      log("发送动作卡片失败", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   /**
    * Called only after the final answer has actually been sent, so the card
    * asking for acceptance never appears above the explanation. Idempotent:
@@ -1515,6 +1552,24 @@ export function createDispatcher(options: DispatcherOptions) {
               return updated
                 ? "已标记为「已发布」。"
                 : "只有「待验收」或「已修复」的记录可以标记为已发布。";
+            },
+            card: async () => {
+              const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
+              if (!current) return "本话题还没有登记到问题跟踪表。";
+              const status =
+                (await options.issueTracker!.statusFor(current.recordId, values)) ??
+                current.status;
+              if (!binding.issueActions.some((action) => action.from.includes(status))) {
+                return `当前状态是「${status}」，没有可用的动作按钮。`;
+              }
+              const sent = await sendIssueActionCard(
+                cliPath,
+                values,
+                { ...current, status },
+                topicKey,
+                binding,
+              );
+              return sent ? "已重发动作卡片。" : "动作卡片发送失败，请查看插件日志。";
             },
             close: async (reason) => {
               const current = options.issueTracker!.recordForTopic(event.chat_id, topicKey);
@@ -2655,14 +2710,20 @@ export function createDispatcher(options: DispatcherOptions) {
       runLabel?: string;
     },
   ): Promise<void> {
-    try {
-      await patchCard({
-        cliPath,
-        messageId,
-        card: buildIssueResolvedCard(options),
-      });
-    } catch (error) {
-      log("更新问题卡片失败", error instanceof Error ? error.message : String(error));
+    const card = buildIssueResolvedCard(options);
+    // TLS timeouts are common on this path; one failed PATCH would otherwise
+    // leave a stale card with the old buttons forever.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await patchCard({ cliPath, messageId, card });
+        return;
+      } catch (error) {
+        if (attempt === 2) {
+          log("更新问题卡片失败", error instanceof Error ? error.message : String(error));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1_000 : 2_000));
+      }
     }
   }
 

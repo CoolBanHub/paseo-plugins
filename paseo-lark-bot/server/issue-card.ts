@@ -57,6 +57,32 @@ function button(
   };
 }
 
+/** Buttons for configured actions whose `from` covers the current status. */
+function actionButtons(options: {
+  record: Pick<IssueRecord, "recordId" | "chatId" | "threadId" | "rootMessageId">;
+  topicKey: string;
+  status: IssueStatus;
+  actions: IssueAction[];
+}): Record<string, unknown>[] {
+  return options.actions
+    .filter((action) => action.label && action.from.includes(options.status))
+    .map((action) =>
+      button(
+        action.label,
+        action.type,
+        {
+          kind: "issue",
+          action: "run",
+          actionId: action.id,
+          recordId: options.record.recordId,
+          chatId: options.record.chatId,
+          topicKey: options.topicKey,
+        },
+        action.confirm || undefined,
+      ),
+    );
+}
+
 export function buildIssueCard(options: {
   record: IssueRecord;
   summary?: string | null;
@@ -130,9 +156,12 @@ export function buildIssueResolvedCard(options: {
   const availableActions =
     options.action === "run" || !record || !topicKey
       ? []
-      : (options.actions ?? []).filter(
-          (action) => action.label && action.from.includes(options.status),
-        );
+      : actionButtons({
+          record,
+          topicKey,
+          status: options.status,
+          actions: options.actions ?? [],
+        });
   const lines = [
     `**${clip(options.title || "未命名话题", MAX_TITLE)}**`,
     `状态：${options.status}`,
@@ -147,26 +176,8 @@ export function buildIssueResolvedCard(options: {
   }
   const elements: Record<string, unknown>[] = [
     { tag: "markdown", content: lines.join("\n") },
+    ...availableActions,
   ];
-  if (record && topicKey && options.action !== "run") {
-    for (const action of availableActions) {
-      elements.push(
-        button(
-          action.label,
-          action.type,
-          {
-            kind: "issue",
-            action: "run",
-            actionId: action.id,
-            recordId: record.recordId,
-            chatId: record.chatId,
-            topicKey,
-          },
-          action.confirm || undefined,
-        ),
-      );
-    }
-  }
   return {
     schema: "2.0",
     config: { update_multi: true, width_mode: "default" },
@@ -178,6 +189,49 @@ export function buildIssueResolvedCard(options: {
       direction: "vertical",
       padding: "12px 12px 20px 12px",
       elements,
+    },
+  };
+}
+
+/**
+ * Fresh card for `/issue card`: re-send the current state plus configured
+ * buttons, so a topic whose card PATCH failed (or an old 已修复 card) can still
+ * reach the action without waiting for a new acceptance cycle.
+ */
+export function buildIssueActionCard(options: {
+  record: Pick<IssueRecord, "recordId" | "chatId" | "threadId" | "rootMessageId">;
+  title: string;
+  status: IssueStatus;
+  topicKey: string;
+  actions: IssueAction[];
+}): Record<string, unknown> {
+  const topicKey = options.topicKey || options.record.threadId || options.record.rootMessageId;
+  return {
+    schema: "2.0",
+    config: { update_multi: true, width_mode: "default" },
+    header: {
+      title: { tag: "plain_text", content: "问题可执行动作" },
+      template: options.status === "已修复" ? "green" : "purple",
+    },
+    body: {
+      direction: "vertical",
+      padding: "12px 12px 20px 12px",
+      elements: [
+        {
+          tag: "markdown",
+          content: [
+            `**${clip(options.title || "未命名话题", MAX_TITLE)}**`,
+            `状态：${options.status}`,
+            "点击下面的动作后，机器人会以你的身份在本话题触发一轮处理。",
+          ].join("\n"),
+        },
+        ...actionButtons({
+          record: options.record,
+          topicKey,
+          status: options.status,
+          actions: options.actions,
+        }),
+      ],
     },
   };
 }

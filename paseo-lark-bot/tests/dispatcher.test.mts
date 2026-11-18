@@ -3133,7 +3133,9 @@ describe("issue action buttons", () => {
   ): { tracker: IssueTracker; progress: (string | null)[] } {
     const progress: (string | null)[] = [];
     const tracker = {
+      observe: () => {},
       recordFor: () => record,
+      recordForTopic: () => record,
       statusFor: async () => status,
       updateProgress: (input: { summary: string | null }) => {
         progress.push(input.summary);
@@ -3226,6 +3228,22 @@ describe("issue action buttons", () => {
 
     assert.equal(h.created.length, 0);
     assert.match(h.replies.at(-1)?.text ?? "", /按钮已失效/u);
+  });
+
+  it("re-sends an action card for an already-accepted record", async () => {
+    const record = issueActionRecord();
+    const { tracker } = actionTracker(record);
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    await h.dispatch.handleMessageEvent(
+      groupEvent({ message_id: "om_cmd_card", content: "@_user_1 /issue card" }),
+    );
+    await flush();
+
+    assert.equal(h.cards.length, 1);
+    const card = JSON.stringify(h.cards[0]?.card);
+    assert.match(card, /发布到生产/u);
+    assert.match(card, /"action":"run"/u);
+    assert.match(h.replies.at(-1)?.text ?? "", /已重发动作卡片/u);
   });
 
   it("adds the configured buttons to the card after acceptance", async () => {

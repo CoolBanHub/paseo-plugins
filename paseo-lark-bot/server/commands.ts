@@ -97,6 +97,7 @@ export function commandHelp(): string {
     "`/delegate <id|前缀> <任务>` 把任务交给其他 Paseo Agent 并等待结果（需开启）",
     "`/issues [mine|pending|all]` 查看本群的问题/需求台账（默认未关闭）",
     "`/issue done [说明]` 把当前话题标记为待验收；`/issue release` 标记已发布",
+    "`/issue card` 重发当前记录的动作按钮卡片（卡住了/旧卡片没有按钮时用）",
     "`/issue close [原因]` 关闭当前话题的问题记录",
     "`/issue type 问题|需求|咨询` 修正当前话题的类型",
     "`/issue track` 强制把当前话题登记到跟踪表（跳过 AI 判断）",
@@ -126,6 +127,8 @@ export interface CommandIssueActions {
   status: () => Promise<string>;
   done: (summary: string) => Promise<string>;
   release: () => Promise<string>;
+  /** Re-send the current record's action card without changing status. */
+  card: () => Promise<string>;
   close: (reason: string) => Promise<string>;
   /** Human correction for the current record's type. */
   type: (type: string) => Promise<string>;
@@ -431,6 +434,10 @@ export async function runCommand(context: CommandContext): Promise<void> {
         await reply(await context.issue.release());
         return;
       }
+      if (sub === "card" || sub === "卡片") {
+        await reply(await context.issue.card());
+        return;
+      }
       if (sub === "close") {
         await reply(await context.issue.close(tail));
         return;
@@ -443,7 +450,7 @@ export async function runCommand(context: CommandContext): Promise<void> {
         await reply(await context.issue.track());
         return;
       }
-      await reply("用法：`/issue` 查看状态，`/issue done [说明]` 待验收，`/issue release` 已发布，`/issue close [原因]` 关闭，`/issue type 问题|需求|咨询` 修正类型，`/issue track` 强制登记。");
+      await reply("用法：`/issue` 查看状态，`/issue done [说明]` 待验收，`/issue release` 已发布，`/issue card` 重发动作卡片，`/issue close [原因]` 关闭，`/issue type 问题|需求|咨询` 修正类型，`/issue track` 强制登记。");
       return;
     }
     case "cron":
