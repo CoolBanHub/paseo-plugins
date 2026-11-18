@@ -2340,7 +2340,9 @@ describe("issue acceptance card ordering", () => {
       },
       updateProgress: () => {},
     } as unknown as IssueTracker;
-    const h = makeHarness(baseValues(), {
+    const values = baseValues();
+    values.chats[0] = { ...values.chats[0]!, issueAiStatusReview: false };
+    const h = makeHarness(values, {
       issueTracker: tracker,
       reply: async () => {
         order.push("reply");
@@ -2356,6 +2358,134 @@ describe("issue acceptance card ordering", () => {
     h.dispatch.handleTurnEnded(turnEnded("agent-1", "已处理并部署到 TEST。"));
     await flush();
     assert.deepEqual(order, ["reply", "markDone", "card"]);
+  });
+
+  function turnReviewHarness(
+    lastMessage: string | null,
+    options: { throwOnRun?: boolean } = {},
+  ): { h: Harness; order: string[]; prompts: string[] } {
+    const order: string[] = [];
+    const prompts: string[] = [];
+    const record: IssueRecord = {
+      recordId: "rec_turn_review",
+      chatId: "oc_group",
+      rootMessageId: "om_1",
+      threadId: "omt_1",
+      requesterOpenId: "ou_user",
+      title: "测试问题",
+      status: "处理中",
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      mediaSynced: [],
+      updatedAt: 1,
+    };
+    let mainAgent: SessionAgentHandle | null = null;
+    const paseo = {
+      agents: {
+        create: async (request: { title?: string | null }) => {
+          if (request.title === "问题状态判断") {
+            return {
+              id: "helper-review",
+              send: async () => {},
+              run: async (text: string) => {
+                prompts.push(text);
+                if (options.throwOnRun) throw new Error("model down");
+                return { status: "idle" as const, error: null, lastMessage };
+              },
+            };
+          }
+          mainAgent = {
+            id: "agent-1",
+            send: async () => {},
+            run: async () => ({ status: "idle" as const, error: null, lastMessage: "ok" }),
+          };
+          return mainAgent;
+        },
+        ref: (id: string) => {
+          if (!mainAgent || mainAgent.id !== id) throw new Error("unexpected agent ref");
+          return mainAgent;
+        },
+      },
+    } as unknown as SessionPaseoApi;
+    const tracker = {
+      observe: () => {},
+      recordForTopic: () => record,
+      markDone: async () => {
+        order.push("markDone");
+        return { ...record, status: "待验收" as const };
+      },
+      updateProgress: () => {
+        order.push("progress");
+      },
+    } as unknown as IssueTracker;
+    const h = makeHarness(baseValues(), {
+      paseo,
+      issueTracker: tracker,
+      reply: async () => {
+        order.push("reply");
+        return null;
+      },
+      replyCard: async () => {
+        order.push("card");
+        return "om_card_1";
+      },
+    });
+    return { h, order, prompts };
+  }
+
+  it("sends the card only when the AI confirms the turn is really done", async () => {
+    const { h, order, prompts } = turnReviewHarness(
+      '{"done":true,"summary":"已部署到 TEST 并验证","reason":"有构建与接口验证"}',
+    );
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "已完成并部署到 TEST，构建通过。"));
+    await flush();
+    assert.equal(prompts.length, 1, "the final answer should be reviewed");
+    assert.match(prompts[0]!, /本轮最终回答/u);
+    assert.match(prompts[0]!, /已完成并部署到 TEST/u);
+    assert.deepEqual(order, ["reply", "markDone", "card"]);
+  });
+
+  it("keeps 处理中 when the AI sees only a design/plan", async () => {
+    const { h, order, prompts } = turnReviewHarness(
+      '{"done":false,"summary":"","reason":"只是方案，尚未实施"}',
+    );
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(
+      turnEnded("agent-1", "这个方案已完成设计，包含 SQL、适配器和单测三部分，预计明天实施。"),
+    );
+    await flush();
+    assert.equal(prompts.length, 1);
+    assert.ok(!order.includes("markDone"), "a design-only turn must not advance the record");
+    assert.ok(!order.includes("card"), "a design-only turn must not notify the requester");
+    assert.ok(order.includes("progress"), "the final answer is still kept as progress");
+  });
+
+  it("does not call the AI or send a card when the answer has no completion signal", async () => {
+    const { h, order, prompts } = turnReviewHarness(
+      '{"done":true,"summary":"x","reason":"y"}',
+    );
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(
+      turnEnded("agent-1", "方案分三步：先改 SQL，再补适配器，最后加测试。预计明天实施。"),
+    );
+    await flush();
+    assert.equal(prompts.length, 0);
+    assert.deepEqual(order, ["reply", "progress"]);
+  });
+
+  it("keeps 处理中 when the AI review fails", async () => {
+    const { h, order } = turnReviewHarness(null, { throwOnRun: true });
+    await h.dispatch.handleMessageEvent(groupEvent());
+    await flush();
+    h.dispatch.handleTurnEnded(turnEnded("agent-1", "已完成并部署到 TEST，构建通过。"));
+    await flush();
+    assert.deepEqual(order, ["reply", "progress"]);
   });
 
   it("keeps 处理中 when the turn only asks the user to confirm the start", async () => {

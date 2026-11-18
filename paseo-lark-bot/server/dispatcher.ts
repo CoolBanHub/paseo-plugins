@@ -302,7 +302,7 @@ const QUESTION_DONE_NOTE = "✅ 已提交选择：";
 const QUESTION_UNAUTHORIZED_NOTE = "只有该会话白名单内的成员可以回答这个问题。";
 /** Cheap local prefilter before spending a model call on a comment. */
 const ISSUE_STATUS_HINT =
-  /((?:已|已经)(?:修复|修好|改好|解决|完成|上线|发布|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)|(?:修复|修好|改好|解决|完成|上线|发布|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)了|可以了|没问题|验证通过|验收通过|fixed|resolved|deployed|released|implemented|completed)/iu;
+  /((?:已|已经)(?:修复|修好|改好|解决|完成|上线|发布|部署|合并|推送|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)|(?:修复|修好|改好|解决|完成|上线|发布|部署|合并|推送|新增|添加|加上|实现|补充|完善|调整|修改|更新|处理|搞定|弄好|做完)了|可以了|没问题|验证通过|验收通过|构建成功|构建通过|测试通过|fixed|resolved|deployed|released|implemented|completed)/iu;
 
 /**
  * Records an ambient completion comment may advance. A "待处理" topic never
@@ -1397,14 +1397,17 @@ export function createDispatcher(options: DispatcherOptions) {
     const current = tracker?.recordForTopic(chatId, topicKey) ?? null;
     if (!tracker || !current) return;
     const agentId = sessions.agentIdForTopic(topicKey);
+    const values = await currentValues();
+    const keepProcessing = (): void => {
+      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+    };
     if (
       current.status === "待验收" ||
       current.status === "已修复" ||
       current.status === "已发布" ||
       current.status === "已关闭"
     ) {
-      const values = await currentValues();
-      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+      keepProcessing();
       return;
     }
     if (awaitingConfirmation) {
@@ -1412,12 +1415,73 @@ export function createDispatcher(options: DispatcherOptions) {
       // start; there is nothing to accept yet. Keep 处理中 and let the next
       // completed turn (the actual implementation) send the card.
       log(`本轮仅在等待用户确认，保持处理中：${text?.slice(0, 60) ?? ""}`);
-      const values = await currentValues();
-      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+      keepProcessing();
       return;
     }
+    const binding = values.chats.find((chat) => chat.chatId === chatId) ?? null;
+    if (binding?.issueAiStatusReview) {
+      // A turn that never claims completion (design, analysis, questions)
+      // must not notify the requester. The local hint also bounds model calls.
+      if (!text || !ISSUE_STATUS_HINT.test(text)) {
+        log(`本轮回答没有完成信号，保持处理中：${text?.slice(0, 60) ?? ""}`);
+        keepProcessing();
+        return;
+      }
+      if (issueStatusReviewing.has(current.recordId)) {
+        log("问题状态判断已在运行，本轮保持处理中");
+        keepProcessing();
+        return;
+      }
+      issueStatusReviewing.add(current.recordId);
+      try {
+        const cwd = resolveCwd(binding.cwd);
+        const issueAi = issueAiModelChoice(binding);
+        const provider = options.resolveProvider
+          ? await options.resolveProvider(issueAi.provider, issueAi.model)
+          : issueAi.provider;
+        const workspace = await helperWorkspace(
+          binding.chatId,
+          binding.chatName,
+          cwd,
+          "问题验收判断",
+        );
+        const review = await reviewIssueStatusWithModel({
+          mode: "turn",
+          paseo: options.paseo,
+          workspace,
+          provider,
+          cwd,
+          chatId,
+          topicKey,
+          rootText: current.title,
+          currentStatus: current.status,
+          comments: [],
+          finalAnswer: text,
+          log,
+        });
+        if (!review) {
+          log("AI 判断本轮是否可验收失败，保持处理中");
+          keepProcessing();
+          return;
+        }
+        if (!review.done) {
+          log(`AI 判断本轮尚不可验收：${review.reason || "无依据"}`);
+          keepProcessing();
+          return;
+        }
+        log(`AI 判断本轮可验收：${review.summary || review.reason || "回答显示已完成"}`);
+      } catch (error) {
+        log(
+          "AI 判断本轮验收状态失败，保持处理中",
+          error instanceof Error ? error.message : String(error),
+        );
+        keepProcessing();
+        return;
+      } finally {
+        issueStatusReviewing.delete(current.recordId);
+      }
+    }
     try {
-      const values = await currentValues();
       const cliPath = cliPathFor(values);
       if (!cliPath) return;
       const updated = await tracker.markDone({
@@ -1432,8 +1496,7 @@ export function createDispatcher(options: DispatcherOptions) {
       }
     } catch (error) {
       log("自动转待验收失败", error instanceof Error ? error.message : String(error));
-      const values = await currentValues();
-      tracker.updateProgress({ chatId, topicKey, summary: text, agentId, values });
+      keepProcessing();
     }
   }
 

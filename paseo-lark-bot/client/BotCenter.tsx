@@ -1173,8 +1173,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                         }
                       />
                       <ToggleRow
-                        label="AI 判断评论是否可验收"
-                        hint="评论出现已修复/已新增/已上线等词时，AI 读话题最近评论；只会把待处理/处理中自动推进到待验收，已修复/已发布仍需人确认"
+                        label="AI 判断是否可验收"
+                        hint="评论或每轮最终回答出现完成信号时，AI 判断是否真的做完并可在 TEST 验证；只设计/讨论方案不会发验收卡片。AI 失败时保持处理中，可用 /issue done 兜底；已修复/已发布仍需人确认"
                         value={chat.issueAiStatusReview}
                         onChange={(value) =>
                           patchBinding(chat.chatId, { issueAiStatusReview: value })
