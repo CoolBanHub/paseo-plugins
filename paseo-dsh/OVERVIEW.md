@@ -112,17 +112,20 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
 - Prompting, interrupting, model and reasoning-effort selection, dsh agent
   presets, and permission prompts. Model choices come
   from dsh's live catalog (provider-grouped, flattened by Paseo).
-- Paseo mirrors the `bai` model list and `reasoningEfforts` from the Web
-  profile's `llm-pi-ai` patch into a temporary ACP overlay. Removing a model
-  or changing its effort list in dsh Web invalidates Paseo's catalog cache;
-  refresh the provider catalog to see the update. The ACP profile still owns
-  the provider endpoint and credential configuration. dsh's "Provider default" effort
-  (empty string) is stripped by the connector because Paseo's schema
-  requires non-empty option ids. A missing or malformed Web profile no
-  longer fails the spawn: the last successfully written overlay is reused,
-  and only when none exists does the session open without the overlay
-  (dsh falls back to its own ACP profile models) with a log line explaining
-  the degradation.
+- Paseo mirrors every `llm-pi-ai` provider's model list and
+  `reasoningEfforts` from the Web profile into a temporary ACP overlay, so a
+  model added under any provider in dsh Web (not only `bai`) reaches Paseo.
+  For a provider the ACP profile already declares, the ACP endpoint and
+  credential reference still win; providers only Web knows about carry their
+  Web route into the overlay. Inline API keys are never copied, only
+  `apiKeyEnv` names. Removing a model, changing its effort list, or adding a
+  provider in dsh Web invalidates Paseo's catalog cache; refresh the provider
+  catalog to see the update. dsh's "Provider default" effort (empty string) is
+  stripped by the connector because Paseo's schema requires non-empty option
+  ids. A missing or malformed Web profile no longer fails the spawn: the last
+  successfully written overlay is reused, and only when none exists does the
+  session open without the overlay (dsh falls back to its own ACP profile
+  models) with a log line explaining the degradation.
 - Permissions: dsh runs sessions under the `workspace-write` permission preset by
   default — sandboxed in-workspace operations run without prompts, and
   escalations (outside-workspace writes, wider sandbox) surface as

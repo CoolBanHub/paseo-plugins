@@ -545,7 +545,7 @@ test("plugin source root resolves from the daemon config and env override", asyn
   );
 });
 
-test("Web model overlay keeps ACP route settings and current model capabilities", async (t) => {
+test("Web model overlay mirrors every provider and keeps ACP route settings", async (t) => {
   const profile = mkdtempSync(join(tmpdir(), "dsh-web-profile-test-"));
   t.after(() => rmSync(profile, { recursive: true, force: true }));
   const acp = join(profile, "acp");
@@ -561,6 +561,10 @@ test("Web model overlay keeps ACP route settings and current model capabilities"
         baseURL: https://example.invalid/v1
         apiKeyEnv: BAI_API_KEY
         apiKey: do-not-copy
+      owner:
+        api: openai-completions
+        baseURL: https://acp-owner.invalid/v1
+        apiKeyEnv: ACP_OWNER_KEY
 `);
   writeFileSync(join(web, "cordis.patch.yml"), `- id: llm-pi-ai
   config:
@@ -572,14 +576,35 @@ test("Web model overlay keeps ACP route settings and current model capabilities"
               low: low
               high: high
               max: max
+      owner:
+        displayName: Owner
+        api: openai-completions
+        baseURL: https://web-owner.invalid/v1
+        apiKey: do-not-copy-owner
+        models:
+          - id: qwen-local
+      local:
+        api: openai-completions
+        baseURL: http://127.0.0.1:8801/v1
+        apiKeyEnv: LOCAL_API_KEY
+        models:
+          - id: tiny
 `);
 
-  assert.deepEqual(writeWebModelOverlay(acp, web, output), ["flash"]);
+  assert.deepEqual(writeWebModelOverlay(acp, web, output), ["flash", "qwen-local", "tiny"]);
   const overlay = readFileSync(output, "utf8");
   assert.match(overlay, /api: openai-completions/);
   assert.match(overlay, /baseURL: https:\/\/example\.invalid\/v1/);
   assert.match(overlay, /apiKeyEnv: BAI_API_KEY/);
   assert.match(overlay, /max: max/);
+  assert.match(overlay, /displayName: Owner/);
+  // A provider the ACP profile already declares keeps its own route.
+  assert.match(overlay, /baseURL: https:\/\/acp-owner\.invalid\/v1/);
+  assert.match(overlay, /apiKeyEnv: ACP_OWNER_KEY/);
+  assert.doesNotMatch(overlay, /web-owner\.invalid/);
+  // A provider only the Web profile knows still reaches the overlay.
+  assert.match(overlay, /baseURL: http:\/\/127\.0\.0\.1:8801\/v1/);
+  assert.match(overlay, /apiKeyEnv: LOCAL_API_KEY/);
   assert.doesNotMatch(overlay, /do-not-copy/, "raw API keys are never copied into the overlay");
 });
 
@@ -629,13 +654,13 @@ test("resolveModelOverlay degrades to last-good or no overlay instead of failing
   const missing = resolveModelOverlay(acpProfileRoot, brokenWeb, join(home, "no-prior.patch.yml"));
   assert.equal(missing.path, undefined);
   assert.equal(missing.ids.length, 0);
-  assert.match(missing.degradedReason ?? "", /does not define any bai models/);
+  assert.match(missing.degradedReason ?? "", /does not define any llm-pi-ai models/);
 
   // A previously written overlay at the same path is reused verbatim.
   const good = resolveModelOverlay(acpProfileRoot, webProfileRoot, output);
   assert.deepEqual(good.ids, ["deepseek-v4.1-flash"]);
   const degraded = resolveModelOverlay(acpProfileRoot, brokenWeb, output);
   assert.equal(degraded.path, output);
-  assert.match(degraded.degradedReason ?? "", /does not define any bai models/);
+  assert.match(degraded.degradedReason ?? "", /does not define any llm-pi-ai models/);
   assert.equal(readFileSync(output, "utf8"), readFileSync(output, "utf8"));
 });

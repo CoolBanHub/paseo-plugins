@@ -9,7 +9,6 @@ import { dshCatalogShape } from "./dsh-labels.ts";
 
 const PROFILE_FILES = ["cordis.yml", "cordis.patch.yml", "package.json", "pnpm-lock.yaml"];
 const MODEL_PATCH_ID = "llm-pi-ai";
-const PROVIDER_ID = "bai";
 
 /**
  * Locate this plugin's source directory. Paseo evaluates the plugin server
@@ -140,38 +139,75 @@ function readPatchList(profileRoot: string): Array<{
   }>;
 }
 
-/** Build an ACP overlay from Web models and the ACP profile's non-secret route fields. */
+type ProviderConfig = Record<string, unknown>;
+
+/** Keep only the non-secret route fields dsh needs to reach a provider. */
+function providerRoute(provider: ProviderConfig | undefined): ProviderConfig | undefined {
+  if (!provider || typeof provider.api !== "string" || typeof provider.baseURL !== "string") return undefined;
+  return {
+    api: provider.api,
+    baseURL: provider.baseURL,
+    ...(typeof provider.apiKeyEnv === "string" ? { apiKeyEnv: provider.apiKeyEnv } : {}),
+  };
+}
+
+/**
+ * Build an ACP overlay from every `llm-pi-ai` provider the Web profile
+ * defines models for. Mirroring only the legacy `bai` route meant a model
+ * added under any other provider in dsh Web (a second endpoint, a local
+ * runtime) never reached Paseo's catalog, and refreshing re-read the same
+ * four entries.
+ *
+ * The ACP profile stays authoritative for a provider it already declares:
+ * its endpoint and credential reference win. Providers only Web knows about
+ * take their route from Web so the models stay usable. Inline API keys are
+ * never copied — only `apiKeyEnv` names survive into the overlay file.
+ */
 export function writeWebModelOverlay(
   acpProfileRoot: string,
   webProfileRoot: string,
   outputPath: string,
 ): string[] {
-  const acpPatch = readPatchList(acpProfileRoot).find((patch) => patch?.id === MODEL_PATCH_ID);
-  const webPatch = readPatchList(webProfileRoot).find((patch) => patch?.id === MODEL_PATCH_ID);
-  const acpProvider = acpPatch?.config?.providers?.[PROVIDER_ID];
-  const models = webPatch?.config?.providers?.[PROVIDER_ID]?.models;
-  if (!Array.isArray(models) || models.length === 0) {
-    throw new Error(`dsh Web profile does not define any ${PROVIDER_ID} models in ${join(webProfileRoot, "cordis.patch.yml")}`);
+  const acpProviders =
+    readPatchList(acpProfileRoot).find((patch) => patch?.id === MODEL_PATCH_ID)?.config?.providers ?? {};
+  const webProviders =
+    readPatchList(webProfileRoot).find((patch) => patch?.id === MODEL_PATCH_ID)?.config?.providers ?? {};
+
+  const providers: Record<string, Record<string, unknown>> = {};
+  const ids: string[] = [];
+  for (const [providerId, webProvider] of Object.entries(webProviders)) {
+    const models = webProvider?.models;
+    if (!Array.isArray(models) || models.length === 0) continue;
+
+    const modelIds = models.map((model) => {
+      if (!model || typeof model !== "object" || typeof (model as { id?: unknown }).id !== "string") {
+        throw new Error(`dsh Web profile contains a ${providerId} model without an id`);
+      }
+      return (model as { id: string }).id;
+    });
+    const acpProvider = acpProviders[providerId];
+    const route = providerRoute(acpProvider) ?? providerRoute(webProvider);
+    if (!route) {
+      throw new Error(`dsh profiles must define ${providerId}.api and ${providerId}.baseURL`);
+    }
+    const displayName =
+      typeof webProvider.displayName === "string" ? webProvider.displayName :
+      typeof acpProvider?.displayName === "string" ? acpProvider.displayName : undefined;
+
+    providers[providerId] = {
+      ...route,
+      ...(displayName === undefined ? {} : { displayName }),
+      models,
+    };
+    ids.push(...modelIds);
   }
-  if (!acpProvider || typeof acpProvider.api !== "string" || typeof acpProvider.baseURL !== "string") {
-    throw new Error(`dsh ACP profile must define ${PROVIDER_ID}.api and ${PROVIDER_ID}.baseURL`);
+  if (ids.length === 0) {
+    throw new Error(`dsh Web profile does not define any ${MODEL_PATCH_ID} models in ${join(webProfileRoot, "cordis.patch.yml")}`);
   }
 
-  const ids = models.map((model) => {
-    if (!model || typeof model !== "object" || typeof (model as { id?: unknown }).id !== "string") {
-      throw new Error(`dsh Web profile contains a ${PROVIDER_ID} model without an id`);
-    }
-    return (model as { id: string }).id;
-  });
-  const route = {
-    api: acpProvider.api,
-    baseURL: acpProvider.baseURL,
-    ...(typeof acpProvider.apiKeyEnv === "string" ? { apiKeyEnv: acpProvider.apiKeyEnv } : {}),
-    models,
-  };
   const overlay = [{
     id: MODEL_PATCH_ID,
-    config: { providers: { [PROVIDER_ID]: route } },
+    config: { providers },
   }];
 
   mkdirSync(dirname(outputPath), { recursive: true });
