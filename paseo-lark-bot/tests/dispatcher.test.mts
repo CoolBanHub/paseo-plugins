@@ -12,7 +12,7 @@ import type {
 } from "../server/sessions.ts";
 import { questionCardToken } from "../server/question-card.ts";
 import type { RewriteReplyOptions } from "../server/rewrite.ts";
-import { DEFAULT_BOT_VALUES, NEUTRAL_REWRITE_INSTRUCTION, type BotValues } from "../shared/settings.ts";
+import { DEFAULT_BOT_VALUES, NEUTRAL_REWRITE_INSTRUCTION, type BotValues, type ChatBinding } from "../shared/settings.ts";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,7 @@ function baseValues(overrides: Partial<BotValues> = {}): BotValues {
         issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
         issueAcceptRequester: true,
   issueAcceptUsers: [],
+  issueActions: [],
         rewriteIgnoreStyle: false,
         rewriteInstruction: "",
       },
@@ -1568,6 +1569,7 @@ describe("p2p and delivery hygiene", () => {
         issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
         issueAcceptRequester: true,
   issueAcceptUsers: [],
+  issueActions: [],
         rewriteIgnoreStyle: false,
         rewriteInstruction: "",
       },
@@ -2874,6 +2876,7 @@ describe("completion mentions", () => {
       issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
       issueAcceptRequester: true,
   issueAcceptUsers: [],
+  issueActions: [],
       rewriteIgnoreStyle: false,
       rewriteInstruction: "",
     };
@@ -3078,5 +3081,179 @@ describe("guest collaboration", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("issue action buttons", () => {
+  function issueActionRecord(overrides: Partial<IssueRecord> = {}): IssueRecord {
+    return {
+      recordId: "rec_action",
+      chatId: "oc_group",
+      rootMessageId: "om_1",
+      threadId: "omt_1",
+      requesterOpenId: "ou_boss",
+      title: "打手订单详情买家留言全显",
+      status: "已修复",
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      mediaSynced: [],
+      updatedAt: 1,
+      ...overrides,
+    };
+  }
+
+  function actionValues(overrides: Partial<ChatBinding> = {}): BotValues {
+    const values = baseValues();
+    values.chats[0] = {
+      ...values.chats[0]!,
+      issueTracking: "auto",
+      issueBaseToken: "bascnTest",
+      issueTableId: "tblTest",
+      issueActions: [
+        {
+          id: "release",
+          label: "发布到生产",
+          prompt: "发布到生产",
+          from: ["已修复"],
+          confirm: "确认发布到生产？",
+          allowed: [{ openId: "ou_boss", name: "老板" }],
+          type: "primary",
+        },
+      ],
+      ...overrides,
+    };
+    return values;
+  }
+
+  function actionTracker(
+    record: IssueRecord,
+    status: IssueRecord["status"] = record.status,
+  ): { tracker: IssueTracker; progress: (string | null)[] } {
+    const progress: (string | null)[] = [];
+    const tracker = {
+      recordFor: () => record,
+      statusFor: async () => status,
+      updateProgress: (input: { summary: string | null }) => {
+        progress.push(input.summary);
+      },
+    } as unknown as IssueTracker;
+    return { tracker, progress };
+  }
+
+  function runPayload(
+    record: IssueRecord,
+    actionId = "release",
+  ): string {
+    return JSON.stringify({
+      kind: "issue",
+      action: "run",
+      recordId: record.recordId,
+      chatId: record.chatId,
+      topicKey: record.threadId,
+      actionId,
+    });
+  }
+
+  it("turns an allowed click into a topic turn and patches the card", async () => {
+    const record = issueActionRecord();
+    const { tracker, progress } = actionTracker(record);
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    h.dispatch.handleCardAction(
+      cardAction({ operator_id: "ou_boss", action_value: runPayload(record) }),
+    );
+    await flush();
+
+    assert.equal(h.created.length, 1, "the action must enqueue one agent turn");
+    assert.match(h.created[0]?.prompt ?? "", /【卡片操作】发布到生产/u);
+    assert.match(h.created[0]?.prompt ?? "", /打手订单详情买家留言全显/u);
+    assert.match(h.created[0]?.prompt ?? "", /发布到生产/u);
+    assert.equal(h.cardUpdates.length, 1);
+    assert.match(JSON.stringify(h.cardUpdates[0]?.card), /已触发「发布到生产」/u);
+    assert.ok(progress.some((entry) => entry?.includes("发布到生产")));
+    assert.match(h.replies.at(-1)?.text ?? "", /已触发「发布到生产」/u);
+  });
+
+  it("rejects operators outside the action allowlist", async () => {
+    const record = issueActionRecord();
+    const { tracker } = actionTracker(record);
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    h.dispatch.handleCardAction(
+      cardAction({ operator_id: "ou_other", action_value: runPayload(record) }),
+    );
+    await flush();
+
+    assert.equal(h.created.length, 0);
+    assert.match(h.replies.at(-1)?.text ?? "", /没有权限/u);
+  });
+
+  it("refuses when the authoritative status no longer matches", async () => {
+    const record = issueActionRecord();
+    const { tracker } = actionTracker(record, "待验收");
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    h.dispatch.handleCardAction(
+      cardAction({ operator_id: "ou_boss", action_value: runPayload(record) }),
+    );
+    await flush();
+
+    assert.equal(h.created.length, 0);
+    assert.match(h.replies.at(-1)?.text ?? "", /当前状态是「待验收」/u);
+  });
+
+  it("swallows a second click inside the cooldown window", async () => {
+    const record = issueActionRecord();
+    const { tracker } = actionTracker(record);
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    const payload = runPayload(record);
+    h.dispatch.handleCardAction(cardAction({ operator_id: "ou_boss", action_value: payload }));
+    await flush();
+    h.dispatch.handleCardAction(cardAction({ operator_id: "ou_boss", action_value: payload }));
+    await flush();
+
+    assert.equal(h.created.length, 1);
+    assert.match(h.replies.at(-1)?.text ?? "", /刚刚已经触发过/u);
+  });
+
+  it("rejects an action id that no longer exists in the binding", async () => {
+    const record = issueActionRecord();
+    const { tracker } = actionTracker(record);
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    h.dispatch.handleCardAction(
+      cardAction({ operator_id: "ou_boss", action_value: runPayload(record, "removed") }),
+    );
+    await flush();
+
+    assert.equal(h.created.length, 0);
+    assert.match(h.replies.at(-1)?.text ?? "", /按钮已失效/u);
+  });
+
+  it("adds the configured buttons to the card after acceptance", async () => {
+    const record = issueActionRecord({ status: "待验收" });
+    const { tracker } = actionTracker(record);
+    (tracker as unknown as { accept: () => Promise<IssueRecord> }).accept = async () => ({
+      ...record,
+      status: "已修复",
+    });
+    const h = makeHarness(actionValues(), { issueTracker: tracker });
+    h.dispatch.handleCardAction(
+      cardAction({
+        operator_id: "ou_boss",
+        action_value: JSON.stringify({
+          kind: "issue",
+          action: "accept",
+          recordId: record.recordId,
+          chatId: record.chatId,
+          topicKey: record.threadId,
+        }),
+      }),
+    );
+    await flush();
+
+    const card = JSON.stringify(h.cardUpdates[0]?.card);
+    assert.match(card, /发布到生产/u);
+    assert.match(card, /"action":"run"/u);
+    assert.match(card, /"actionId":"release"/u);
+    assert.match(h.replies.at(-1)?.text ?? "", /卡片上可以直接执行已配置的动作/u);
   });
 });

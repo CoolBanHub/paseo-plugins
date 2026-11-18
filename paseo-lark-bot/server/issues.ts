@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
-import type { BotValues, ChatBinding } from "../shared/settings.ts";
+import { ISSUE_STATUS_VALUES, type BotValues, type ChatBinding } from "../shared/settings.ts";
 import type { LarkMessageEvent } from "./lark-events.ts";
 import { parseLarkJson, readMessageDetail, readRawContent, resolveLarkCli, type LarkPayload, type MessageDetail } from "./lark.ts";
 import { sanitizeTopicText } from "./format.ts";
@@ -33,7 +33,7 @@ const VIDEO_MAX_BYTES = 50 * 1024 * 1024;
  * select. "已修复" means the fix was accepted; "已发布" means it is live.
  * Those are deliberately different states — a fix is not a release.
  */
-export const ISSUE_STATUSES = ["待处理", "处理中", "待验收", "已修复", "已发布", "已关闭"] as const;
+export const ISSUE_STATUSES = ISSUE_STATUS_VALUES;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
 export const ISSUE_TYPES = ["问题", "需求", "咨询"] as const;
@@ -317,6 +317,12 @@ export interface IssueTracker {
     values?: BotValues,
   ): Promise<IssueRecord | null>;
   release(recordId: string, operatorOpenId: string, values?: BotValues): Promise<IssueRecord | null>;
+  /**
+   * Re-read the authoritative Base status before a card action runs. Returns
+   * the local mapping when the read fails, so a transient Base error does not
+   * block an otherwise valid click.
+   */
+  statusFor(recordId: string, values?: BotValues): Promise<IssueStatus | null>;
   close(recordId: string, operatorOpenId: string, reason: string | null, values?: BotValues): Promise<IssueRecord | null>;
   query(
     chatId: string,
@@ -1659,6 +1665,18 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     return record;
   }
 
+  async function statusFor(recordId: string, values?: BotValues): Promise<IssueStatus | null> {
+    const current = await valuesFor(values);
+    const record = byRecord.get(recordId);
+    if (!record) return null;
+    try {
+      return (await readRecordStatus(current, record)) ?? record.status;
+    } catch (error) {
+      log("读取 Base 状态失败，按本地状态继续", errorDetail(error));
+      return record.status;
+    }
+  }
+
   async function close(
     recordId: string,
     operatorOpenId: string,
@@ -1757,6 +1775,7 @@ export function createIssueTracker(options: IssueTrackerOptions): IssueTracker {
     accept,
     reject,
     release,
+    statusFor,
     close,
     query,
     recordFor,

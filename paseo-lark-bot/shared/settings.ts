@@ -173,6 +173,85 @@ export const allowedUserSchema = z.object({
 export type AllowedUser = z.output<typeof allowedUserSchema>;
 
 /**
+ * Ledger statuses. Kept in the shared bundle so the settings UI can validate
+ * per-action status guards without importing the server. `server/issues.ts`
+ * re-exports the same tuple as its canonical `ISSUE_STATUSES`.
+ */
+export const ISSUE_STATUS_VALUES = [
+  "待处理",
+  "处理中",
+  "待验收",
+  "已修复",
+  "已发布",
+  "已关闭",
+] as const;
+export const issueStatusSchema = z.enum(ISSUE_STATUS_VALUES);
+export type IssueStatusValue = z.output<typeof issueStatusSchema>;
+
+/**
+ * One configurable button rendered on an issue card after acceptance. The
+ * plugin only renders the button and turns a click into a normal topic turn;
+ * what the prompt actually does (deploy, rollback, …) stays in the agent's
+ * own skill, so the plugin never learns a team's release pipeline.
+ */
+export const issueActionSchema = z.object({
+  /** Stable callback id; the prompt never travels in the card payload. */
+  id: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/u),
+  label: z.string().trim().min(1).max(30),
+  /** Sent to the topic as the clicker's message, exactly like an @-mention. */
+  prompt: z.string().trim().min(1).max(500),
+  /** Statuses the button may run from; the Base status is re-read on click. */
+  from: z.array(issueStatusSchema).min(1).default(["已修复"]),
+  /** Optional second-confirmation dialog text. */
+  confirm: z.string().trim().max(200).default(""),
+  /**
+   * Who may click; empty falls back to the binding's `allowedUsers`. An empty
+   * allowlist there means every member of the chat, same as normal turns.
+   */
+  allowed: z.array(allowedUserSchema).default([]),
+  type: z.enum(["primary", "danger", "default"]).default("default"),
+});
+
+export type IssueAction = z.output<typeof issueActionSchema>;
+
+/**
+ * Parse the settings textarea. Returns `actions: []` for an empty box, and a
+ * Chinese error for malformed JSON / schema / duplicate ids so the client can
+ * show it without importing zod's error prose.
+ */
+export function parseIssueActionsJson(raw: string): {
+  actions: IssueAction[];
+  error: string | null;
+} {
+  const text = raw.trim();
+  if (!text) return { actions: [], error: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return {
+      actions: [],
+      error: `JSON 解析失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const result = z.array(issueActionSchema).max(5).safeParse(parsed);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const path = issue && issue.path.length > 0 ? `（${issue.path.join(".")}）` : "";
+    return {
+      actions: [],
+      error: `格式不正确${path}：${issue?.message ?? "未知错误"}`,
+    };
+  }
+  const ids = new Set<string>();
+  for (const action of result.data) {
+    if (ids.has(action.id)) return { actions: [], error: `id「${action.id}」重复` };
+    ids.add(action.id);
+  }
+  return { actions: result.data, error: null };
+}
+
+/**
  * dsh's permission presets. Kept here (rather than imported from paseo-dsh)
  * because this plugin runs standalone and the values are dsh-protocol level.
  * Empty `permission` keeps the historical danger-full-access default.
@@ -281,6 +360,11 @@ export const chatBindingSchema = z.object({
   issueAcceptRequester: z.boolean().default(true),
   /** Additional people allowed to accept; names are display-only. */
   issueAcceptUsers: z.array(allowedUserSchema).default([]),
+  /**
+   * Extra buttons on the post-acceptance issue card. Each one is just a
+   * trusted prompt injected into the topic; no deploy logic lives here.
+   */
+  issueActions: z.array(issueActionSchema).max(5).default([]),
 });
 
 export type ChatBinding = z.output<typeof chatBindingSchema>;

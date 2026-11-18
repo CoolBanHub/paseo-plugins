@@ -18,8 +18,10 @@ import {
   DEFAULT_ISSUE_REACTION_EMOJIS,
   botValuesSchema,
   larkBotSettingsRpc,
+  parseIssueActionsJson,
   type BotValues,
   type ChatBinding,
+  type IssueAction,
 } from "../shared/settings.ts";
 import {
   AddChatPicker,
@@ -91,6 +93,11 @@ const CARD_CONSUMER_LABELS: Record<string, { text: string; tone: "success" | "wa
   retrying: { text: "重试中", tone: "danger" },
 };
 
+/** Pretty-print configured actions; an empty list shows the placeholder. */
+function formatIssueActions(actions: IssueAction[]): string {
+  return actions.length > 0 ? JSON.stringify(actions, null, 2) : "";
+}
+
 type Selection =
   | { kind: "none" }
   | { kind: "add" }
@@ -126,6 +133,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
   const [memberCatalogs, setMemberCatalogs] = useState<Record<string, MemberCatalogState>>({});
   const [allowedDrafts, setAllowedDrafts] = useState<Record<string, string>>({});
   const [acceptDrafts, setAcceptDrafts] = useState<Record<string, string>>({});
+  const [actionDrafts, setActionDrafts] = useState<Record<string, string>>({});
+  const [actionErrors, setActionErrors] = useState<Record<string, string | null>>({});
   const [status, setStatus] = useState<StatusState | null>(null);
   const [issueBases, setIssueBases] = useState<Record<string, LarkBotIssueBase>>({});
   const [issueBusy, setIssueBusy] = useState<Record<string, boolean>>({});
@@ -315,6 +324,7 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               issueReactionEmojis: [...DEFAULT_ISSUE_REACTION_EMOJIS],
               issueAcceptRequester: true,
               issueAcceptUsers: [],
+              issueActions: [],
             },
           ],
         };
@@ -449,6 +459,32 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
       setAcceptDrafts((current) => ({ ...current, [chatId]: "" }));
     },
     [acceptDrafts, addAcceptUser, draft, memberCatalogs, toast],
+  );
+
+  const applyIssueActions = useCallback(
+    (chatId: string) => {
+      const chat = draft?.chats.find((entry) => entry.chatId === chatId);
+      if (!chat) return;
+      const raw = actionDrafts[chatId] ?? formatIssueActions(chat.issueActions);
+      const result = parseIssueActionsJson(raw);
+      if (result.error) {
+        setActionErrors((current) => ({ ...current, [chatId]: result.error }));
+        return;
+      }
+      patchBinding(chatId, { issueActions: result.actions });
+      setActionErrors((current) => ({ ...current, [chatId]: null }));
+      setActionDrafts((current) => {
+        const next = { ...current };
+        delete next[chatId];
+        return next;
+      });
+      toast.show(
+        result.actions.length > 0
+          ? `已应用 ${result.actions.length} 个动作按钮；记得保存设置`
+          : "已清空动作按钮；记得保存设置",
+      );
+    },
+    [actionDrafts, draft, patchBinding, toast],
   );
 
   const loadMembers = useCallback(
@@ -1369,6 +1405,60 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
                           验收人按 open_id 配置，与「允许 @ 的成员」相互独立；提出人由话题根消息发送者识别。
                           表情验收需要开发者后台开启事件 im.message.reaction.created_v1 并发布版本；不知道 emoji_type
                           时先点一次，插件日志会打印「忽略未配置的验收表情：XXX」，把 XXX 填进上面的列表即可。
+                        </Text>
+                        <FieldLabel text="动作按钮（JSON，最多 5 个）" />
+                        <TextInput
+                          multiline
+                          value={
+                            actionDrafts[chat.chatId] ?? formatIssueActions(chat.issueActions)
+                          }
+                          placeholder={
+                            '[\n  {\n    "id": "release",\n    "label": "发布到生产",\n    "prompt": "发布到生产",\n    "from": ["已修复"],\n    "confirm": "确认把这个问题发布到生产？"\n  }\n]'
+                          }
+                          placeholderTextColor={colors().foregroundMuted}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          onChangeText={(text) => {
+                            setActionDrafts((current) => ({ ...current, [chat.chatId]: text }));
+                            setActionErrors((current) => ({ ...current, [chat.chatId]: null }));
+                          }}
+                          style={inputStyle({ minHeight: 104, textAlignVertical: "top" })}
+                        />
+                        {actionErrors[chat.chatId] ? (
+                          <Text style={{ color: colors().statusDanger, fontSize: 12 }}>
+                            {actionErrors[chat.chatId]}
+                          </Text>
+                        ) : null}
+                        <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+                          <PrimaryButton
+                            label="应用动作"
+                            subtle
+                            onPress={() => applyIssueActions(chat.chatId)}
+                          />
+                          {chat.issueActions.length > 0 || actionDrafts[chat.chatId] ? (
+                            <PrimaryButton
+                              label="清空动作"
+                              subtle
+                              onPress={() => {
+                                patchBinding(chat.chatId, { issueActions: [] });
+                                setActionDrafts((current) => {
+                                  const next = { ...current };
+                                  delete next[chat.chatId];
+                                  return next;
+                                });
+                                setActionErrors((current) => ({
+                                  ...current,
+                                  [chat.chatId]: null,
+                                }));
+                              }}
+                            />
+                          ) : null}
+                        </View>
+                        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+                          验收通过后，状态匹配的动作会出现在卡片上。点按钮 = 以操作人身份把
+                          prompt 发进话题、触发一轮 agent；插件不内置发布流程，部署逻辑留在 agent
+                          的 skill 里。allowed 留空跟随本会话「允许 @ 的成员」；from
+                          填状态数组（默认 ["已修复"]）。改完点「应用动作」，再保存设置。
                         </Text>
                         <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
                           <PrimaryButton

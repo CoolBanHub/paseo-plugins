@@ -1,3 +1,4 @@
+import type { IssueAction } from "../shared/settings.ts";
 import type { IssueRecord, IssueStatus } from "./issues.ts";
 
 /**
@@ -7,7 +8,9 @@ import type { IssueRecord, IssueStatus } from "./issues.ts";
  * move an already-closed item.
  */
 
-export type IssueCardAction = "accept" | "reject";
+export type IssueCardAction = "accept" | "reject" | "run";
+/** `release` is only used for the static "already released" replacement. */
+export type IssueCardStatusAction = IssueCardAction | "release";
 
 export interface IssueCardPayload {
   kind: "issue";
@@ -15,6 +18,8 @@ export interface IssueCardPayload {
   recordId: string;
   chatId: string;
   topicKey: string;
+  /** Set for `run`: the configured action id. The prompt never rides here. */
+  actionId?: string;
 }
 
 const MAX_TITLE = 120;
@@ -33,12 +38,21 @@ function button(
   label: string,
   type: "primary" | "danger" | "default",
   value: IssueCardPayload,
+  confirmText?: string,
 ): Record<string, unknown> {
   return {
     tag: "button",
     text: { tag: "plain_text", content: label },
     type,
     width: "fill",
+    ...(confirmText
+      ? {
+          confirm: {
+            title: { tag: "plain_text", content: "确认操作" },
+            text: { tag: "plain_text", content: clip(confirmText, 200) },
+          },
+        }
+      : {}),
     behaviors: [{ type: "callback", value }],
   };
 }
@@ -87,19 +101,72 @@ export function buildIssueCard(options: {
   };
 }
 
-/** Static replacement after a click; keeps the original buttons from lingering. */
+/**
+ * Static replacement after a click; keeps the original buttons from lingering.
+ * When the record is in a status covered by configured actions, those buttons
+ * are appended and each one resolves its prompt again on the server.
+ */
 export function buildIssueResolvedCard(options: {
   title: string;
   status: IssueStatus;
-  action: IssueCardAction | "release";
+  action: IssueCardStatusAction;
   operatorOpenId: string;
+  actions?: IssueAction[];
+  record?: Pick<IssueRecord, "recordId" | "chatId" | "threadId" | "rootMessageId">;
+  topicKey?: string;
+  /** Label of the action that was just triggered, for the "已触发" state. */
+  runLabel?: string;
 }): Record<string, unknown> {
   const actionText =
     options.action === "accept"
       ? "已验收通过"
       : options.action === "reject"
         ? "验收未通过，已打回处理中"
-        : "已标记为已发布";
+        : options.action === "run"
+          ? `已触发「${clip(options.runLabel || "动作", 30)}」，请等待本轮回复`
+          : "已标记为已发布";
+  const record = options.record;
+  const topicKey = options.topicKey || record?.threadId || record?.rootMessageId || "";
+  const availableActions =
+    options.action === "run" || !record || !topicKey
+      ? []
+      : (options.actions ?? []).filter(
+          (action) => action.label && action.from.includes(options.status),
+        );
+  const lines = [
+    `**${clip(options.title || "未命名话题", MAX_TITLE)}**`,
+    `状态：${options.status}`,
+    `${actionText}（操作人 <at id="${options.operatorOpenId}"></at>）`,
+  ];
+  if (options.action === "run") {
+    lines.push("", "如果执行失败或需要重试，请在话题里直接说明。");
+  } else if (availableActions.length > 0) {
+    lines.push("", "可执行以下动作；点击后以操作人身份在话题里触发一轮处理。");
+  } else {
+    lines.push("", "不能重复操作；如需变更请在 Base 里修改，或在话题里使用 `/issue` 命令。");
+  }
+  const elements: Record<string, unknown>[] = [
+    { tag: "markdown", content: lines.join("\n") },
+  ];
+  if (record && topicKey && options.action !== "run") {
+    for (const action of availableActions) {
+      elements.push(
+        button(
+          action.label,
+          action.type,
+          {
+            kind: "issue",
+            action: "run",
+            actionId: action.id,
+            recordId: record.recordId,
+            chatId: record.chatId,
+            topicKey,
+          },
+          action.confirm || undefined,
+        ),
+      );
+    }
+  }
   return {
     schema: "2.0",
     config: { update_multi: true, width_mode: "default" },
@@ -110,18 +177,7 @@ export function buildIssueResolvedCard(options: {
     body: {
       direction: "vertical",
       padding: "12px 12px 20px 12px",
-      elements: [
-        {
-          tag: "markdown",
-          content: [
-            `**${clip(options.title || "未命名话题", MAX_TITLE)}**`,
-            `状态：${options.status}`,
-            `${actionText}（操作人 <at id="${options.operatorOpenId}"></at>）`,
-            "",
-            "不能重复操作；如需变更请在 Base 里修改，或在话题里使用 `/issue` 命令。",
-          ].join("\n"),
-        },
-      ],
+      elements,
     },
   };
 }
@@ -132,16 +188,22 @@ export function parseIssueAction(value: string | undefined): IssueCardPayload | 
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>;
     if (parsed.kind !== "issue") return null;
-    if (parsed.action !== "accept" && parsed.action !== "reject") return null;
+    if (parsed.action !== "accept" && parsed.action !== "reject" && parsed.action !== "run") {
+      return null;
+    }
     if (typeof parsed.recordId !== "string" || !parsed.recordId) return null;
     if (typeof parsed.chatId !== "string" || !parsed.chatId) return null;
     if (typeof parsed.topicKey !== "string" || !parsed.topicKey) return null;
+    const actionId =
+      typeof parsed.actionId === "string" && parsed.actionId ? parsed.actionId : undefined;
+    if (parsed.action === "run" && !actionId) return null;
     return {
       kind: "issue",
       action: parsed.action,
       recordId: parsed.recordId,
       chatId: parsed.chatId,
       topicKey: parsed.topicKey,
+      ...(actionId ? { actionId } : {}),
     };
   } catch {
     return null;

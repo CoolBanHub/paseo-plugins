@@ -91,6 +91,7 @@ const binding: ChatBinding = {
   issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
   issueAcceptRequester: true,
   issueAcceptUsers: [],
+  issueActions: [],
   rewriteIgnoreStyle: false,
   rewriteInstruction: "",
 };

@@ -5,6 +5,7 @@ import {
   botValuesSchema,
   isDshProvider,
   larkBotSettings,
+  parseIssueActionsJson,
 } from "../shared/settings.ts";
 
 describe("chat binding schema", () => {
@@ -38,6 +39,7 @@ describe("chat binding schema", () => {
     assert.deepEqual(binding.issueReactionEmojis, [...DEFAULT_ISSUE_REACTION_EMOJIS]);
     assert.equal(binding.issueAcceptRequester, true);
     assert.deepEqual(binding.issueAcceptUsers, []);
+    assert.deepEqual(binding.issueActions, []);
   });
 
   it("accepts explicit AI rewrite modes and an independent model", () => {
@@ -196,5 +198,85 @@ describe("isDshProvider", () => {
     assert.equal(isDshProvider("dsh/deepseek-v4.1-flash"), true);
     assert.equal(isDshProvider("claude"), false);
     assert.equal(isDshProvider("dshx"), false);
+  });
+});
+
+describe("issue action config", () => {
+  it("fills defaults from a minimal action", () => {
+    const result = parseIssueActionsJson(
+      JSON.stringify([{ id: "release", label: " 发布到生产 ", prompt: " 发布到生产 " }]),
+    );
+    assert.equal(result.error, null);
+    assert.deepEqual(result.actions, [
+      {
+        id: "release",
+        label: "发布到生产",
+        prompt: "发布到生产",
+        from: ["已修复"],
+        confirm: "",
+        allowed: [],
+        type: "default",
+      },
+    ]);
+  });
+
+  it("treats an empty box as no actions", () => {
+    assert.deepEqual(parseIssueActionsJson("  "), { actions: [], error: null });
+  });
+
+  it("rejects malformed JSON, unknown statuses, duplicate ids and more than five", () => {
+    assert.match(parseIssueActionsJson("{").error ?? "", /JSON/u);
+    const badStatus = parseIssueActionsJson(
+      JSON.stringify([{ id: "release", label: "发布", prompt: "发布", from: ["已上线"] }]),
+    );
+    assert.ok(badStatus.error);
+    const duplicate = parseIssueActionsJson(
+      JSON.stringify([
+        { id: "release", label: "A", prompt: "A" },
+        { id: "release", label: "B", prompt: "B" },
+      ]),
+    );
+    assert.match(duplicate.error ?? "", /重复/u);
+    const six = Array.from({ length: 6 }, (_, index) => ({
+      id: `action${index}`,
+      label: "动作",
+      prompt: "动作",
+    }));
+    assert.ok(parseIssueActionsJson(JSON.stringify(six)).error);
+  });
+
+  it("validates action ids and the five-button cap in the settings schema", () => {
+    assert.throws(() =>
+      botValuesSchema.parse({
+        chats: [
+          {
+            chatId: "oc_group",
+            provider: "dsh",
+            issueActions: [{ id: "Release", label: "发布", prompt: "发布" }],
+          },
+        ],
+      }),
+    );
+    const parsed = botValuesSchema.parse({
+      chats: [
+        {
+          chatId: "oc_group",
+          provider: "dsh",
+          issueActions: [
+            {
+              id: "release",
+              label: "发布到生产",
+              prompt: "发布到生产",
+              from: ["已修复"],
+              allowed: [{ openId: "ou_boss", name: "老板" }],
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(parsed.chats[0]?.issueActions[0]?.type, "default");
+    assert.deepEqual(parsed.chats[0]?.issueActions[0]?.allowed, [
+      { openId: "ou_boss", name: "老板" },
+    ]);
   });
 });

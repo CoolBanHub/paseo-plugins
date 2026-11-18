@@ -11,7 +11,7 @@ import {
   issueAiModelChoice,
   issueRecordUrl,
 } from "../server/issues.ts";
-import { buildIssueCard, parseIssueAction } from "../server/issue-card.ts";
+import { buildIssueCard, buildIssueResolvedCard, parseIssueAction } from "../server/issue-card.ts";
 import { parseIssueClassification } from "../server/issue-classifier.ts";
 import type { LarkMessageEvent } from "../server/lark-events.ts";
 import { DEFAULT_BOT_VALUES, type BotValues, type ChatBinding } from "../shared/settings.ts";
@@ -55,6 +55,7 @@ function binding(overrides: Partial<ChatBinding> = {}): ChatBinding {
     issueReactionEmojis: ["OK", "THUMBSUP", "THANKS", "DONE", "YES", "Yes", "CheckMark", "JIAYI"],
     issueAcceptRequester: true,
     issueAcceptUsers: [],
+    issueActions: [],
     ...overrides,
   };
 }
@@ -686,6 +687,121 @@ describe("issue card", () => {
     assert.equal(accept?.topicKey, THREAD);
     assert.equal(parseIssueAction("not-json"), null);
     assert.equal(parseIssueAction(JSON.stringify({ kind: "issue", action: "release" })), null);
+  });
+
+  it("renders configured action buttons with confirmation and parses run callbacks", () => {
+    const record = {
+      recordId: "rec_1",
+      chatId: CHAT,
+      rootMessageId: ROOT,
+      threadId: THREAD,
+      requesterOpenId: USER,
+      title: "登录后偶发闪退",
+      status: "已修复" as const,
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      mediaSynced: [],
+      updatedAt: 1,
+    };
+    const card = buildIssueResolvedCard({
+      title: record.title,
+      status: "已修复",
+      action: "accept",
+      operatorOpenId: USER,
+      record,
+      topicKey: THREAD,
+      actions: [
+        {
+          id: "release",
+          label: "发布到生产",
+          prompt: "发布到生产",
+          from: ["已修复"],
+          confirm: "确认发布到生产？",
+          allowed: [],
+          type: "primary",
+        },
+        {
+          id: "rollback",
+          label: "回滚",
+          prompt: "回滚",
+          from: ["已发布"],
+          confirm: "",
+          allowed: [],
+          type: "danger",
+        },
+      ],
+    });
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const buttons = body.elements.filter((element) => element.tag === "button") as Array<{
+      text: { content: string };
+      confirm?: { text: { content: string } };
+      behaviors: Array<{ value: unknown }>;
+    }>;
+    assert.equal(buttons.length, 1, "only the action matching 已修复 is rendered");
+    assert.equal(buttons[0]?.text.content, "发布到生产");
+    assert.equal(buttons[0]?.confirm?.text.content, "确认发布到生产？");
+    const parsed = parseIssueAction(JSON.stringify(buttons[0]?.behaviors[0]?.value));
+    assert.equal(parsed?.action, "run");
+    assert.equal(parsed?.actionId, "release");
+    assert.equal(parsed?.recordId, "rec_1");
+    assert.equal(parsed?.topicKey, THREAD);
+    assert.equal(
+      parseIssueAction(
+        JSON.stringify({
+          kind: "issue",
+          action: "run",
+          recordId: "rec_1",
+          chatId: CHAT,
+          topicKey: THREAD,
+        }),
+      ),
+      null,
+      "run callbacks must carry an action id",
+    );
+  });
+
+  it("drops action buttons after one has been triggered", () => {
+    const record = {
+      recordId: "rec_1",
+      chatId: CHAT,
+      rootMessageId: ROOT,
+      threadId: THREAD,
+      requesterOpenId: USER,
+      title: "登录后偶发闪退",
+      status: "已修复" as const,
+      baseToken: "bascnTest",
+      tableId: "tblTest",
+      lastActiveAt: 1,
+      messageCount: 1,
+      mediaSynced: [],
+      updatedAt: 1,
+    };
+    const actions = [
+      {
+        id: "release",
+        label: "发布到生产",
+        prompt: "发布到生产",
+        from: ["已修复" as const],
+        confirm: "",
+        allowed: [],
+        type: "primary" as const,
+      },
+    ];
+    const done = buildIssueResolvedCard({
+      title: record.title,
+      status: "已修复",
+      action: "run",
+      operatorOpenId: USER,
+      record,
+      topicKey: THREAD,
+      actions,
+      runLabel: "发布到生产",
+    });
+    const body = done.body as { elements: Array<Record<string, unknown>> };
+    assert.equal(body.elements.some((element) => element.tag === "button"), false);
+    assert.match(JSON.stringify(done), /已触发「发布到生产」/u);
   });
 });
 
