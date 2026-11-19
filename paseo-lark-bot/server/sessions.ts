@@ -388,14 +388,22 @@ export interface SessionPaseoApi {
     ref(id: string): SessionAgentHandle & { timeline?: SessionTimelineHandle };
   };
   /**
-   * Optional slice for placing topic agents in one shared workspace. Agents
+   * Optional slice for placing topic agents in a shared workspace. Agents
    * created through a workspace handle inherit the workspace directory as
    * their cwd. Absent on older daemons (and plain test fakes): the registry
    * then falls back to a plain agents.create() with the binding cwd.
    */
   workspaces?: {
     list(): Promise<{
-      entries?: { id: string; name?: string | null; title?: string | null }[];
+      entries?: {
+        id: string;
+        name?: string | null;
+        title?: string | null;
+        /** Directory the workspace runs in; used to group by cwd. */
+        workspaceDirectory?: string | null;
+        /** Fallback directory field on older/newer host projections. */
+        projectRootPath?: string | null;
+      }[];
     }>;
     ref(id: string): SessionWorkspaceHandle;
     create(options: {
@@ -809,9 +817,10 @@ export function createSessionRegistry(options: {
   };
   /** A still-running turn is re-probed at most this often. */
   const stuckRecheckMs = (): number => Math.min(stuckBusyMs(), STUCK_RECHECK_MS);
-  // Workspace handles cached per chat (per-binding mode) or once for the
-  // shared "飞书任务" workspace. A failed lookup is not cached, so the next
-  // turn retries and a recovered daemon heals the path.
+  // Workspace handles cached per cwd in shared mode (all chats using the same
+  // directory share one "飞书任务"), or per chat in strict per-binding mode.
+  // A failed lookup is not cached, so the next turn retries and a recovered
+  // daemon heals the path.
   function effectiveBinding(binding: ChatBinding, overrides: TopicOverrides): ChatBinding {
     return {
       ...binding,
@@ -828,7 +837,7 @@ export function createSessionRegistry(options: {
 
   function workspaceForAgent(item: QueueItem, cwd: string): Promise<SessionWorkspaceHandle | null> {
     const perBinding = getWorkspacePerBinding();
-    const key = perBinding ? `chat:${item.binding.chatId}` : "shared";
+    const key = perBinding ? `chat:${item.binding.chatId}` : `cwd:${cwd}`;
     const cached = workspaceCache.get(key);
     if (cached) return Promise.resolve(cached);
     const title = workspaceTitleFor(item.binding.chatId, item.binding.chatName, perBinding);

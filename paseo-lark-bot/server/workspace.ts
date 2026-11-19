@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import type {
   SessionAgentHandle,
   SessionPaseoApi,
@@ -6,9 +7,10 @@ import type {
 
 /**
  * Topic agents live in a workspace so the Paseo sidebar is not flooded with
- * one entry per topic. By default every Feishu chat shares "飞书任务"; with
- * `workspacePerBinding` each chat gets its own workspace named after the chat,
- * which lets different bindings point at different project directories.
+ * one entry per topic. By default one "飞书任务" workspace is created per
+ * working directory and shared by every chat using that directory; with
+ * `workspacePerBinding` each chat gets its own workspace named after the chat
+ * for strict isolation.
  */
 export const SHARED_WORKSPACE_TITLE = "飞书任务";
 
@@ -26,10 +28,24 @@ export function workspaceTitleFor(
   return "飞书 · " + (chatName || chatId).slice(0, 32) + " · " + chatId.slice(-4);
 }
 
+/** Resolve a workspace's directory from the fields Paseo exposes. */
+function workspaceDirectoryOf(entry: {
+  workspaceDirectory?: string | null;
+  projectRootPath?: string | null;
+}): string | null {
+  const value = entry.workspaceDirectory?.trim() || entry.projectRootPath?.trim();
+  return value ? resolve(value) : null;
+}
+
 /**
- * Find (or create) a workspace by title. Resolves to null when the daemon
- * exposes no workspaces API or the lookup/create fails, so the caller can
- * fall back to a plain agents.create() with its own cwd.
+ * Find (or create) a workspace by title **and directory**. Resolves to null
+ * when the daemon exposes no workspaces API or the lookup/create fails, so
+ * the caller can fall back to a plain agents.create() with its own cwd.
+ *
+ * Same title + same directory is reused (chats sharing a cwd share one
+ * workspace); same title in another directory creates a separate workspace.
+ * Entries from hosts that do not report directory metadata fall back to the
+ * old title-only match.
  */
 export async function ensureWorkspace(options: {
   paseo: SessionPaseoApi;
@@ -44,10 +60,17 @@ export async function ensureWorkspace(options: {
   if (!workspaces) return null;
   try {
     const result = await workspaces.list();
-    const existing = (result.entries ?? []).find(
+    const targetDirectory = resolve(options.directory);
+    const sameTitle = (result.entries ?? []).filter(
       (entry) => entry.title === options.title || entry.name === options.title,
     );
+    const withDirectory = sameTitle.filter((entry) => workspaceDirectoryOf(entry) !== null);
+    const existing = withDirectory.find(
+      (entry) => workspaceDirectoryOf(entry) === targetDirectory,
+    );
     if (existing) return workspaces.ref(existing.id);
+    // Legacy host: entries carry no directory, so title is the only key.
+    if (withDirectory.length === 0 && sameTitle[0]) return workspaces.ref(sameTitle[0].id);
     return await workspaces.create({
       title: options.title,
       source: { kind: "directory", path: options.directory },

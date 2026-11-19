@@ -437,9 +437,10 @@ export const botValuesSchema = z.object({
    */
   collabEnabled: z.boolean().default(false),
   /**
-   * Give each chat binding its own workspace (named after the chat) instead
-   * of putting every topic agent in the shared "飞书任务" workspace. Use this
-   * when bindings point at different project directories.
+   * Strict per-chat isolation: give each chat binding its own workspace
+   * (named after the chat) even when several chats share a cwd. By default
+   * one "飞书任务" workspace is created per working directory and reused by
+   * every chat pointing at that directory.
    */
   workspacePerBinding: z.boolean().default(false),
   /**

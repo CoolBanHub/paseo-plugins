@@ -86,7 +86,7 @@ host 级设置（`lark_bot`，version 3），在 Paseo 侧边栏的「飞书机�
 | `collabEnabled` | `false` | 允许话题发起人用 `/collab open` 开启限时只读协作；访客使用独立只读会话，默认关闭 |
 | `attachmentSend` | `true` | 允许智能体通过 `bin/lark-bot-send` 把生成的图片/文件发回话题 |
 | `attachmentMaxMb` | `50` | 回传附件的单文件大小上限（入站文件另有 20MB 上限） |
-| `workspacePerBinding` | `false` | 每个会话一个以群名命名的 workspace；默认所有话题共用「飞书任务」 |
+| `workspacePerBinding` | `false` | 默认按工作目录共享：同一 `cwd` 共用一个「飞书任务」，不同 `cwd` 各建一个；开启后每个会话单独一个「飞书 · 群名」，即使 `cwd` 相同也不共享 |
 | `stuckTurnMinutes` | `120` | 长轮次检查阈值（分钟）。到点后先查 Agent 状态，只有确认 Agent 已不存在才重建并重跑；仍在运行只提醒、不因耗时就重建。可设 5–720 |
 | `aiTitle` | `true` | 新话题首次 @ 时，用该会话绑定的模型跑一次一次性命名轮次，为智能体会话生成一句不超过 40 字、直接描述任务内容的标题（首轮回复会稍慢）。失败、超时（45 秒）或关闭时回退为清洗后的话题文本（截 60 字） |
 | `notifyPermission` | `false` | 普通权限请求是否通知到群。默认关闭：直接在 Paseo 客户端处理，完成后结果仍回到话题；dsh 的 ask_user_question 走 `questionCards` |
@@ -237,8 +237,8 @@ host 级设置（`lark_bot`，version 3），在 Paseo 侧边栏的「飞书机�
 - **读取话题根消息/媒体失败会重试**：飞书接口 TLS 超时时，根消息文本与根媒体不会被当成“已读取”缓存；下一次 @ 会重新拉取。仍失败时机器人会提示“读取话题根消息失败，请稍后重试”，而不是把话题当成空话题。
 - **图片与视频会传给智能体**：话题内出现的图片（包括 post 内嵌图片）自动下载缓存；**话题根消息的图片在首次被引用时自动补拉**（即使根消息发出时插件未运行、群未绑定或守护进程重启过），单聊图片同样摄取；视频用 ffmpeg 在整段视频上均匀抽 3 帧（有 ffprobe 时按 15%/50%/85%  seek，缩至 640px 宽），下次 @ 机器人时随消息附加（每次最多 4 张）。**图片缓存按消息 id 索引**，触发时按「根消息 + 话题历史 + 当前消息」聚合——飞书话题事件可能带 `root_id` 或 `thread_id` 两种话题标识，按话题缓存在两种 key 漂移时会丢图，按消息聚合不受影响。图片下载上限 5MB、视频 50MB、文件 20MB；需要本机可访问 `/opt/homebrew/bin/ffmpeg` 或 `/usr/local/bin/ffmpeg`（无则视频退化为占位）。能否真正识图取决于所选 provider 的视觉能力，请以实际 provider 为准。
 - **图片会同时落盘**：摄取的图片写入 `~/.paseo/plugin-data/lark-bot/media/<话题>/<消息id>-<序号>.png|.jpg`，【附图】行列出文件路径——不依赖视觉 API 的 provider 可用文件工具直接读图，用户也可按路径打开原图核对。**注意 Paseo 客户端的会话时间线不渲染图片**（协议时间线没有图片条目类型，`images` 仅作为模型的视觉输入），在会话里看到的是【附图】行与路径；要看原图请打开这些文件或回飞书话题。文件消息同样落盘，并在 prompt 的【附件】行列路径。
-- 创建的智能体会话标题就是任务描述本身，不带「飞书」/群名前缀——共享 workspace 已命名「飞书任务」，来源一目了然，前缀只会挤占 workspace 标签页宽度；会话归属哪个群看 `lark-bot-chat` / `lark-bot-topic` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。标题默认由 **AI 生成**（`aiTitle`）：创建会话前先跑一个一次性的命名轮次（用该会话绑定的 provider/model，带 `lark-bot-purpose: title` 标签、`autoArchive`，并复用话题已有的 workspace，不会为命名单独创建 workspace），生成一句不超过 40 字、直接描述任务内容（做什么、对象是什么，保留关键名词与数字）的标题；失败、超时（45 秒）、workspace 不可用或关闭该设置时，回退为清洗后的话题根文本（截 60 字）。注意：在 Paseo 里手动给该 agent 发消息产生的轮次也可能被当作插件轮次回复到飞书；建议在独立话题/会话中使用。
-- **默认所有话题 agent 放在一个共享 workspace「飞书任务」里**（`workspacePerBinding` 开启时改为每个会话一个「飞书 · 群名」workspace）：按名字在 `workspaces.list` 中查找，没有则用当时绑定的 `cwd` 创建（避免每个话题各占一个 workspace 淹没侧边栏）。进入该 workspace 后，agent 的工作目录固定为 workspace 目录；AI 命名、回复改写和定时任务的一次性 helper 也复用同一个 workspace，不再各自调用不带 `workspaceId` 的 `agents.create`。守护进程不支持 workspaces API 时，仍回退为「每话题独立 workspace」的旧行为；支持 workspaces API 但解析/创建失败时，helper 会跳过（命名回退文本、改写发原文、定时任务记一次失败），避免在 Paseo 0.15+ 上留下空的 background workspace。旧版本留下的散落 workspace 不会被自动清理，可在 Paseo 中手动归档。
+- 创建的智能体会话标题就是任务描述本身，不带「飞书」/群名前缀——每个工作目录的共享 workspace 都命名「飞书任务」，来源一目了然，前缀只会挤占 workspace 标签页宽度；会话归属哪个群看 `lark-bot-chat` / `lark-bot-topic` 标签，可在 Paseo 客户端中查看完整时间线并手动接管。标题默认由 **AI 生成**（`aiTitle`）：创建会话前先跑一个一次性的命名轮次（用该会话绑定的 provider/model，带 `lark-bot-purpose: title` 标签、`autoArchive`，并复用话题已有的 workspace，不会为命名单独创建 workspace），生成一句不超过 40 字、直接描述任务内容（做什么、对象是什么，保留关键名词与数字）的标题；失败、超时（45 秒）、workspace 不可用或关闭该设置时，回退为清洗后的话题根文本（截 60 字）。注意：在 Paseo 里手动给该 agent 发消息产生的轮次也可能被当作插件轮次回复到飞书；建议在独立话题/会话中使用。
+- **默认按工作目录划分 workspace**：每个解析后的绑定 `cwd` 对应一个「飞书任务」workspace，同一目录的多个群共用，不同目录各自创建。`workspaces.list` 同时匹配标题和目录（`workspaceDirectory` / `projectRootPath`），不会再把第一个「飞书任务」的目录套给所有群。开启 `workspacePerBinding` 时改为每个会话一个「飞书 · 群名 · id」workspace，用于严格隔离；即使目录相同也不共享。进入 workspace 后，agent 的工作目录固定为 workspace 目录；AI 命名、回复改写和定时任务的一次性 helper 也复用同一个 workspace，不再各自调用不带 `workspaceId` 的 `agents.create`。守护进程不支持 workspaces API 时，仍回退为「每话题独立 workspace」的旧行为；支持 workspaces API 但解析/创建失败时，helper 会跳过（命名回退文本、改写发原文、定时任务记一次失败），避免在 Paseo 0.15+ 上留下空的 background workspace。旧版本留下的散落 workspace 不会被自动清理，可在 Paseo 中手动归档。
 
 ## 开发与验证
 
@@ -297,7 +297,7 @@ npm run typecheck
 - 进程关闭/插件 reload 时会停止重试与看门狗定时器，并立即写入话题映射与正在跑的 pending-turn 标记（不等 5 秒去抖），避免卸载后仍有延迟通知或在旧进程里覆盖新映射。
 - **重启恢复是尽力而为**：pending-turn 在轮次开始时同步写入，但 SIGKILL/断电可能丢最后一次写；手动在 Paseo 给 agent 发消息产生的轮次如果恰好在重启后结束，也可能被当作恢复轮次补发到飞书。
 - 一次性命名（`title`）与 AI 改写（`rewrite`）会话都带 `lark-bot-purpose` 标签，伴生插件可据此跳过这些辅助会话的生命周期通知。
-- 共享 workspace 的目录取**首次创建时**绑定的 `cwd`：之后再修改绑定 `cwd`、或存在多个不同 `cwd` 的绑定，都不会产生新的「飞书任务」workspace——所有话题 agent 仍落在第一个 workspace（工作目录以它为准）。开启 `workspacePerBinding` 可让每个绑定独立，但同一绑定之后的 `cwd` 修改仍需归档旧 workspace 才会重建。
+- workspace 以**解析后的 `cwd`** 为键：同一目录共用一个「飞书任务」，不同目录各自创建。绑定改 `cwd` 后，新话题或 `/new` 会使用新目录的 workspace；已有话题的旧 agent 仍留在原 workspace，不会自动迁移。旧版本按首次目录创建的「飞书任务」不会被自动改名或迁移；新目录没有同名 workspace 时会新建，已有同目录的则复用。`workspacePerBinding` 仍可强制每个会话独立。
 - **进度卡片不是可靠通道**：卡片 PATCH 受飞书限流与 30KB 上限影响，失败时只写日志并保留旧卡；最终答案始终单独发送，不依赖卡片。卡片更新不会推送，完成提示依赖 `DONE` 表情或最终回复。
 - `/stop` 只能清空本地排队；Paseo 插件 API 目前没有 `cancelAgent`，已在执行的轮次不会被中断，完成后仍会回复。因此看门狗不会仅凭超时重建会话；仍在运行时只提醒，确认 Agent 已不存在才重建。
 - 定时任务使用 daemon 本地时区、分钟粒度，停机期间错过的触发不补跑；任务存在 `cron-jobs.json`，增删改需在会话里用 `/cron`，运行状态页只读。插件要等第一次拿到 PaseoApi（收到消息或打开设置页触发的状态请求）后才启动调度器；守护进程重启后如果一直没有任何事件，任务会延后到下一次交互。

@@ -58,7 +58,13 @@ interface Harness {
 }
 
 interface WorkspacesFakeOptions {
-  entries: { id: string; name?: string | null; title?: string | null }[];
+  entries: {
+    id: string;
+    name?: string | null;
+    title?: string | null;
+    workspaceDirectory?: string | null;
+    projectRootPath?: string | null;
+  }[];
   failCreate?: boolean;
 }
 
@@ -202,7 +208,11 @@ function makeHarness(
             create: async (request: { title?: string; source: { kind: string; path: string } }) => {
               if (options.workspaces!.failCreate) throw new Error("workspace create failed");
               wsCreated.push(request);
-              options.workspaces!.entries.push({ id: "ws-new", title: request.title ?? null });
+              options.workspaces!.entries.push({
+                id: "ws-new",
+                title: request.title ?? null,
+                workspaceDirectory: request.source.path,
+              });
               return workspaceHandle("ws-new");
             },
           },
@@ -857,9 +867,14 @@ describe("shared workspace", () => {
     assert.deepEqual(h.wsAgentCreates[1].labels, { "lark-bot-chat": "oc_group", "lark-bot-topic": "om_2" });
   });
 
-  it("reuses an existing same-named workspace instead of creating one", async () => {
+  it("reuses an existing 飞书任务 workspace with the same directory", async () => {
     const byTitle = makeHarness({
-      workspaces: { entries: [{ id: "ws-existing", name: "别的目录", title: "飞书任务" }] },
+      workspaces: {
+        entries: [
+          { id: "ws-other", title: "飞书任务", workspaceDirectory: "/tmp/other" },
+          { id: "ws-existing", name: "别的目录", title: "飞书任务", workspaceDirectory: "/tmp/project" },
+        ],
+      },
     });
     byTitle.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
@@ -867,6 +882,7 @@ describe("shared workspace", () => {
     assert.deepEqual(byTitle.wsRefs, ["ws-existing"]);
     assert.equal(byTitle.wsAgentCreates.length, 1);
 
+    // Older hosts without directory metadata keep the legacy title-only match.
     const byName = makeHarness({
       workspaces: { entries: [{ id: "ws-named", name: "飞书任务", title: null }] },
     });
@@ -875,6 +891,47 @@ describe("shared workspace", () => {
     assert.equal(byName.wsCreated.length, 0);
     assert.deepEqual(byName.wsRefs, ["ws-named"]);
     assert.equal(byName.wsAgentCreates.length, 1);
+  });
+
+  it("creates a separate 飞书任务 when the only same-named workspace is another directory", async () => {
+    const h = makeHarness({
+      workspaces: {
+        entries: [{ id: "ws-other", title: "飞书任务", workspaceDirectory: "/tmp/other" }],
+      },
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    assert.equal(h.wsCreated.length, 1);
+    assert.deepEqual(h.wsCreated[0].source, { kind: "directory", path: "/tmp/project" });
+    assert.equal(h.wsAgentCreates.length, 1);
+  });
+
+  it("shares one 飞书任务 across chats with the same cwd and separates different cwds", async () => {
+    const h = makeHarness({ workspaces: { entries: [] } });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    h.registry.handleTurnEnded("agent-1", completed("第一轮答复"));
+    await flush();
+
+    const sameCwd: ChatBinding = { ...binding, chatId: "oc_other", chatName: "同目录群" };
+    h.registry.enqueue("om_2", "oc_other", "om_2", "第二条", sameCwd);
+    await flush();
+    assert.equal(h.wsCreated.length, 1, "same cwd reuses the existing workspace");
+    assert.equal(h.wsAgentCreates.length, 2);
+    h.registry.handleTurnEnded("agent-2", completed("第二轮答复"));
+    await flush();
+
+    const otherCwd: ChatBinding = {
+      ...binding,
+      chatId: "oc_third",
+      chatName: "其他目录群",
+      cwd: "/tmp/project-two",
+    };
+    h.registry.enqueue("om_3", "oc_third", "om_3", "第三条", otherCwd);
+    await flush();
+    assert.equal(h.wsCreated.length, 2, "different cwd gets its own workspace");
+    assert.deepEqual(h.wsCreated[1].source, { kind: "directory", path: "/tmp/project-two" });
+    assert.equal(h.wsAgentCreates.length, 3);
   });
 
   it("uses one workspace per binding when enabled", async () => {

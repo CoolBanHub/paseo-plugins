@@ -1646,8 +1646,8 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               onChange={(value) => patchDraft({ aiTitle: value })}
             />
             <ToggleRow
-              label="按会话划分 workspace"
-              hint="每个会话一个以群名命名的 workspace，适合不同绑定指向不同项目目录；默认全部放进「飞书任务」"
+              label="严格按会话隔离 workspace"
+              hint="默认同一个工作目录共用一个「飞书任务」，不同目录各自创建；开启后每个会话单独一个 workspace，即使目录相同也不共享"
               value={draft.workspacePerBinding}
               onChange={(value) => patchDraft({ workspacePerBinding: value })}
             />
