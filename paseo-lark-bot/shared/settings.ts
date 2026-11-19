@@ -443,6 +443,13 @@ export const botValuesSchema = z.object({
    */
   workspacePerBinding: z.boolean().default(false),
   /**
+   * Wall-clock threshold before the watchdog probes a long-running turn.
+   * Elapsed time alone never rebuilds a session: the probe checks whether the
+   * agent is still running. Default 2 hours; implementation + deployment
+   * turns routinely take longer than the old 30 minutes.
+   */
+  stuckTurnMinutes: z.number().int().min(5).max(720).default(120),
+  /**
    * Name new topic sessions with a one-shot AI turn on the chat's bound
    * provider (adds a short delay to the first reply). On failure, timeout,
    * or when disabled, the title falls back to the sanitized topic text.

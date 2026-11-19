@@ -512,6 +512,12 @@ interface TopicState {
   recoveries: number;
   /** One-shot allowance for requeueing the item a stuck watchdog abandoned. */
   stuckRequeues: number;
+  /** Status probes already spent on this still-running turn. */
+  stuckRechecks: number;
+  /** True after the first "still running" notice for this turn. */
+  stuckNotified: boolean;
+  /** Guards against overlapping watchdog status probes for one topic. */
+  stuckChecking: boolean;
   lastActivityAt: number;
   lastSeenMessageId: string | null;
   /** run()'s lastMessage for the most recent idle turn, a reply fallback. */
@@ -589,8 +595,21 @@ function snapshotTimestamp(value: unknown): number | null {
 }
 
 const RUN_TIMEOUT_MS = 10 * 60_000;
-/** If a turn never ends (stuck provider), give up waiting and rebuild. */
-const STUCK_BUSY_MS = 30 * 60_000;
+/**
+ * Default wall-clock threshold before probing a long-running turn. Elapsed
+ * time alone must never rebuild a session: implementation + deployment turns
+ * routinely exceed 30 minutes, and the old agent cannot be cancelled through
+ * the plugin API. The probe decides from the agent's real status instead.
+ */
+const STUCK_BUSY_MS = 2 * 60 * 60_000;
+/** How often to re-probe a turn that is still running after the first check. */
+const STUCK_RECHECK_MS = 15 * 60_000;
+/**
+ * Re-probes allowed after a turn is still running / status cannot be read.
+ * Once exhausted the watchdog stops waiting and resets the mapping without
+ * rerunning the request, because the old agent may still be executing it.
+ */
+const MAX_STUCK_RECHECKS = 4;
 /**
  * Transient upstream failures (rate limit, 5xx, transport blips) retry
  * in-place on the same agent; each delay in this list buys one more attempt
@@ -603,6 +622,10 @@ const DEFAULT_TURN_FALLBACK_MS = 5_000;
 const RESTORED_TURN = -1;
 /** Agent statuses that still have a turn running in Paseo. */
 const RUNNING_STATUS = /run|busy|work|start|stream|permission|wait/i;
+/** Agent statuses that mean the turn is over and turn_ended was missed. */
+const FINISHED_STATUS = /idle|complete|done|finish|success|closed/i;
+/** Agent statuses that mean the turn failed or was cancelled/stopped. */
+const FAILED_STATUS = /error|fail|cancel|abort|stop/i;
 /** Hard cap for queued messages per topic; prevents unbounded group spam. */
 const MAX_QUEUE_PER_TOPIC = 20;
 /** Bound topic state for long-running daemons. */
@@ -730,10 +753,16 @@ export function createSessionRegistry(options: {
   /** Backoff schedule for transient turn failures; default 5s then 20s. */
   turnRetryDelaysMs?: number[];
   /**
-   * How long a busy turn may run without finishing before the watchdog
-   * rebuilds the topic (default 30 minutes).
+   * How long a busy turn may run before the watchdog probes its status
+   * (default 2 hours). Static value for tests and older hosts.
    */
   stuckBusyMs?: number;
+  /**
+   * Live override for the probe threshold, read when a watchdog is armed.
+   * The dispatcher wires this to the user setting so changes apply without
+   * recreating the registry.
+   */
+  getStuckBusyMs?: () => number;
   /**
    * JSON path persisting topicKey → agentId across daemon restarts, so a
    * topic resumes its existing agent instead of starting cold. Entries whose
@@ -771,7 +800,15 @@ export function createSessionRegistry(options: {
   const turnFallbackMs = options.turnFallbackMs ?? DEFAULT_TURN_FALLBACK_MS;
   const getAiTitle = options.getAiTitle ?? (() => true);
   const turnRetryDelays = options.turnRetryDelaysMs ?? TURN_RETRY_DELAYS_MS;
-  const stuckBusyMs = options.stuckBusyMs ?? STUCK_BUSY_MS;
+  const fallbackStuckBusyMs = options.stuckBusyMs ?? STUCK_BUSY_MS;
+  const stuckBusyMs = (): number => {
+    const configured = options.getStuckBusyMs?.();
+    return configured && Number.isFinite(configured) && configured > 0
+      ? configured
+      : fallbackStuckBusyMs;
+  };
+  /** A still-running turn is re-probed at most this often. */
+  const stuckRecheckMs = (): number => Math.min(stuckBusyMs(), STUCK_RECHECK_MS);
   // Workspace handles cached per chat (per-binding mode) or once for the
   // shared "飞书任务" workspace. A failed lookup is not cached, so the next
   // turn retries and a recovered daemon heals the path.
@@ -850,6 +887,9 @@ export function createSessionRegistry(options: {
       activeItem: null,
       recoveries: 0,
       stuckRequeues: 0,
+      stuckRechecks: 0,
+      stuckNotified: false,
+      stuckChecking: false,
       lastActivityAt: 0,
       lastSeenMessageId: null,
       lastRunText: null,
@@ -1009,25 +1049,24 @@ export function createSessionRegistry(options: {
     // lastActivityAt stays at the previous turn's end here so status ordering
     // reflects completed activity; drain() refreshes it once a turn starts.
     state.lastSeenMessageId = messageId;
-    // Heal a stuck topic before the queue-full rejection so a full backlog
-    // cannot pin a hung turn forever. A permission wait is human-paced, not a
-    // hang: keep waiting (the watchdog sends a single reminder) and let the
-    // user resolve it in Paseo. A pending retry timer also owns the queue, so
-    // do not reset the item it is about to rerun.
-    if (
+    // Probe a long-running turn before the queue-full rejection so a full
+    // backlog cannot pin a hung turn forever. The probe checks the real agent
+    // status first; elapsed time alone never rebuilds. A permission wait is
+    // human-paced, not a hang: keep waiting (the watchdog sends a single
+    // reminder) and let the user resolve it in Paseo. A pending retry timer
+    // also owns the queue, so do not reset the item it is about to rerun.
+    const overdue =
       state.busy &&
       state.busySince !== null &&
       state.retryTimer === null &&
-      now() - state.busySince > stuckBusyMs
-    ) {
-      if (state.awaitingPermission) {
-        options.callbacks.log?.(`topic ${topicKey} still awaiting permission; not rebuilding on new message`);
-      } else {
-        bailOutStuckTopic(topicKey, state, "detected on new message");
-      }
+      now() - state.busySince > stuckBusyMs();
+    if (overdue && state.awaitingPermission) {
+      options.callbacks.log?.(`topic ${topicKey} still awaiting permission; not probing on new message`);
     }
+    const probeTurn = overdue && !state.awaitingPermission ? state.activeTurn : null;
     if (state.queue.length >= MAX_QUEUE_PER_TOPIC) {
       options.callbacks.onNotice(state.chatId, messageId, "当前话题排队消息过多，请稍后再试。");
+      if (probeTurn !== null) void checkStuckTopic(topicKey, state, probeTurn);
       return false;
     }
     state.queue.push({
@@ -1039,31 +1078,51 @@ export function createSessionRegistry(options: {
       ...(guest ? { guest } : {}),
     });
     drain(topicKey);
+    // Run after the new item is queued: a probe that abandons the old turn
+    // must leave this message in place for the fresh session's queue.
+    if (probeTurn !== null) void checkStuckTopic(topicKey, state, probeTurn);
     return true;
   }
 
   /**
-   * Drop a hopelessly stuck turn: requeue its request once, notify the topic,
-   * forget the agent, and let the queue continue on a fresh session. The
-   * abandoned turn's late reply is ignored because its agent is unmapped.
+   * Abandon a turn the watchdog can no longer wait for. Only a confirmed
+   * missing agent may rerun the request automatically; a still-running or
+   * unreadable turn is reset without retry because the old agent may keep
+   * executing side effects (the plugin API has no cancelAgent).
    */
-  function bailOutStuckTopic(topicKey: string, state: TopicState, reason: string): void {
+  function bailOutStuckTopic(
+    topicKey: string,
+    state: TopicState,
+    reason: string,
+    retry: boolean,
+    noticeText?: string,
+  ): void {
     // The in-flight prompt was already shifted off the queue and its reply
     // will be discarded; put it back once so the request is not silently lost.
-    const requeued = state.activeItem !== null && state.stuckRequeues < 1;
+    const requeued = retry && state.activeItem !== null && state.stuckRequeues < 1;
     if (requeued && state.activeItem) {
       state.stuckRequeues += 1;
       state.queue.unshift(state.activeItem);
     }
     const stuckTarget = state.pendingTargets[0] ?? state.lastSeenMessageId;
-    options.callbacks.log?.(`topic ${topicKey} busy for too long (${reason}); rebuilding session`);
+    options.callbacks.log?.(
+      `topic ${topicKey} busy for too long (${reason}); ` +
+        (requeued
+          ? "rebuilding session and retrying once"
+          : retry
+            ? "rebuilding session without a retry"
+            : "resetting session without a retry"),
+    );
     if (stuckTarget) {
       options.callbacks.onNotice(
         state.chatId,
         stuckTarget,
-        requeued
-          ? "上一轮处理超时，已重建会话；这条消息会在新会话中重试一次。"
-          : "上一轮处理超时，已重建会话；本轮请求未能完成，如仍需要请重新发送。",
+        noticeText ??
+          (requeued
+            ? "上一轮处理超时，已重建会话；这条消息会在新会话中重试一次。"
+            : retry
+              ? "上一轮处理超时，已重建会话；本轮请求未能完成，如仍需要请重新发送。"
+              : "上一轮处理超时，旧轮次可能仍在运行；为避免重复执行，本次没有自动重试。请到 Paseo 查看，或发 /new 后重新发送。"),
       );
     }
     resetTopic(topicKey);
@@ -1076,10 +1135,14 @@ export function createSessionRegistry(options: {
     if (busy) {
       state.awaitingPermission = false;
       state.turnUsage = null;
+      state.stuckRechecks = 0;
+      state.stuckNotified = false;
+      state.stuckChecking = false;
       return;
     }
     state.activeTurn = null;
     state.awaitingPermission = false;
+    state.stuckChecking = false;
     if (state.turnFallback) {
       clearTimeout(state.turnFallback);
       state.turnFallback = null;
@@ -1094,29 +1157,198 @@ export function createSessionRegistry(options: {
     }
   }
 
+  function notifyStuckStillRunning(state: TopicState, minutes: number, status: string | null): void {
+    const target = state.pendingTargets[0] ?? state.lastSeenMessageId;
+    if (!target) return;
+    const detail = status ? `Agent 状态：${status}` : "暂时读不到 Agent 状态";
+    options.callbacks.onNotice(
+      state.chatId,
+      target,
+      `本轮已运行超过 ${minutes} 分钟（${detail}），不会仅因耗时就重建会话；完成后结果会回到本话题。需要立即换新会话可发 /new。`,
+    );
+  }
+
+  /**
+   * Probe a long-running turn instead of treating wall-clock time as a hang.
+   * A live agent is left alone (with a one-time notice); an idle agent whose
+   * turn_ended was lost is finished from its timeline; only a missing agent
+   * is rebuilt and retried automatically.
+   */
+  async function checkStuckTopic(topicKey: string, state: TopicState, turn: number): Promise<void> {
+    if (disposed || !state.busy || state.activeTurn !== turn) return;
+    if (state.stuckChecking) return;
+    // Permission waits are human-paced, not hangs; the timer handles the
+    // single reminder and this probe must not reset the session behind it.
+    if (state.awaitingPermission) return;
+    state.stuckChecking = true;
+    const minutes = Math.max(1, Math.round((now() - (state.busySince ?? now())) / 60_000));
+    try {
+      const handle = state.handle;
+      if (!handle?.refresh) {
+        options.callbacks.log?.(`topic ${topicKey} stuck probe unavailable after ${minutes}min; resetting without retry`);
+        bailOutStuckTopic(topicKey, state, "watchdog: status unavailable", false);
+        return;
+      }
+
+      let snapshot: unknown;
+      let probeFailed = false;
+      try {
+        snapshot = await handle.refresh();
+      } catch (error) {
+        probeFailed = true;
+        options.callbacks.log?.(
+          `topic ${topicKey} stuck probe failed: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
+      if (disposed || !state.busy || state.activeTurn !== turn) return;
+
+      // A null snapshot means the agent was deleted/archived; rerunning on a
+      // fresh agent is safe because the old one no longer exists. A thrown
+      // refresh is transient and must fall through to the unknown branch.
+      if (!probeFailed && snapshot === null) {
+        options.callbacks.log?.(`topic ${topicKey} agent gone after ${minutes}min; rebuilding and retrying once`);
+        bailOutStuckTopic(topicKey, state, "watchdog: agent gone", true);
+        return;
+      }
+
+      const status = snapshotStatus(snapshot);
+      if (status && RUNNING_STATUS.test(status)) {
+        state.stuckRechecks += 1;
+        if (state.stuckRechecks <= MAX_STUCK_RECHECKS) {
+          if (!state.stuckNotified) {
+            state.stuckNotified = true;
+            notifyStuckStillRunning(state, minutes, status);
+          }
+          options.callbacks.log?.(
+            `topic ${topicKey} still running after ${minutes}min (${status}); ` +
+              `recheck ${state.stuckRechecks}/${MAX_STUCK_RECHECKS}`,
+          );
+          armStuckWatchdog(topicKey, state, turn, stuckRecheckMs());
+          return;
+        }
+        options.callbacks.log?.(
+          `topic ${topicKey} still running after ${minutes}min; recheck budget exhausted, resetting without retry`,
+        );
+        bailOutStuckTopic(
+          topicKey,
+          state,
+          "watchdog: still running",
+          false,
+          "上一轮仍在 Paseo 中运行；为避免重复执行，本次没有自动重试。请到 Paseo 查看，或发 /new 后重新发送。",
+        );
+        return;
+      }
+
+      if (status && FINISHED_STATUS.test(status)) {
+        const text = state.lastRunText ?? (await fetchLastReply(handle.id).catch(() => null));
+        if (disposed || !state.busy || state.activeTurn !== turn) return;
+        const lastActivity = snapshotTimestamp(snapshot);
+        const startedAt = state.pendingTurn?.startedAt ?? state.busySince ?? 0;
+        const freshText = text && (lastActivity === null || lastActivity >= startedAt) ? text : null;
+        options.callbacks.log?.(
+          `topic ${topicKey} status ${status} after ${minutes}min but turn_ended missing; ` +
+            (freshText ? "recovering final reply" : "no fresh reply found"),
+        );
+        if (freshText) {
+          await handleTurnEnded(handle.id, {
+            outcome: "completed",
+            lastText: freshText,
+            lastError: null,
+          });
+          return;
+        }
+        bailOutStuckTopic(
+          topicKey,
+          state,
+          `watchdog: finished without reply (${status})`,
+          false,
+          "上一轮已结束，但没有取到最终回复；为避免重复执行，本次没有自动重试。请到 Paseo 查看或重新发送。",
+        );
+        return;
+      }
+
+      if (status && FAILED_STATUS.test(status)) {
+        options.callbacks.log?.(`topic ${topicKey} status ${status} after ${minutes}min; resetting without retry`);
+        bailOutStuckTopic(
+          topicKey,
+          state,
+          `watchdog: status ${status}`,
+          false,
+          "上一轮已失败或取消；为避免重复执行，本次没有自动重试。请到 Paseo 查看或重新发送。",
+        );
+        return;
+      }
+
+      // Unknown status (or a failed probe): do not guess and rebuild. Recheck
+      // a few times, then unblock the queue without rerunning the request.
+      state.stuckRechecks += 1;
+      if (state.stuckRechecks <= MAX_STUCK_RECHECKS) {
+        if (!state.stuckNotified) {
+          state.stuckNotified = true;
+          notifyStuckStillRunning(state, minutes, null);
+        }
+        options.callbacks.log?.(
+          `topic ${topicKey} status unreadable after ${minutes}min; ` +
+            `recheck ${state.stuckRechecks}/${MAX_STUCK_RECHECKS}`,
+        );
+        armStuckWatchdog(topicKey, state, turn, stuckRecheckMs());
+        return;
+      }
+      options.callbacks.log?.(
+        `topic ${topicKey} status still unreadable after ${minutes}min; resetting without retry`,
+      );
+      bailOutStuckTopic(
+        topicKey,
+        state,
+        "watchdog: status unreadable",
+        false,
+        "上一轮状态无法确认；为避免重复执行，本次没有自动重试。请到 Paseo 查看，或发 /new 后重新发送。",
+      );
+    } catch (error) {
+      options.callbacks.log?.(
+        `topic ${topicKey} stuck probe error: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
+      if (!disposed && state.busy && state.activeTurn === turn) {
+        bailOutStuckTopic(topicKey, state, "watchdog: probe error", false);
+      }
+    } finally {
+      state.stuckChecking = false;
+    }
+  }
+
   /**
    * The passive stuck check only runs when the next message arrives; without
-   * one, a hung provider would block the topic forever and nobody would hear
-   * about it. The watchdog makes the rebuild happen on its own. Permission
-   * waits are human-paced, not hangs: they get a single reminder and stay
-   * pending until resolved in Paseo (new messages never rebuild them).
+   * one, a long-running provider would block the topic forever. The watchdog
+   * probes status on its own. Permission waits are human-paced, not hangs:
+   * they get a single reminder and stay pending until resolved in Paseo.
    */
-  function armStuckWatchdog(topicKey: string, state: TopicState, turn: number): void {
+  function armStuckWatchdog(
+    topicKey: string,
+    state: TopicState,
+    turn: number,
+    delayMs = stuckBusyMs(),
+  ): void {
     if (state.stuckTimer) clearTimeout(state.stuckTimer);
-    const minutes = Math.max(1, Math.round(stuckBusyMs / 60_000));
     const timer = setTimeout(() => {
       state.stuckTimer = null;
       if (!state.busy || state.activeTurn !== turn) return;
       if (state.awaitingPermission) {
+        const minutes = Math.max(1, Math.round((now() - (state.busySince ?? now())) / 60_000));
         const target = state.pendingTargets[0] ?? state.lastSeenMessageId;
         options.callbacks.log?.(`topic ${topicKey} still awaiting permission after ${minutes}min`);
         if (target) {
-          options.callbacks.onNotice(state.chatId, target, `本轮仍在等待 Paseo 中的权限确认（已超过 ${minutes} 分钟），请处理或忽略。`);
+          options.callbacks.onNotice(
+            state.chatId,
+            target,
+            `本轮仍在等待 Paseo 中的权限确认（已超过 ${minutes} 分钟），请处理或忽略。`,
+          );
         }
         return;
       }
-      bailOutStuckTopic(topicKey, state, "watchdog");
-    }, stuckBusyMs);
+      void checkStuckTopic(topicKey, state, turn);
+    }, delayMs);
     timer.unref?.();
     state.stuckTimer = timer;
   }

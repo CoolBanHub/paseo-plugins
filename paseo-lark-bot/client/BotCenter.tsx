@@ -1651,6 +1651,13 @@ export function BotCenterSurface(props: PluginSurfaceProps) {
               value={draft.workspacePerBinding}
               onChange={(value) => patchDraft({ workspacePerBinding: value })}
             />
+            <NumberField
+              label="长轮次检查阈值"
+              hint="超过该分钟数只检查 Agent 状态；仍在运行会提醒并继续等待，不会仅因耗时就重建会话"
+              value={draft.stuckTurnMinutes}
+              onChange={(value) => patchDraft({ stuckTurnMinutes: value })}
+              suffix="分钟"
+            />
           </Card>
           <Card>
             <CardTitle text="安全与限制" hint="谁能用、能用多少、能发什么文件" />

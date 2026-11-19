@@ -102,6 +102,8 @@ function makeHarness(
     workspaces?: WorkspacesFakeOptions;
     turnRetryDelaysMs?: number[];
     stuckBusyMs?: number;
+    refresh?: () => Promise<unknown | null>;
+    fetchLastReply?: (agentId: string) => Promise<string | null>;
     workspacePerBinding?: boolean;
     getMemberDirectory?: (chatId: string, replyFormat: string) => Promise<string | null>;
     getLarkCliPath?: () => string | null;
@@ -125,6 +127,7 @@ function makeHarness(
     current = {
       id: `agent-${agentCounter}`,
       send: async () => {},
+      ...(options?.refresh ? { refresh: options.refresh } : {}),
       run: (text) => {
         runCalls.push({ agentId: current!.id, text });
         return new Promise<SessionRunResult>((resolve) => {
@@ -211,6 +214,7 @@ function makeHarness(
     getLarkCliPath: options?.getLarkCliPath,
     turnRetryDelaysMs: options?.turnRetryDelaysMs,
     stuckBusyMs: options?.stuckBusyMs,
+    fetchLastReply: options?.fetchLastReply,
     callbacks: {
       onReply: (chatId, messageId, outcome) => replies.push({ chatId, messageId, outcome }),
       onNotice: (chatId, messageId, text) => notices.push({ chatId, messageId, text }),
@@ -1045,8 +1049,8 @@ describe("turn failure retries", () => {
 });
 
 describe("stuck-busy watchdog", () => {
-  it("requeues the hung request once and continues the queue on a fresh agent", async () => {
-    const h = makeHarness({ stuckBusyMs: 40 });
+  it("rebuilds and retries once when the agent is confirmed gone", async () => {
+    const h = makeHarness({ stuckBusyMs: 40, refresh: async () => null });
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
     await flush();
     const agent = h.currentAgent();
@@ -1068,6 +1072,94 @@ describe("stuck-busy watchdog", () => {
     await flush();
     assert.deepEqual(h.runCalls.map((call) => call.text), ["第二条"]);
     assert.equal(h.created.length, 2);
+  });
+
+  it("keeps a turn that the agent reports as running", async () => {
+    const h = makeHarness({
+      stuckBusyMs: 20,
+      refresh: async () => ({ lastStatus: "running" }),
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.created.length, 1, "a running agent must not be replaced");
+    assert.equal(h.registry.ownsAgent(agent.id), true);
+    assert.ok(
+      h.notices.some((notice) => notice.text.includes("不会仅因耗时就重建会话")),
+      "the topic is told that the turn is still running",
+    );
+
+    h.registry.handleTurnEnded(agent.id, completed("终于完成"));
+    await flush();
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.lastText, "终于完成");
+  });
+
+  it("recovers the final reply when the agent is idle but turn_ended was lost", async () => {
+    const h = makeHarness({
+      stuckBusyMs: 20,
+      refresh: async () => ({ lastStatus: "idle", lastActivityAt: Date.now() }),
+      fetchLastReply: async () => "补发答案",
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.created.length, 1, "the existing agent is kept");
+    assert.equal(h.registry.ownsAgent(agent.id), true);
+    assert.equal(h.replies[h.replies.length - 1]?.messageId, "om_1");
+    assert.equal(h.replies[h.replies.length - 1]?.outcome.lastText, "补发答案");
+  });
+
+  it("does not resend a stale reply when the idle snapshot predates the turn", async () => {
+    const h = makeHarness({
+      stuckBusyMs: 20,
+      refresh: async () => ({ lastStatus: "idle", lastActivityAt: Date.now() - 60_000 }),
+      fetchLastReply: async () => "上一轮的旧答案",
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.replies.length, 0, "a reply from before the turn must not be sent");
+    assert.ok(h.notices.some((notice) => notice.text.includes("没有取到最终回复")));
+  });
+
+  it("stops waiting without retrying a turn that keeps running", async () => {
+    const h = makeHarness({
+      stuckBusyMs: 10,
+      refresh: async () => ({ lastStatus: "running" }),
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(h.created.length, 1, "a still-running request must not be rerun");
+    assert.equal(h.registry.ownsAgent(agent.id), false, "the mapping is released after the grace period");
+    assert.ok(
+      h.notices.some((notice) => notice.text.includes("没有自动重试")),
+      "the topic is told that no automatic retry happened",
+    );
+  });
+
+  it("does not rebuild when the status probe itself fails", async () => {
+    const h = makeHarness({
+      stuckBusyMs: 10,
+      refresh: async () => {
+        throw new Error("TLS handshake timeout");
+      },
+    });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    const agent = h.currentAgent();
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(h.created.length, 1, "a failed probe must not be treated as a missing agent");
+    assert.equal(h.registry.ownsAgent(agent.id), false, "the mapping is released without a retry");
+    assert.ok(h.notices.some((notice) => notice.text.includes("状态无法确认")));
   });
 
   it("does not rebuild a permission wait on a new message", async () => {

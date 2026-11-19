@@ -580,6 +580,7 @@ export function createDispatcher(options: DispatcherOptions) {
     resolveProvider: options.resolveProvider,
     fetchLastReply: options.fetchLastReply,
     topicStorePath: options.topicStorePath,
+    getStuckBusyMs: () => valuesCache.stuckTurnMinutes * 60_000,
     getWorkspacePerBinding: () => valuesCache.workspacePerBinding,
     getAttachmentHelperPath: () =>
       valuesCache.attachmentSend ? options.attachmentHelperPath ?? null : null,

@@ -145,6 +145,9 @@ describe("chat binding schema", () => {
     assert.equal(parsed.attachmentMaxMb, 50);
     assert.equal(parsed.rateLimitPerHour, 20);
     assert.equal(parsed.workspacePerBinding, false);
+    assert.equal(parsed.stuckTurnMinutes, 120);
+    assert.equal(botValuesSchema.safeParse({ stuckTurnMinutes: 4 }).success, false);
+    assert.equal(botValuesSchema.safeParse({ stuckTurnMinutes: 721 }).success, false);
   });
 
   it("accepts one ack mode at a time and rejects combinations", () => {
