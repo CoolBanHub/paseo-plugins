@@ -819,6 +819,9 @@ export function createSessionRegistry(options: {
   const stuckRecheckMs = (): number => Math.min(stuckBusyMs(), STUCK_RECHECK_MS);
   // Workspace handles cached per cwd in shared mode (all chats using the same
   // directory share one "飞书任务"), or per chat in strict per-binding mode.
+  // The cwd stays part of the key in both modes: a workspace is bound to the
+  // directory it was created with, so reusing the cached handle after the
+  // binding cwd changed would keep creating agents in the old directory.
   // A failed lookup is not cached, so the next turn retries and a recovered
   // daemon heals the path.
   function effectiveBinding(binding: ChatBinding, overrides: TopicOverrides): ChatBinding {
@@ -837,7 +840,7 @@ export function createSessionRegistry(options: {
 
   function workspaceForAgent(item: QueueItem, cwd: string): Promise<SessionWorkspaceHandle | null> {
     const perBinding = getWorkspacePerBinding();
-    const key = perBinding ? `chat:${item.binding.chatId}` : `cwd:${cwd}`;
+    const key = perBinding ? `chat:${item.binding.chatId}:${cwd}` : `cwd:${cwd}`;
     const cached = workspaceCache.get(key);
     if (cached) return Promise.resolve(cached);
     const title = workspaceTitleFor(item.binding.chatId, item.binding.chatName, perBinding);

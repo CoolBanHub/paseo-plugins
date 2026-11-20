@@ -315,6 +315,9 @@ export function BindingEditor({
           onChangeText={(text) => onPatch({ cwd: text })}
           style={inputStyle()}
         />
+        <Text style={{ fontSize: 12, color: colors().foregroundMuted }}>
+          改目录只影响新建会话；已有话题需要在会话内发送 `/new` 重建后才会切换。
+        </Text>
         <FieldLabel text="系统提示（可选，替换插件默认提示；留空用默认）" />
         <TextInput
           value={binding.systemPrompt}

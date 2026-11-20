@@ -943,6 +943,23 @@ describe("shared workspace", () => {
     assert.deepEqual(h.wsCreated[0].source, { kind: "directory", path: "/tmp/project" });
   });
 
+  it("recreates the per-binding workspace after the binding cwd changes", async () => {
+    const h = makeHarness({ workspaces: { entries: [] }, workspacePerBinding: true });
+    h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
+    await flush();
+    h.registry.handleTurnEnded("agent-1", completed("第一轮答复"));
+    await flush();
+
+    h.registry.resetTopicForCommand("om_1", false);
+    const moved: ChatBinding = { ...binding, cwd: "/tmp/project-two" };
+    h.registry.enqueue("om_1", "oc_group", "om_2", "第二条", moved);
+    await flush();
+
+    assert.equal(h.wsCreated.length, 2);
+    assert.deepEqual(h.wsCreated[1].source, { kind: "directory", path: "/tmp/project-two" });
+    assert.equal(h.wsAgentCreates.length, 2);
+  });
+
   it("falls back to a standalone agents.create when the workspace create fails", async () => {
     const h = makeHarness({ workspaces: { entries: [], failCreate: true } });
     h.registry.enqueue("om_1", "oc_group", "om_1", "第一条", binding);
