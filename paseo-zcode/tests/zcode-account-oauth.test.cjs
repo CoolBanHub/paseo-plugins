@@ -98,7 +98,20 @@ test("reads an OAuth BigModel account without a manual API key", (t) => {
     projectId: "proj-1",
     apiKeyId: "key-1",
   });
-  assert.deepEqual(providers[0].models, ["GLM-5.3", "GLM-5.3-Flash"]);
+});
+
+test("offers an account whatever its rule's model order says", (t) => {
+  // The order only sorts models the CLI already knows; it never defines them.
+  const credentials = {
+    [`account-provider:coding-plan:${PROVIDER}:account:user-1:api-key`]: "manual-key",
+  };
+  for (const config of [{ modelOrder: ["GLM-5.3"] }, { modelOrder: [] }, {}]) {
+    const dir = makeV2Dir(t, { credentials, rules: [{ providerId: PROVIDER, config }] });
+    const providers = accounts.readAccountProviders({ v2Dir: dir });
+    assert.deepEqual(providers.map((p) => p.providerId), [PROVIDER], JSON.stringify(config));
+    assert.equal(providers[0].apiKey, "manual-key");
+    assert.ok(!("models" in providers[0]), "the plugin must not carry a model list");
+  }
 });
 
 test("keeps the manual API-key path when auth-source is manual", (t) => {
@@ -306,7 +319,7 @@ test("returns the shared JWT token for Start Plan requests", async () => {
   assert.deepEqual(result, { headersApplied: true, requestAuth: { apiKey: "jwt-token" } });
 });
 
-test("registration keeps the account access shape accepted by the CLI", async () => {
+test("registration marks the account entitled and leaves its models to the CLI", async () => {
   const calls = [];
   await accounts.registerAccountProviders(
     async (method, params) => {
@@ -317,7 +330,6 @@ test("registration keeps the account access shape accepted by the CLI", async ()
       providerId: PROVIDER,
       family: "bigmodel",
       planKind: "individual-coding-plan",
-      models: ["GLM-5.3"],
       oauth: oauthAccount(),
     }],
     "zcode-builtin:test",
@@ -325,8 +337,38 @@ test("registration keeps the account access shape accepted by the CLI", async ()
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "provider/updateAccountConfig");
-  assert.deepEqual(calls[0].params.providers[PROVIDER], {
-    builtinModelIds: ["GLM-5.3"],
-    access: { type: "zhipu-account", entitled: true },
-  });
+  assert.equal(calls[0].params.basedOnZCodeBuiltinRevision, "zcode-builtin:test");
+  // A builtinModelIds value replaces the account's built-in model list instead
+  // of ordering it, which hides every model ZCode releases later.
+  assert.deepEqual(calls[0].params.providers[PROVIDER], { access: { type: "zhipu-account", entitled: true } });
+  assert.deepEqual(calls[0].params.states[PROVIDER], { availability: "available", entitled: true, current: true });
+});
+
+test("every registration carries a revision of its own", async () => {
+  // The CLI keeps the snapshot it holds when a new one arrives under a
+  // revision it has already seen, even back to back.
+  const revisions = [];
+  const request = async (method, params) => { revisions.push(params.revision); return {}; };
+  const provider = { providerId: PROVIDER, family: "bigmodel", apiKey: "manual-key" };
+  await accounts.registerAccountProviders(request, [provider], "zcode-builtin:47");
+  await accounts.registerAccountProviders(request, [provider], "zcode-builtin:48");
+  assert.equal(new Set(revisions).size, 2);
+});
+
+test("builtinRevisionFor derives the revision from the built-in config file", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-builtin-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "zcode-builtin.json");
+  // Shape the CLI reports in its provider_registry.ready log line.
+  const expected = (revision) =>
+    `zcode-builtin:${revision}:${crypto.createHash("sha256").update(path.resolve(file)).digest("hex")}`;
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, revision: 47, config: {} }));
+  assert.equal(accounts.builtinRevisionFor(file), expected(47));
+  // A remote release written while the app-server keeps running moves it.
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, revision: 48, config: {} }));
+  assert.equal(accounts.builtinRevisionFor(file), expected(48));
+  assert.equal(accounts.builtinRevisionFor(undefined), undefined);
+  assert.equal(accounts.builtinRevisionFor(path.join(dir, "missing.json")), undefined);
+  fs.writeFileSync(file, JSON.stringify({ config: {} }));
+  assert.equal(accounts.builtinRevisionFor(file), undefined);
 });

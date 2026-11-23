@@ -194,5 +194,5 @@ test("readAccountProviders discovers an OAuth plan from enc:v2:os credentials", 
   assert.equal(providers[0].apiKey, undefined);
   assert.equal(providers[0].oauth?.accessToken, "oauth-token");
   assert.equal(providers[0].oauth?.accountIdentity, "user-1");
-  assert.deepEqual(providers[0].models, ["GLM-5.3"]);
+  assert.ok(!("models" in providers[0]), "the plugin must not carry a model list");
 });

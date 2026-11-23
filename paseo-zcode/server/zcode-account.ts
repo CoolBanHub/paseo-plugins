@@ -11,8 +11,9 @@ import type {
 } from "./zcode-account-oauth";
 
 /**
- * Account providers (BigModel / Z.ai coding plans) are not in the CLI's
- * provider registry by default: the desktop app registers them at runtime via
+ * Account providers (BigModel / Z.ai coding plans) are declared in ZCode's
+ * built-in provider config but fail closed there (`entitled: false`): the
+ * desktop app marks the connected ones entitled at runtime via
  * provider/updateAccountConfig and supplies their credentials through
  * interaction/requestProviderRuntimeHeaders. This module replicates that for
  * headless use.
@@ -21,12 +22,15 @@ import type {
  * - manual API key: `account-provider:coding-plan:<provider>:account:<id>:api-key`
  * - OAuth account: `oauth:<family>:access_token` plus a `project-key-location`
  *   entry, exchanged for a project token by zcode-account-oauth.ts.
+ *
+ * An account's models are not listed here. The CLI resolves membership, order
+ * and enablement from its built-in config plus the user's own provider rules,
+ * which is what keeps a remotely released model selectable.
  */
 export interface AccountProvider {
   providerId: string;
   family: AccountFamily;
   planKind?: PlanKind;
-  models: string[];
   apiKey?: string;
   oauth?: OAuthAccount;
 }
@@ -48,7 +52,6 @@ export interface OAuthTokenSet {
 interface ProviderConfigFile {
   config?: {
     providerConfigRules?: { providerRules?: Array<Record<string, unknown>> };
-    modelConfigRules?: { providerModelRules?: Array<Record<string, unknown>> };
   };
 }
 
@@ -261,7 +264,6 @@ export function readAccountProviders(options: ReadAccountProvidersOptions = {}):
     const locations = readProjectLocations(creds, credentialPath, keyStore);
 
     const rules = cfg.config?.providerConfigRules?.providerRules ?? [];
-    const modelRules = cfg.config?.modelConfigRules?.providerModelRules ?? [];
     const providers: AccountProvider[] = [];
 
     for (const rule of rules) {
@@ -302,24 +304,12 @@ export function readAccountProviders(options: ReadAccountProvidersOptions = {}):
 
       if (!auth) continue;
 
-      const config = (rule?.config ?? {}) as Record<string, unknown>;
-      const order = Array.isArray(config.modelOrder) ? config.modelOrder.map(String) : [];
-      const models = order.filter((modelId) => {
-        const disabled = modelRules.some(
-          (mr) =>
-            String(mr?.providerId ?? "") === providerId &&
-            String(mr?.modelId ?? "") === modelId &&
-            ((mr?.config as Record<string, unknown> | undefined)?.enabled === false),
-        );
-        return !disabled;
-      });
-      if (!models.length) continue;
-
+      // The rule's modelOrder is only the user's ordering of models the CLI
+      // already knows; an empty or stale one must not hide the account.
       providers.push({
         providerId,
         family,
         ...(planKind ? { planKind } : {}),
-        models,
         ...auth,
       });
     }
@@ -611,6 +601,24 @@ export function readBuiltinRevision(spawnedAtMs: number): string | undefined {
   }
 }
 
+/**
+ * The revision the CLI derives from a built-in provider config file:
+ * `zcode-builtin:<file revision>:<sha256 of the resolved path>`. Unlike
+ * readBuiltinRevision (a startup log line) this reflects the file as it is
+ * now, so a remote release written by the desktop app is visible while the
+ * app-server keeps running.
+ */
+export function builtinRevisionFor(builtinConfigPath: string | undefined): string | undefined {
+  if (!builtinConfigPath) return undefined;
+  try {
+    const { revision } = JSON.parse(readFileSync(builtinConfigPath, "utf8")) as { revision?: unknown };
+    if ((typeof revision !== "number" && typeof revision !== "string") || String(revision) === "") return undefined;
+    return `zcode-builtin:${revision}:${createHash("sha256").update(resolve(builtinConfigPath)).digest("hex")}`;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Reads the newest turn.failed log entry for a session and returns the deepest error message. */
 export function readLastTurnFailure(sessionId: string): string | undefined {
   try {
@@ -642,6 +650,9 @@ export function readLastTurnFailure(sessionId: string): string | undefined {
   }
 }
 
+/** Distinguishes registrations made in the same millisecond: the CLI keeps a snapshot whose revision it already holds. */
+let registrationSequence = 0;
+
 /** Registers account providers into the CLI's runtime provider registry. */
 export async function registerAccountProviders(
   request: (method: string, params: Record<string, unknown>) => Promise<{ error?: unknown }>,
@@ -652,8 +663,10 @@ export async function registerAccountProviders(
   const providerMap: Record<string, unknown> = {};
   const states: Record<string, unknown> = {};
   for (const p of providers) {
+    // Only the entitlement is set. A `builtinModelIds` value here would
+    // replace the account's built-in model list instead of ordering it, which
+    // is how newly released models used to go missing.
     providerMap[p.providerId] = {
-      builtinModelIds: p.models,
       access: {
         type: "zhipu-account",
         entitled: true,
@@ -662,7 +675,7 @@ export async function registerAccountProviders(
     states[p.providerId] = { availability: "available", entitled: true, current: true };
   }
   const response = await request("provider/updateAccountConfig", {
-    revision: `paseo-zcode-${Date.now()}`,
+    revision: `paseo-zcode-${Date.now()}-${++registrationSequence}`,
     basedOnZCodeBuiltinRevision: builtinRevision,
     providers: providerMap,
     states,

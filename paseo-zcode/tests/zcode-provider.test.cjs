@@ -22,6 +22,14 @@ const ACCOUNT = "account:bigmodel-individual-coding-plan";
 const BINGLM = "zai-api::GLM-5.3";
 const FLASH = "zai-api::GLM-5.3-Flash";
 const accountModel = `${ACCOUNT}::GLM-5.3`;
+/** What an account registration says about a connected plan — and nothing about its models. */
+const ENTITLED = { access: { type: "zhipu-account", entitled: true } };
+const INDIVIDUAL_PLAN = {
+  providerId: ACCOUNT, family: "bigmodel", planKind: "individual-coding-plan", apiKey: "manual-key",
+};
+const TEAM_PLAN = {
+  providerId: "account:bigmodel-team-coding-plan", family: "bigmodel", planKind: "team-coding-plan", apiKey: "team-key",
+};
 
 /** Drains the promise chains started by fired mock timers. */
 const flush = async () => {
@@ -53,7 +61,25 @@ async function fixture(t, options = {}) {
   });
   t.mock.method(console, "log", () => {});
   t.mock.method(protocol, "resolveZcodeCliPath", () => "/mock/zcode.cjs");
-  t.mock.method(accounts, "readAccountProviders", () => []);
+  // Accounts connected in the desktop app; tests change them to simulate a login.
+  let accountList = structuredClone(options.accountProviders ?? []);
+  t.mock.method(accounts, "readAccountProviders", () => structuredClone(accountList));
+  // The built-in provider config file handed to the app-server, and the
+  // registry-ready log line a cold app-server reports its revision in.
+  const builtinFile = path.join(paseoHome, "zcode-builtin.json");
+  if (options.builtinRevision !== undefined) {
+    fs.writeFileSync(builtinFile, JSON.stringify({ revision: options.builtinRevision, config: {} }));
+    t.mock.method(protocol, "resolveBuiltinProviderConfig", () => builtinFile);
+    t.mock.method(accounts, "readBuiltinRevision", () => (
+      options.appServerRunning ? undefined : accounts.builtinRevisionFor(builtinFile)
+    ));
+    if (options.appServerRunning) t.mock.getter(protocol.ZcodeProtocolClient.prototype, "childPid", () => 4242);
+  }
+  const exitListeners = [];
+  t.mock.method(protocol.ZcodeProtocolClient.prototype, "onProcessExit", (listener) => {
+    exitListeners.push(listener);
+    return () => {};
+  });
   t.mock.getter(taskIndex.ZcodeTaskIndex.prototype, "available", () => true);
   const archived = new Set();
   const archiveCalls = [];
@@ -338,6 +364,11 @@ async function fixture(t, options = {}) {
     listSessions: () => connection.send({ type: "sessions", requestId: "sessions" }),
     setAvailable: (list) => { currentAvailable = list; },
     refreshCatalog: (requestId = "catalog") => connection.send({ type: "catalog", requestId }),
+    setAccountProviders: (list) => { accountList = structuredClone(list); },
+    writeBuiltinRevision: (revision) => { fs.writeFileSync(builtinFile, JSON.stringify({ revision, config: {} })); },
+    /** The revision the CLI derives from the built-in file as it is now. */
+    builtinRevision: () => accounts.builtinRevisionFor(builtinFile),
+    appServerExit: () => { for (const listener of [...exitListeners]) listener({ code: 1, signal: null }); },
   };
   function fSessionId() {
     return events.find((event) => event.type === "session.persistence")?.persistence.data.zcodeSessionId;
@@ -994,6 +1025,103 @@ test("explicit catalog requests bypass the TTL and re-probe ZCode live", async (
   await f.open({ model: BINGLM }, undefined, "skip", "paseo-session-2");
   assert.equal(probes(), 2);
   assert.ok(f.config().models.some((model) => model.id === "new-provider::glm-5.3"));
+});
+
+test("account registration marks the account entitled and leaves its models to the CLI", async (t) => {
+  const f = await fixture(t, { accountProviders: [INDIVIDUAL_PLAN], builtinRevision: 47 });
+  await f.open({ model: accountModel });
+  const [registration] = f.calls("provider/updateAccountConfig");
+  assert.equal(registration.basedOnZCodeBuiltinRevision, f.builtinRevision());
+  assert.deepEqual(registration.providers[ACCOUNT], ENTITLED);
+  assert.deepEqual(registration.states[ACCOUNT], { availability: "available", entitled: true, current: true });
+});
+
+test("a refresh re-registers accounts when ZCode's built-in provider config moves", async (t) => {
+  const f = await fixture(t, { accountProviders: [INDIVIDUAL_PLAN], builtinRevision: 47 });
+  await f.open({ model: accountModel });
+  const [first] = f.calls("provider/updateAccountConfig");
+  // The file-derived revision matched the registry-ready line, so later
+  // refreshes may trust it.
+  assert.equal(first.basedOnZCodeBuiltinRevision, f.builtinRevision());
+
+  // The desktop app wrote a release adding models. The CLI keeps its last
+  // registry snapshot for as long as the registration names the old revision.
+  f.writeBuiltinRevision(48);
+  await f.refreshCatalog("refresh-moved");
+  const registrations = f.calls("provider/updateAccountConfig");
+  assert.equal(registrations.length, 2);
+  assert.equal(registrations[1].basedOnZCodeBuiltinRevision, f.builtinRevision());
+  assert.notEqual(registrations[1].revision, first.revision);
+  assert.ok(f.events.some((event) => event.type === "catalog" && event.requestId === "refresh-moved"));
+
+  // Nothing moved since: the registration stands and the CLI only re-reads
+  // the user's provider config.
+  await f.refreshCatalog("refresh-same");
+  assert.equal(f.calls("provider/updateAccountConfig").length, 2);
+  assert.deepEqual(f.calls("provider/refreshRegistry"), [{ reason: "paseo-catalog-refresh" }]);
+});
+
+test("a refresh follows accounts connected or disconnected in the desktop app", async (t) => {
+  const f = await fixture(t, { accountProviders: [INDIVIDUAL_PLAN], builtinRevision: 47 });
+  await f.open({ model: accountModel });
+  f.setAccountProviders([INDIVIDUAL_PLAN, TEAM_PLAN]);
+  await f.refreshCatalog();
+  assert.deepEqual(
+    Object.keys(f.calls("provider/updateAccountConfig").at(-1).providers).sort(),
+    [ACCOUNT, TEAM_PLAN.providerId].sort(),
+  );
+  f.setAccountProviders([TEAM_PLAN]);
+  await f.refreshCatalog();
+  const registration = f.calls("provider/updateAccountConfig").at(-1);
+  assert.deepEqual(Object.keys(registration.providers), [TEAM_PLAN.providerId]);
+  assert.deepEqual(registration.providers[TEAM_PLAN.providerId], ENTITLED);
+});
+
+test("a refresh registers an account connected after the plugin loaded", async (t) => {
+  const f = await fixture(t, { builtinRevision: 47 });
+  await f.open({ model: BINGLM });
+  assert.equal(f.calls("provider/updateAccountConfig").length, 0);
+  f.setAccountProviders([INDIVIDUAL_PLAN]);
+  await f.refreshCatalog();
+  assert.deepEqual(f.calls("provider/updateAccountConfig").at(-1)?.providers[ACCOUNT], ENTITLED);
+});
+
+test("an account connected later registers without a fresh registry log line", async (t) => {
+  // The app-server has been running since before the account existed, so its
+  // provider_registry.ready line predates this registration.
+  const f = await fixture(t, { builtinRevision: 47, appServerRunning: true });
+  await f.open({ model: BINGLM });
+  f.setAccountProviders([INDIVIDUAL_PLAN]);
+  await f.refreshCatalog();
+  assert.equal(f.calls("provider/updateAccountConfig").at(-1)?.basedOnZCodeBuiltinRevision, f.builtinRevision());
+});
+
+test("accounts are registered again after the app-server is replaced", async (t) => {
+  const f = await fixture(t, { accountProviders: [INDIVIDUAL_PLAN], builtinRevision: 47 });
+  await f.open({ model: accountModel });
+  assert.equal(f.calls("provider/updateAccountConfig").length, 1);
+  f.appServerExit();
+  await f.refreshCatalog();
+  const registrations = f.calls("provider/updateAccountConfig");
+  assert.equal(registrations.length, 2);
+  assert.equal(registrations[1].basedOnZCodeBuiltinRevision, f.builtinRevision());
+});
+
+test("a refresh that reads no accounts keeps the working registration", async (t) => {
+  const f = await fixture(t, { accountProviders: [INDIVIDUAL_PLAN], builtinRevision: 47 });
+  await f.open({ model: accountModel });
+  // Credentials mid-rewrite or a keychain hiccup must not retract accounts,
+  // not even when the built-in provider config moved in the meantime.
+  f.setAccountProviders([]);
+  f.writeBuiltinRevision(48);
+  await f.refreshCatalog();
+  assert.equal(f.calls("provider/updateAccountConfig").length, 1);
+  // Once the accounts read again, the registration catches up in one step.
+  f.setAccountProviders([INDIVIDUAL_PLAN]);
+  await f.refreshCatalog();
+  const registrations = f.calls("provider/updateAccountConfig");
+  assert.equal(registrations.length, 2);
+  assert.equal(registrations[1].basedOnZCodeBuiltinRevision, f.builtinRevision());
 });
 
 test("archive and unarchive use the desktop task index even for a closed session", async (t) => {

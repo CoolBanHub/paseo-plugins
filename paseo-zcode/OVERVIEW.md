@@ -176,7 +176,9 @@ local ZCode sessions are listed in Paseo's session picker.
   discovery) always re-probes ZCode live — model or provider changes made in
   the ZCode app show up on refresh without waiting out the in-memory TTL.
   The 60-second probe cache only shields internal callers (session open and
-  configure) from repeated throwaway probes.
+  configure) from repeated throwaway probes. The same refresh re-reads the
+  coding-plan accounts and registers them again when the desktop app
+  connected or disconnected one, or wrote a newer built-in provider config.
 - Paseo caches the provider catalog (models, mode labels) per agent and only
   re-discovers when the catalog cache key changes, so the key hashes the
   zcode CLI's identity (the model list is queried live from it) plus this
@@ -184,7 +186,12 @@ local ZCode sessions are listed in Paseo's session picker.
   updates both invalidate the cached catalog on the next plugin reload.
 - Coding-plan account providers (BigModel / Z.ai plans logged in inside the
   ZCode desktop app) are registered into the CLI at runtime and their models
-  are selectable. Both credential shapes are supported: a manual coding-plan
+  are selectable. The registration only marks a connected account entitled:
+  which models it offers, in what order and whether each is enabled come from
+  ZCode's built-in provider config plus the provider rules in
+  `~/.zcode/v2/provider_config.json`, the same way the desktop app resolves
+  them, so a remotely released model needs no plugin change. Both credential
+  shapes are supported: a manual coding-plan
   API key, and the desktop's OAuth session (BigModel individual plan and
   Start Plan). OAuth accounts are exchanged for a short-lived project token
   and sent as `apiKey` / `apiKeyId` / `accountScope` on each model request;

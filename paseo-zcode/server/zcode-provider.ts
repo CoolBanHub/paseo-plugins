@@ -21,12 +21,14 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import {
   ZcodeProtocolClient,
+  resolveBuiltinProviderConfig,
   resolveNodePath,
   resolveZcodeCliPath,
   type ZcodeServerRequest,
   type ZcodeSessionEvent,
 } from "./zcode-protocol";
 import {
+  builtinRevisionFor,
   readAccountProviders,
   readBuiltinRevision,
   readLastTurnFailure,
@@ -1186,6 +1188,23 @@ interface CatalogCache {
 }
 const CATALOG_TTL_MS = 60_000;
 
+/**
+ * The account registration the app-server process currently holds. The CLI
+ * keeps its last registry snapshot for as long as the registration is based
+ * on an older built-in revision, so the revision is what tells a refresh that
+ * models released since then are not visible yet.
+ */
+interface RegisteredAccounts {
+  /** Provider ids the registration covers. */
+  signature: string;
+  builtinRevision: string;
+  /**
+   * Built-in config file the revision can be derived from. Set only once that
+   * derivation matched the revision the CLI reported for itself.
+   */
+  builtinConfigPath?: string;
+}
+
 export function createZcodeProvider(): ProviderRegistration {
   return {
     id: "zcode",
@@ -1259,38 +1278,97 @@ export function createZcodeProvider(): ProviderRegistration {
         }
       };
       const pendingPermissionIds = new Map<string, string>();
-      const accountProviders: AccountProvider[] = readAccountProviders({
+      const readAccounts = () => readAccountProviders({
         onSkip: (providerId, reason) => log("account provider skipped", { providerId, reason }),
       });
+      let accountProviders = readAccounts();
       const zcodeAppVersion = resolveZcodeAppVersion(cliPath);
-      let accountProvidersRegistered = false;
+      let registeredAccounts: RegisteredAccounts | undefined;
+      const accountSignature = (providers: AccountProvider[]) => providers.map((p) => p.providerId).sort().join("\n");
 
-      // Account providers must be registered before they can be used.
+      /** Registers the accounts and records what the app-server now holds; false when the CLI rejected it. */
+      const registerAccounts = async (
+        providers: AccountProvider[],
+        builtinRevision: string,
+        builtinConfigPath?: string,
+      ): Promise<boolean> => {
+        try {
+          await registerAccountProviders(
+            (method, params) => client.request(method, params),
+            providers,
+            builtinRevision,
+          );
+        } catch (error) {
+          log("account provider registration failed", String(error));
+          return false;
+        }
+        registeredAccounts = {
+          signature: accountSignature(providers),
+          builtinRevision,
+          ...(builtinConfigPath ? { builtinConfigPath } : {}),
+        };
+        log("account providers registered", providers.map((p) => p.providerId));
+        return true;
+      };
+
+      // Account providers must be registered before they can be used. The
+      // registration lives in the app-server process, so it is redone whenever
+      // that process is replaced.
       const ensureAccountProviders = async () => {
-        if (accountProvidersRegistered || !accountProviders.length) return;
-        // Force the CLI to start, then wait for its registry-ready log line.
+        if (registeredAccounts || !accountProviders.length) return;
+        // Force the CLI to start, then wait for its registry-ready log line —
+        // unless it was already running and logged that line long ago.
+        const coldStart = client.childPid === undefined;
         const spawnedAt = Date.now();
         await client.request("session/list", {}).catch(() => undefined);
+        // Resolved just after the spawn: the file this process was given.
+        const builtinConfigPath = resolveBuiltinProviderConfig();
         let revision: string | undefined;
-        for (let i = 0; i < 30 && !revision; i++) {
+        for (let i = 0; coldStart && i < 30 && !revision; i++) {
           revision = readBuiltinRevision(spawnedAt);
           if (!revision) await new Promise((r) => setTimeout(r, 300));
         }
+        // Nothing was registered in this process yet, so a revision derived
+        // from the file can only add accounts, never replace a working set.
+        revision ??= builtinRevisionFor(builtinConfigPath);
         if (!revision) {
           log("account providers not registered: builtin revision not found");
           return;
         }
-        try {
-          await registerAccountProviders(
-            (method, params) => client.request(method, params),
-            accountProviders,
-            revision,
-          );
-          accountProvidersRegistered = true;
-          log("account providers registered", accountProviders.map((p) => p.providerId));
-        } catch (error) {
-          log("account provider registration failed", String(error));
+        // The file-derived revision drives later refreshes only once it
+        // matches what this CLI build reported for itself.
+        const fileRevision = builtinRevisionFor(builtinConfigPath);
+        await registerAccounts(accountProviders, revision, fileRevision === revision ? builtinConfigPath : undefined);
+      };
+      client.onProcessExit(() => {
+        registeredAccounts = undefined;
+      });
+
+      /**
+       * Explicit catalog refresh: accounts connected or logged into in the
+       * desktop app since the last read, and ZCode's built-in provider config
+       * when the desktop app wrote a newer release.
+       */
+      const refreshAccountProviders = async () => {
+        accountProviders = readAccounts();
+        if (!registeredAccounts) return ensureAccountProviders();
+        // An empty read (credentials mid-rewrite, keychain hiccup) must never
+        // change a working registration.
+        const readable = accountProviders.length > 0;
+        const accountsChanged = readable && accountSignature(accountProviders) !== registeredAccounts.signature;
+        const builtinConfigPath = registeredAccounts.builtinConfigPath;
+        const builtinRevision = builtinRevisionFor(builtinConfigPath);
+        const builtinMoved = builtinRevision !== undefined && builtinRevision !== registeredAccounts.builtinRevision;
+        if (readable && builtinRevision && (accountsChanged || builtinMoved)) {
+          await registerAccounts(accountProviders, builtinRevision, builtinConfigPath);
+          return;
         }
+        if (accountsChanged || builtinMoved) {
+          log("account registration left as is", { accountsChanged, builtinMoved, readable });
+        }
+        // The registration still applies: have the CLI re-read the user's
+        // provider config now instead of on its next file poll.
+        await client.request("provider/refreshRegistry", { reason: "paseo-catalog-refresh" }).catch(() => undefined);
       };
 
       let listener: ((event: ProviderEvent) => void) | undefined;
@@ -2056,7 +2134,8 @@ export function createZcodeProvider(): ProviderRegistration {
         // repeated throwaway probes; explicit catalog requests force a live
         // read so Paseo's model refresh reflects changes made in ZCode.
         if (!options.force && catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) return catalogCache.catalog;
-        await ensureAccountProviders();
+        if (options.force) await refreshAccountProviders();
+        else await ensureAccountProviders();
         // Create a short-lived throwaway session to read the model catalog.
         // Resuming an arbitrary session from session/list is unsafe: sessions
         // owned by the running desktop app can block on resume.
