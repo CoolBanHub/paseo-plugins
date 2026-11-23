@@ -82,6 +82,8 @@ async function fixture(t, options = {}) {
   let beforeSubagents;
   let beforeClose;
   let rejectSend = false;
+  // Swappable model list: tests simulate ZCode-side provider changes.
+  let currentAvailable = available;
   const snapshot = (sessionId) => {
     const state = states.get(sessionId);
     return {
@@ -95,7 +97,7 @@ async function fixture(t, options = {}) {
       },
       settings: {
         mode: { current: state.mode },
-        model: { available, current: state.model },
+        model: { available: currentAvailable, current: state.model },
         thoughtLevel: { current: state.model?.options?.reasoningLevel },
       },
       runtime: {
@@ -152,7 +154,7 @@ async function fixture(t, options = {}) {
     if (method === "session/setModel") {
       if (beforeSet) await beforeSet();
       if (rejectModel === params.model.modelId) return { error: { code: -1, message: "model switch rejected" } };
-      const entry = available.find((model) => model.ref.providerId === params.model.providerId && model.ref.modelId === params.model.modelId);
+      const entry = currentAvailable.find((model) => model.ref.providerId === params.model.providerId && model.ref.modelId === params.model.modelId);
       assert.ok(entry, "setModel must select an exact provider/model pair");
       if (entry.reasoning.levels.length) {
         assert.ok(entry.reasoning.levels.some((level) => level.value === params.model.options?.reasoningLevel), "reasoning level must be supplied and supported");
@@ -334,6 +336,8 @@ async function fixture(t, options = {}) {
     notifications: () => events.filter((event) => event.type === "timeline.item" && event.item.type === "notification"),
     state: (id = fSessionId()) => states.get(id),
     listSessions: () => connection.send({ type: "sessions", requestId: "sessions" }),
+    setAvailable: (list) => { currentAvailable = list; },
+    refreshCatalog: (requestId = "catalog") => connection.send({ type: "catalog", requestId }),
   };
   function fSessionId() {
     return events.find((event) => event.type === "session.persistence")?.persistence.data.zcodeSessionId;
@@ -969,6 +973,27 @@ test("catalog probes use deferred persistence", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });
   assert.equal(f.calls("session/create")[1].persistence, "deferred");
+});
+
+test("explicit catalog requests bypass the TTL and re-probe ZCode live", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const probes = () => f.calls("session/create").filter((params) => params.persistence === "deferred").length;
+  assert.equal(probes(), 1);
+  // The ZCode app now reports a provider the first probe never saw.
+  f.setAvailable([...available, {
+    ref: { providerId: "new-provider", modelId: "glm-5.3" },
+    label: "glm-5.3", providerLabel: "bai", contextWindow: 128_000,
+  }]);
+  await f.refreshCatalog("catalog-2");
+  const catalog = f.events.find((event) => event.type === "catalog" && event.requestId === "catalog-2").catalog;
+  assert.ok(catalog.models.some((model) => model.id === "new-provider::glm-5.3"), "refresh must return the live model list");
+  assert.equal(probes(), 2);
+  // The forced probe repopulates the shared cache: another open within the
+  // TTL must not probe again and must see the new model.
+  await f.open({ model: BINGLM }, undefined, "skip", "paseo-session-2");
+  assert.equal(probes(), 2);
+  assert.ok(f.config().models.some((model) => model.id === "new-provider::glm-5.3"));
 });
 
 test("archive and unarchive use the desktop task index even for a closed session", async (t) => {

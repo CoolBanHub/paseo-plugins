@@ -172,6 +172,11 @@ local ZCode sessions are listed in Paseo's session picker.
   created outside Paseo. The plugin's archive operation does not fix that
   desktop button. Keeping the shared session store is intentional.
 - Model-catalog probes use deferred persistence and leave no saved session.
+- An explicit catalog request from Paseo (the model screen's refresh /
+  discovery) always re-probes ZCode live — model or provider changes made in
+  the ZCode app show up on refresh without waiting out the in-memory TTL.
+  The 60-second probe cache only shields internal callers (session open and
+  configure) from repeated throwaway probes.
 - Paseo caches the provider catalog (models, mode labels) per agent and only
   re-discovers when the catalog cache key changes, so the key hashes the
   zcode CLI's identity (the model list is queried live from it) plus this

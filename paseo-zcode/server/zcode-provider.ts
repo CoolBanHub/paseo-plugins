@@ -2051,8 +2051,11 @@ export function createZcodeProvider(): ProviderRegistration {
         }
       });
 
-      const ensureCatalog = async (): Promise<ProviderCatalog> => {
-        if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) return catalogCache.catalog;
+      const ensureCatalog = async (options: { force?: boolean } = {}): Promise<ProviderCatalog> => {
+        // The TTL only shields internal callers (session open/configure) from
+        // repeated throwaway probes; explicit catalog requests force a live
+        // read so Paseo's model refresh reflects changes made in ZCode.
+        if (!options.force && catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) return catalogCache.catalog;
         await ensureAccountProviders();
         // Create a short-lived throwaway session to read the model catalog.
         // Resuming an arbitrary session from session/list is unsafe: sessions
@@ -2710,7 +2713,7 @@ export function createZcodeProvider(): ProviderRegistration {
         log(`input: ${input.type}`);
         switch (input.type) {
           case "catalog": {
-            const catalog = await ensureCatalog();
+            const catalog = await ensureCatalog({ force: true });
             emit({ type: "catalog", requestId: input.requestId, catalog });
             emit({ type: "request.completed", requestId: input.requestId });
             return;
