@@ -258,6 +258,19 @@ export class ZcodeProtocolClient {
       this.replyServerRequest(request.id, {});
       return;
     }
+    if (request.method === "session/readReplyLanguage") {
+      // ZCode 4.0 asks the client for the session's reply language. Paseo has
+      // no per-session language setting, and null keeps ZCode's own default.
+      this.replyServerRequest(request.id, { language: null });
+      return;
+    }
+    if (request.method === "interaction/requestCredentialCipher") {
+      // Encrypting credentials for a remote workspace needs the desktop app's
+      // secure-storage host. Decline explicitly: an empty result fails the
+      // request schema and makes ZCode retry instead of falling back.
+      this.replyServerRequestError(request.id, -32603, "Credential cipher host is unavailable");
+      return;
+    }
     for (const listener of this.serverRequestListeners) {
       if (listener(request)) return;
     }
@@ -267,6 +280,10 @@ export class ZcodeProtocolClient {
 
   replyServerRequest(id: string | number, result: unknown): void {
     this.child?.stdin?.write(JSON.stringify({ id, result }) + "\n");
+  }
+
+  replyServerRequestError(id: string | number, code: number, message: string): void {
+    this.child?.stdin?.write(JSON.stringify({ id, error: { code, message } }) + "\n");
   }
 
   onSessionEvent(listener: (event: ZcodeSessionEvent) => void): () => void {

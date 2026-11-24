@@ -117,6 +117,19 @@ local ZCode sessions are listed in Paseo's session picker.
 - Pausing a run maps ZCode's `turn.completed` (`resultType: "cancelled"`) to a
   canceled Paseo turn: no system error is appended and the prompt is not
   rolled back. Only execution error result types close the turn as failed.
+- ZCode 4.x reports provider and execution failures as a first-class
+  `turn.failed` session event. The plugin settles the Paseo turn from it (and
+  still accepts the older computer-use failure event, without double-reporting),
+  so an agent stops showing as running once ZCode has already failed the turn.
+- ZCode 4.x activates a resumed runtime asynchronously and keeps a resident
+  session pool that can reclaim sessions without subscribers. Opening waits for
+  `session/lifecycle/ensureReady` and subscribes before the model-catalog probe
+  creates and closes its throwaway session; a `Session runtime is not ready`
+  reply is retried briefly, including when reading subagent transcripts.
+- ZCode 4.x asks the client for the session reply language and, for remote
+  credential storage, for a credential cipher. Paseo answers the former with
+  the ZCode default (`null`) and declines the latter explicitly, which keeps
+  those requests from failing their response schemas.
 - Model labels include the provider name. Model and reasoning selections are
   confirmed before the session becomes ready and travel with every prompt;
   changing the mode or reasoning level preserves the selected model.

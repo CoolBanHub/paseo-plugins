@@ -1371,6 +1371,47 @@ export function createZcodeProvider(): ProviderRegistration {
         await client.request("provider/refreshRegistry", { reason: "paseo-catalog-refresh" }).catch(() => undefined);
       };
 
+      /**
+       * ZCode 4.0 activates a resumed session asynchronously and rejects
+       * protocol calls until its lifecycle reports ready. `ensureReady` is the
+       * explicit barrier; ZCode 3.x has no such method, so a missing method is
+       * remembered and callers fall back to retrying the operation itself.
+       */
+      let runtimeReadyApi = true;
+      const ensureRuntimeReady = async (zcodeSessionId: string): Promise<void> => {
+        if (!runtimeReadyApi) return;
+        try {
+          await client.requestOk("session/lifecycle/ensureReady", { sessionId: zcodeSessionId }, 60_000);
+        } catch (error) {
+          const code = (error as { code?: number }).code;
+          const message = error instanceof Error ? error.message : String(error);
+          if (code === -32601 || /unknown method|method not found|not supported/i.test(message)) {
+            runtimeReadyApi = false;
+          }
+        }
+      };
+
+      const runtimeNotReady = (error: unknown): boolean => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /Session runtime is not ready|runtimeNotReady/i.test(message);
+      };
+
+      const withRuntimeReady = async <T>(
+        zcodeSessionId: string,
+        operation: () => Promise<T>,
+        attempts = 6,
+      ): Promise<T> => {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await operation();
+          } catch (error) {
+            if (!runtimeNotReady(error) || attempt >= attempts) throw error;
+            await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1_000, 150 * 2 ** attempt)));
+            await ensureRuntimeReady(zcodeSessionId);
+          }
+        }
+      };
+
       let listener: ((event: ProviderEvent) => void) | undefined;
       let queued: ProviderEvent[] = [];
       const emit = (event: ProviderEvent) => {
@@ -1805,43 +1846,71 @@ export function createZcodeProvider(): ProviderRegistration {
         return false;
       });
 
+      /**
+       * Report a failed turn once. ZCode 4.0 emits `turn.failed` on the session
+       * stream; older builds report the same failure as a computer-use
+       * operation event, and either can arrive after the other has settled it.
+       */
+      const failTurn = (state: SessionState, turnId: string | undefined, rawReason: string): void => {
+        const turn = turnId ? state.turns.get(turnId) : undefined;
+        const clientMessageId = state.pendingClientMessageId;
+        if (!turn && !clientMessageId) return;
+        const reason = zcodeFailurePresentation({ message: rawReason }) || rawReason;
+        if (turn) closeDecodeWindow(turn);
+        state.pendingClientMessageId = undefined;
+        if (turnId) state.turns.delete(turnId);
+        emit({
+          type: "timeline.item",
+          sessionId: state.paseoSessionId,
+          item: { type: "error", id: `error:${turnId ?? Date.now()}`, message: reason },
+        });
+        if (turnId && turn?.started) {
+          emit({
+            type: "session.turn",
+            sessionId: state.paseoSessionId,
+            turnId,
+            state: "failed",
+            error: { message: reason },
+          });
+        }
+        if (clientMessageId) {
+          emit({
+            type: "session.prompt_result",
+            sessionId: state.paseoSessionId,
+            clientMessageId,
+            result: { type: "failed", error: { message: reason } },
+          });
+        }
+      };
+
       client.onSessionEvent((event: ZcodeSessionEvent) => {
         const state = sessions.get(event.sessionId);
         if (!state) return;
         const payload = (event.payload ?? {}) as Record<string, unknown>;
-        const turn = event.turnId ? turnFor(state, event.turnId) : undefined;
 
         if (event.type === "zcode.turn_failed") {
           // Early failure (model/auth/quota) reported outside the session/event
           // stream; recover the reason from the CLI log when possible.
-          const rawReason = readLastTurnFailure(event.sessionId) ?? "Turn failed before producing output";
-          const reason = zcodeFailurePresentation({ message: rawReason }) || rawReason;
-          const clientMessageId = state.pendingClientMessageId;
-          state.pendingClientMessageId = undefined;
-          emit({
-            type: "timeline.item",
-            sessionId: state.paseoSessionId,
-            item: { type: "error", id: `error:${event.turnId ?? Date.now()}`, message: reason },
-          });
-          if (event.turnId && turn?.started) {
-            emit({
-              type: "session.turn",
-              sessionId: state.paseoSessionId,
-              turnId: event.turnId,
-              state: "failed",
-              error: { message: reason },
-            });
-          }
-          if (clientMessageId) {
-            emit({
-              type: "session.prompt_result",
-              sessionId: state.paseoSessionId,
-              clientMessageId,
-              result: { type: "failed", error: { message: reason } },
-            });
-          }
+          failTurn(state, event.turnId, readLastTurnFailure(event.sessionId) ?? "Turn failed before producing output");
           return;
         }
+
+        if (event.type === "turn.failed") {
+          // ZCode 4.0 reports execution and provider failures as a first-class
+          // session event. Without this the Paseo turn never ends, so the agent
+          // keeps showing as running after ZCode already settled it.
+          const error = payload.error && typeof payload.error === "object"
+            ? payload.error as Record<string, unknown>
+            : undefined;
+          const message = typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : readLastTurnFailure(event.sessionId) ?? "Turn failed";
+          failTurn(state, event.turnId, message);
+          scheduleSubagentSync(state, subagentSyncTiming.settledMs);
+          return;
+        }
+
+        const turn = event.turnId ? turnFor(state, event.turnId) : undefined;
 
         switch (event.type) {
           case "turn.started": {
@@ -2482,11 +2551,12 @@ export function createZcodeProvider(): ProviderRegistration {
         record.adopted = true;
         // Resume is idempotent for active sessions and activates ended ones.
         await client.requestOk("session/resume", { sessionId: childSessionId }).catch(() => undefined);
+        await ensureRuntimeReady(childSessionId);
         try {
-          const snapshot = await client.requestOk("session/read", {
+          const snapshot = await withRuntimeReady(childSessionId, () => client.requestOk("session/read", {
             sessionId: childSessionId,
             messageLimit: 1000,
-          }) as unknown as CreateOrResumeResult;
+          })) as unknown as CreateOrResumeResult;
           // The parent may have closed while the child transcript was loading.
           if (!canAttachSubagents(parent)) return;
           emitSubagentSnapshot(record, snapshot.messages);
@@ -2551,10 +2621,10 @@ export function createZcodeProvider(): ProviderRegistration {
         const tick = async (): Promise<void> => {
           if (record.pollGeneration !== generation || !growing) return;
           try {
-            const snapshot = await client.requestOk("session/read", {
+            const snapshot = await withRuntimeReady(record.childSessionId, () => client.requestOk("session/read", {
               sessionId: record.childSessionId,
               messageLimit: 1000,
-            }) as unknown as CreateOrResumeResult;
+            })) as unknown as CreateOrResumeResult;
             if (record.pollGeneration !== generation) return;
             const before = record.emittedRows?.size ?? 0;
             emitSubagentSnapshot(record, snapshot.messages);
@@ -2587,10 +2657,10 @@ export function createZcodeProvider(): ProviderRegistration {
         const tick = async (): Promise<void> => {
           if (record.pollGeneration !== generation) return;
           try {
-            const snapshot = await client.requestOk("session/read", {
+            const snapshot = await withRuntimeReady(record.childSessionId, () => client.requestOk("session/read", {
               sessionId: record.childSessionId,
               messageLimit: 1000,
-            }) as unknown as CreateOrResumeResult;
+            })) as unknown as CreateOrResumeResult;
             if (record.pollGeneration !== generation) return;
             emitSubagentSnapshot(record, snapshot.messages);
             if (subagentSnapshotRunning(snapshot)) {
@@ -2857,12 +2927,19 @@ export function createZcodeProvider(): ProviderRegistration {
             state.modeEventSeq = undefined;
             state.planEnabled = undefined;
             state.cwd = input.config.cwd || bridgeDir;
+            applyOfficialState(state, result);
+            // ZCode 4.0 activates a resumed runtime asynchronously and its
+            // resident session pool may reclaim a session without subscribers
+            // once the in-flight operations drain. Subscribe before probing the
+            // catalog (which creates and closes a throwaway session) so the
+            // pool keeps this one, then wait out a cold activation.
+            await ensureRuntimeReady(zcodeSessionId);
+            await withRuntimeReady(zcodeSessionId, () => client.requestOk("session/subscribe", {
+              sessionId: zcodeSessionId,
+              deliveryKind: "desktop-continuous",
+            }));
             const catalog = await ensureCatalog();
             state.catalog = catalog;
-            applyOfficialState(state, result);
-            // Subscribe before mutations: Plan mode is confirmed only by
-            // session.updated { mode, planEnabled }, not by the snapshot.
-            await client.requestOk("session/subscribe", { sessionId: zcodeSessionId, deliveryKind: "desktop-continuous" });
             let historyMessages = result.messages;
             let childSessionIds: Map<string, string> | undefined;
             if (resuming && input.history === "replay") {

@@ -108,6 +108,8 @@ async function fixture(t, options = {}) {
   let beforeSubagents;
   let beforeClose;
   let rejectSend = false;
+  // One-shot protocol failure keyed by method, for runtime-activation races.
+  const nextFailure = new Map();
   // Swappable model list: tests simulate ZCode-side provider changes.
   let currentAvailable = available;
   const snapshot = (sessionId) => {
@@ -144,6 +146,11 @@ async function fixture(t, options = {}) {
   };
   t.mock.method(protocol.ZcodeProtocolClient.prototype, "request", async (method, params) => {
     requests.push({ method, params: structuredClone(params) });
+    const failure = nextFailure.get(method);
+    if (failure) {
+      nextFailure.delete(method);
+      return { error: { code: -32002, message: failure } };
+    }
     if (method === "session/create" || method === "session/resume") {
       const id = params.sessionId ?? `sess_mock_${++nextSession}`;
       // Pre-seeded fields (subagent listings, child transcripts) survive resume.
@@ -350,6 +357,8 @@ async function fixture(t, options = {}) {
     serverReplies,
     setTodos: (todos) => { states.get(fSessionId()).todos = structuredClone(todos); },
     calls: (method) => requests.filter((request) => request.method === method).map((request) => request.params),
+    methodOrder: () => requests.map((request) => request.method),
+    failNext: (method, message = "Session runtime is not ready") => nextFailure.set(method, message),
     config: () => events.filter((event) => event.type === "session.config").at(-1)?.config,
     rejectModel: (id) => { rejectModel = id; },
     beforeSet: (fn) => { beforeSet = fn; },
@@ -934,6 +943,40 @@ test("a provider failure after turn start closes that turn as failed", async (t)
   assert.ok(f.events.some((event) => event.type === "session.turn" && event.turnId === "turn_started" && event.state === "failed"));
 });
 
+test("ZCode 4.0 turn.failed settles a started turn with the provider reason", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.sessionEvent({ type: "turn.started", sessionId, turnId: "turn_failed_40" });
+  f.sessionEvent({
+    type: "turn.failed", sessionId, turnId: "turn_failed_40",
+    payload: { error: { type: "provider", message: "ProviderBusinessError: [1305] overloaded" }, turnPhase: "model" },
+  });
+  const turnEnd = f.events.find((event) => event.type === "session.turn" && event.turnId === "turn_failed_40" && event.state !== "started");
+  assert.equal(turnEnd.state, "failed");
+  assert.match(turnEnd.error.message, /1305/);
+  assert.equal(f.events.filter((event) => event.type === "timeline.item" && event.item.type === "error").length, 1);
+});
+
+test("turn.failed before turn start fails the pending prompt without inventing a turn", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  await f.prompt();
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.sessionEvent({
+    type: "turn.failed", sessionId, turnId: "turn_failed_early",
+    payload: { error: { type: "provider", message: "quota exhausted" }, turnPhase: "model" },
+  });
+  assert.ok(f.events.some((event) => event.type === "session.prompt_result" && event.result.type === "failed"));
+  assert.ok(!f.events.some((event) => event.type === "session.turn" && event.state === "failed"));
+  assert.equal(f.events.filter((event) => event.type === "timeline.item" && event.item.type === "error").length, 1);
+
+  // The legacy operation event for the same turn must not duplicate the error.
+  f.sessionEvent({ type: "zcode.turn_failed", sessionId, turnId: "turn_failed_early" });
+  assert.equal(f.events.filter((event) => event.type === "timeline.item" && event.item.type === "error").length, 1);
+});
+
 test("pausing (turn.completed resultType cancelled) reports a canceled turn, not a failure", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });
@@ -1004,6 +1047,38 @@ test("catalog probes use deferred persistence", async (t) => {
   const f = await fixture(t);
   await f.open({ model: BINGLM });
   assert.equal(f.calls("session/create")[1].persistence, "deferred");
+});
+
+test("opening waits for the runtime and subscribes before probing the catalog", async (t) => {
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const order = f.methodOrder();
+  const ensureReady = order.indexOf("session/lifecycle/ensureReady");
+  const subscribe = order.indexOf("session/subscribe");
+  const catalogProbe = order.lastIndexOf("session/create");
+  assert.ok(ensureReady >= 0, "ZCode 4.0 runtimes are awaited before use");
+  assert.ok(ensureReady < subscribe, "the runtime must be ready before subscribing");
+  assert.ok(subscribe < catalogProbe, "the resumed session must be subscribed before the throwaway catalog probe");
+});
+
+test("opening retries a subscribe while ZCode 4.0 is still activating the runtime", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  f.failNext("session/subscribe");
+  const opening = f.open({ model: BINGLM });
+  await flush();
+  t.mock.timers.tick(200);
+  await opening;
+  assert.equal(f.calls("session/subscribe").length, 2);
+  assert.ok(f.events.some((event) => event.type === "session.ready"));
+});
+
+test("older app-servers without the lifecycle API still open sessions", async (t) => {
+  const f = await fixture(t);
+  f.failNext("session/lifecycle/ensureReady", "Unknown method: session/lifecycle/ensureReady");
+  await f.open({ model: BINGLM });
+  assert.ok(f.events.some((event) => event.type === "session.ready"));
+  assert.equal(f.calls("session/subscribe").length, 1);
 });
 
 test("explicit catalog requests bypass the TTL and re-probe ZCode live", async (t) => {
@@ -1221,6 +1296,34 @@ test("running ZCode subagents attach as nested Paseo subsessions and poll until 
   assert.equal(f.calls("session/read").filter((call) => call.sessionId === "sess_subagent_a").length, readsAfterDone + 1);
   t.mock.timers.tick(subagentSyncTiming.backfillMs * 4); await flush();
   assert.equal(f.calls("session/read").filter((call) => call.sessionId === "sess_subagent_a").length, readsAfterDone + 1);
+});
+
+test("a subagent transcript read is retried while its runtime starts", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = await fixture(t);
+  await f.open({ model: BINGLM });
+  const sessionId = f.events.find((event) => event.type === "session.persistence").persistence.data.zcodeSessionId;
+  f.setSubagents(sessionId, {
+    childSessionIds: ["sess_subagent_ready"],
+    running: [{ childSessionId: "sess_subagent_ready", toolCallId: "agent-call-ready", subagentType: "Explore", status: "running" }],
+    ended: { total: 0, items: [] },
+  });
+  f.session("sess_subagent_ready", {
+    sessionStatus: "running",
+    messages: [
+      { info: { role: "user", messageId: "cu-ready", semantics: { transcriptVisibility: "visible" } }, parts: [{ type: "text", partId: "cu-ready", text: "调研任务" }] },
+    ],
+  });
+  f.failNext("session/read");
+  f.sessionEvent({
+    type: "model.streaming", sessionId, turnId: "turn-agent-ready",
+    payload: { kind: "tool_call", toolCallId: "agent-call-ready", toolName: "Agent", input: {} },
+  });
+  t.mock.timers.tick(subagentSyncTiming.spawnMs); await flush();
+  t.mock.timers.tick(200); await flush();
+  const opened = f.events.find((event) => event.type === "session.opened" && event.sessionId === "sess_subagent_ready");
+  assert.ok(opened, "the retried read must still attach the child");
+  assert.ok(f.events.some((event) => event.type === "timeline.item" && event.sessionId === "sess_subagent_ready" && event.item.id === "cu-ready"));
 });
 
 test("a finished Agent tool call replays the ended subagent with its outcome", async (t) => {
