@@ -266,8 +266,9 @@ export class ZcodeProtocolClient {
     }
     if (request.method === "interaction/requestCredentialCipher") {
       // Encrypting credentials for a remote workspace needs the desktop app's
-      // secure-storage host. Decline explicitly: an empty result fails the
-      // request schema and makes ZCode retry instead of falling back.
+      // secure-storage host. Decline explicitly so ZCode takes its documented
+      // unavailable path instead of rejecting an empty result against the
+      // response schema.
       this.replyServerRequestError(request.id, -32603, "Credential cipher host is unavailable");
       return;
     }

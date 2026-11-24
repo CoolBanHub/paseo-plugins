@@ -1372,10 +1372,10 @@ export function createZcodeProvider(): ProviderRegistration {
       };
 
       /**
-       * ZCode 4.0 activates a resumed session asynchronously and rejects
-       * protocol calls until its lifecycle reports ready. `ensureReady` is the
-       * explicit barrier; ZCode 3.x has no such method, so a missing method is
-       * remembered and callers fall back to retrying the operation itself.
+       * ZCode activates a resumed session asynchronously and rejects protocol
+       * calls until its lifecycle reports ready. `ensureReady` is the explicit
+       * barrier; app-server versions without it fail that probe, so a missing
+       * method is remembered and callers retry the operation itself.
        */
       let runtimeReadyApi = true;
       const ensureRuntimeReady = async (zcodeSessionId: string): Promise<void> => {
