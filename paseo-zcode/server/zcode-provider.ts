@@ -600,7 +600,7 @@ function emitBackgroundJob(
 }
 
 /** ZCode slash commands the plugin can execute through this provider. */
-const SUPPORTED_BUILTIN_COMMANDS = new Set(["compact", "goal", "fork"]);
+const SUPPORTED_BUILTIN_COMMANDS = new Set(["compact", "goal", "fork", "workflow", "dwf"]);
 
 /** Builtins the plugin can run even when an older snapshot omits them. */
 const FALLBACK_BUILTIN_COMMANDS: ProviderCommand[] = [

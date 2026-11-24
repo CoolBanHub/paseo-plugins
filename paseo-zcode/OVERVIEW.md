@@ -94,12 +94,19 @@ local ZCode sessions are listed in Paseo's session picker.
   keeps its dedicated plan card.
 - ZCode's slash-command catalog is published to Paseo. Commands this provider
   can execute are `/compact` (via `session/compact`), `/goal` (via
-  `session/goal`), `/fork` (via `session/fork`), custom prompt commands (via
-  `session/send`), plus provider-local `/tasks`, `/stop-task <taskId>` and
-  `/usage`. UI-only commands (`/help`, `/model`, `/mode`, `/effort`, `/new`,
-  `/resume`, `/plugins`, `/login`, `/locale`, …) are hidden because they only
-  work in ZCode's own client. Command results and errors appear as timeline
-  notifications and settle the Paseo prompt.
+  `session/goal`), `/fork` (via `session/fork`), `/workflow` and `/dwf` (via
+  `session/send` when ZCode advertises dynamic workflows), custom prompt
+  commands (via `session/send`), plus provider-local `/tasks`,
+  `/stop-task <taskId>` and `/usage`. UI-only commands (`/help`, `/model`,
+  `/mode`, `/effort`, `/new`, `/resume`, `/plugins`, `/login`, `/locale`, …)
+  are hidden because they only work in ZCode's own client. Command results and
+  errors appear as timeline notifications and settle the Paseo prompt.
+- Dynamic workflows (ZCode 4.x) can be launched with `/workflow` and managed
+  with `/dwf`; both run through ZCode's own command path, so the workflow
+  script confirmation and run lifecycle stay inside ZCode. Paseo's provider
+  timeline has no workflow row type, so a run appears through its Workflow tool
+  card and background activity rather than as a workflow panel; workflow actor
+  child sessions are not attached as Paseo subsessions.
 - Goal state (`session.target`) renders as a stable Goal row with objective,
   status, token budget and elapsed time; it refreshes after goal commands,
   goal-related state updates and turns while a goal is active. Context usage

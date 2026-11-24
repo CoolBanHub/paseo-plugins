@@ -46,3 +46,13 @@ test("credential cipher requests are declined instead of returning an invalid re
     error: { code: -32603, message: "Credential cipher host is unavailable" },
   }]);
 });
+
+test("subagent runtime config requests fall back to ZCode's built-in profiles", () => {
+  const { client, replies } = clientWithReplies();
+  client.handleServerRequest({
+    id: 9,
+    method: "subagents/readRuntimeConfig",
+    params: { sessionId: "sess_1" },
+  });
+  assert.deepEqual(replies, [{ id: 9, result: { kind: "built-in-fallback" } }]);
+});

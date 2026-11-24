@@ -272,6 +272,12 @@ export class ZcodeProtocolClient {
       this.replyServerRequestError(request.id, -32603, "Credential cipher host is unavailable");
       return;
     }
+    if (request.method === "subagents/readRuntimeConfig") {
+      // Paseo does not manage per-subagent runtime profiles; let ZCode use its
+      // built-in profiles instead of failing the response schema.
+      this.replyServerRequest(request.id, { kind: "built-in-fallback" });
+      return;
+    }
     for (const listener of this.serverRequestListeners) {
       if (listener(request)) return;
     }

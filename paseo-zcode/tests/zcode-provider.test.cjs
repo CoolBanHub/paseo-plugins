@@ -1742,6 +1742,8 @@ test("the command catalog exposes ZCode commands Paseo can execute", async (t) =
       { name: "compact", description: "Compact the conversation", inputHint: "[instructions]", source: "builtin" },
       { name: "goal", description: "Show or set the goal", inputHint: "[objective]", source: "builtin" },
       { name: "fork", description: "Fork from a checkpoint", inputHint: "[latest|id]", source: "builtin" },
+      { name: "workflow", description: "Design and launch a dynamic workflow", inputHint: "[task]", source: "builtin" },
+      { name: "dwf", description: "List or resume dynamic workflow runs", source: "builtin" },
       { name: "help", description: "Show help", source: "builtin" },
       { name: "review", description: "Review the diff", source: "custom" },
     ],
@@ -1749,7 +1751,7 @@ test("the command catalog exposes ZCode commands Paseo can execute", async (t) =
   await f.open({ model: BINGLM });
   assert.deepEqual(
     f.commandList().map((command) => command.name),
-    ["compact", "goal", "fork", "review", "tasks", "stop-task", "usage"],
+    ["compact", "goal", "fork", "workflow", "dwf", "review", "tasks", "stop-task", "usage"],
     "supported builtins and custom commands stay; UI-only builtins are filtered",
   );
   assert.equal(f.commandList().find((command) => command.name === "compact").argumentHint, "[instructions]");
