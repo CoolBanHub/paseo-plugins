@@ -180,17 +180,34 @@ root is resolved from `plugins.dsh.path` in Paseo's `config.json`, with
   message follows it.
 - Background jobs (`job/registered` / `job/settled`) render as Shell or
   labelled status rows with the originating command and terminal detail.
-  Subagent runs update their `sub_agent` card with the child session id,
-  provider, status and final output. Goal changes render as a stable Goal
-  row, working-directory changes as a notice, and `present` tool calls list
-  the delivered files. MCP and skill tools get readable `server · tool` /
-  `Skill · name` labels instead of raw tool ids.
+  Goal changes render as a stable Goal row, working-directory changes as a
+  notice, and `present` tool calls list the delivered files. MCP and skill
+  tools get readable `server · tool` / `Skill · name` labels instead of raw
+  tool ids.
 - History replay restores the same todo, background-job, compaction, goal
   and subagent identity rows in addition to the existing conversation and
   PTC rows.
-- Subagent cards carry the child session id, but Paseo does not open them
-  as nested sessions: the ACP adapter has no `session.subsession`
-  capability, so child transcripts stay available in dsh's own clients.
+- Subagents dsh spawns are nested sessions. Once the host offers
+  `session.subsession` the plugin negotiates it for the connection and every
+  root session, and each `subagent-start` the bridge mirrors opens the dsh
+  child session under its `sub_agent` tool call, the task description as its
+  title. Paseo lists it in its subagent track, where the child's own
+  transcript opens read-only; the card itself keeps the child session id,
+  provider, status and final output. The transcript is tailed from the
+  child's durable dsh session log, polled about once a second while it
+  works, and that log also decides the child's state: a `turn/start` no
+  `turn/end` follows is running, and the latest `turn/end` reason settles it
+  as completed, canceled or failed through the card's mapping. A bridge
+  `subagent-end` whose `turn/end` never flushes (the process was killed)
+  settles the child from the bridge's own reason after a grace period. A
+  parent that resumes a continuable child gets a second run in the same
+  child session, noticed by a slower poll. A reopened parent adopts the
+  children its log records once its own restored rows are out, adopting one
+  whose last turn never ended as canceled — it belonged to the previous
+  process. Closing the parent closes its children. Delegations a rewind
+  shadowed are not adopted, and a child that delegates itself only shows a
+  card inside its own transcript (one level nests). A host that offers no
+  `session.subsession` keeps the tool cards only.
 - Image and file attachments in history replay render as annotated
   placeholders (`[文件 report.pdf · 3.0MB]`, `[图片 image/png · 2KB]`); live
   binary content is still not carried over. Commands come from dsh's live

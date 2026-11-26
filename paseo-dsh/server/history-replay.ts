@@ -95,7 +95,7 @@ function settledToolItem(
  * message kinds do), so absence of `surfaceOp` means "visible as usual";
  * the replace range is the only thing that hides content.
  */
-function shadowedSeqs(ordered: readonly DshSessionEvent[]): Set<number> | undefined {
+export function shadowedSeqs(ordered: readonly DshSessionEvent[]): Set<number> | undefined {
   let sawReplace = false;
   const shadowed = new Set<number>();
   for (const event of ordered) {

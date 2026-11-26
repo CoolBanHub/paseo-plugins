@@ -255,6 +255,19 @@ function subagentDetail(data: Record<string, unknown>): ProviderToolCallDetail {
   };
 }
 
+/**
+ * Paseo turn state for a dsh subagent stop reason (`subagent/end`) or the
+ * `turn/end` reason kind of the child's own log. The parent's tool card and
+ * the nested child session (dsh-subagents.ts) settle through this one mapping.
+ */
+export function dshSubagentTurnState(reason: unknown): "completed" | "canceled" | "failed" {
+  if (reason === "aborted" || reason === "interrupted" || reason === "cancelled" || reason === "canceled") {
+    return "canceled";
+  }
+  if (reason === "error" || reason === "failed") return "failed";
+  return "completed";
+}
+
 function subagentUpdate(kind: string, data: Record<string, unknown>): AcpVendorUpdate[] {
   const callId = text(data.callId);
   if (!callId) return [];
@@ -265,18 +278,16 @@ function subagentUpdate(kind: string, data: Record<string, unknown>): AcpVendorU
       item: toolItem(callId, callId, "subagent", "running", subagentDetail(data)),
     }];
   }
-  const stopReason = text(data.stopReason);
-  const failed = stopReason === "error" || stopReason === "failed";
-  const canceled = stopReason === "cancelled" || stopReason === "canceled" || stopReason === "aborted";
+  const state = dshSubagentTurnState(text(data.stopReason));
   return [{
     type: "timeline",
     item: toolItem(
       callId,
       callId,
       "subagent",
-      failed ? "failed" : canceled ? "canceled" : "completed",
+      state,
       subagentDetail(data),
-      failed ? text(data.output) ?? `${label} 失败` : null,
+      state === "failed" ? text(data.output) ?? `${label} 失败` : null,
     ),
   }];
 }

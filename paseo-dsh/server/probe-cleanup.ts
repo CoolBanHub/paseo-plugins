@@ -289,6 +289,16 @@ function streamZstdTail(path: string): Promise<string | undefined> {
   });
 }
 
+/** Path of a session's durable log, so callers can cheaply watch it for growth. */
+export function dshSessionLogPath(
+  sessionId: string,
+  options: Pick<ProbeCleanupOptions, "home"> = {},
+): string | undefined {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(sessionId)) return undefined;
+  const sessionDir = findSessionDirectory(sessionId, options.home ?? dshHomePath());
+  return sessionDir ? sessionLogPath(sessionDir) : undefined;
+}
+
 /** Last modification time of a session log, for Paseo's session list. */
 export function dshSessionUpdatedAt(
   sessionId: string,
